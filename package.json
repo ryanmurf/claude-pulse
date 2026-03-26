@@ -1,0 +1,48 @@
+{
+  "name": "claude-pulse",
+  "version": "0.1.0",
+  "description": "Usage monitoring channel plugin for Claude Code — tracks subscription usage and pushes alerts into your session",
+  "type": "module",
+  "bin": {
+    "claude-pulse": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "channels",
+    "usage",
+    "monitoring",
+    "rate-limits",
+    "anthropic"
+  ],
+  "author": "Ryan Murphy",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ryanmurf/claude-pulse.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "tsx": "^4.19.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  }
+}
