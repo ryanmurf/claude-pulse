@@ -184,6 +184,20 @@ export function insertSnapshot(
     .get(result.lastInsertRowid) as unknown as UsageSnapshot;
 }
 
+export function getLastSuccessfulSnapshot(
+  profile: string
+): UsageSnapshot | undefined {
+  const d = getDb();
+  const row = d.prepare(
+    `SELECT * FROM usage_snapshots
+     WHERE profile = ?
+       AND (five_hour_resets_at IS NOT NULL OR seven_day_resets_at IS NOT NULL)
+     ORDER BY polled_at DESC
+     LIMIT 1`
+  ).get(profile);
+  return row as unknown as UsageSnapshot | undefined;
+}
+
 export function getLatestSnapshot(
   profile: string
 ): UsageSnapshot | undefined {

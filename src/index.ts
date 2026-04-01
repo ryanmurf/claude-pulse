@@ -31,6 +31,7 @@ import {
   stopAllPollers,
   setMcpServer,
 } from "./poller.js";
+import { startHttpServer, stopHttpServer } from "./server.js";
 
 function log(msg: string): void {
   process.stderr.write(`[claude-pulse] ${new Date().toISOString()} ${msg}\n`);
@@ -43,6 +44,7 @@ When a usage alert fires, you'll receive a <channel source="claude-pulse" alert_
 Use the claude-pulse tools to:
 - list_profiles: see configured profiles and their polling intervals
 - get_usage: check current usage for any profile
+- get_pace: check if you're burning too fast or have room to be thorough
 - get_history: view usage trends over time
 - set_poll_interval: change how often a profile is polled (in minutes)
 - subscribe_alert: set up threshold alerts (e.g. 90% five_hour window)
@@ -58,7 +60,9 @@ Default profiles:
 - claude-hd (~/.claude-hd) — work subscription
 - claude-max (~/.claude-max) — personal subscription
 
-You can use the acknowledge_alerts tool or the reply tool to respond to alerts.`;
+You can use the acknowledge_alerts tool or the reply tool to respond to alerts.
+
+When a poll fails due to rate-limit exhaustion, claude-pulse automatically schedules a resume notification for 1 minute after the usage window resets. You'll receive a <channel source="claude-pulse" event_type="window_reset" profile="..." ...> event when the window has reset and you may continue working.`;
 
 const server = new McpServer(
   { name: "claude-pulse", version: "1.0.0" },
@@ -69,6 +73,83 @@ const server = new McpServer(
     },
     instructions: INSTRUCTIONS,
   },
+);
+
+// --- get_pace ---
+server.tool(
+  "get_pace",
+  "Check current usage pace — whether you're burning too fast or have room. Call this when deciding how thorough to be.",
+  {
+    profile: z
+      .string()
+      .optional()
+      .describe("Profile name. Omit for all profiles."),
+  },
+  async ({ profile }) => {
+    const WINDOW_DURATIONS: Record<string, number> = {
+      five_hour: 5 * 60 * 60 * 1000,
+      seven_day: 7 * 24 * 60 * 60 * 1000,
+    };
+
+    function formatRemaining(ms: number): string {
+      if (ms <= 0) return "resetting now";
+      const mins = Math.floor(ms / 60_000);
+      if (mins < 60) return `${mins}m`;
+      const hrs = Math.floor(mins / 60);
+      const rm = mins % 60;
+      if (hrs < 24) return rm > 0 ? `${hrs}h ${rm}m` : `${hrs}h`;
+      const days = Math.floor(hrs / 24);
+      const rh = hrs % 24;
+      return rh > 0 ? `${days}d ${rh}h` : `${days}d`;
+    }
+
+    function paceForWindow(
+      usedPct: number | null,
+      resetsAt: string | null,
+      windowKey: string,
+      label: string,
+    ): string | null {
+      if (usedPct === null || !resetsAt) return null;
+      const duration = WINDOW_DURATIONS[windowKey];
+      if (!duration) return null;
+
+      const now = Date.now();
+      const resetMs = new Date(resetsAt).getTime();
+      const remaining = resetMs - now;
+      const elapsed = duration - remaining;
+      const elapsedPct = Math.max((elapsed / duration) * 100, 1);
+      const ratio = usedPct / elapsedPct;
+
+      let pace: string;
+      if (ratio > 1.5 && usedPct > 50) pace = "conserve";
+      else if (ratio < 0.5 && remaining < 3_600_000) pace = "capacity available";
+      else if (ratio > 1.2) pace = "slightly fast";
+      else pace = "on track";
+
+      return `${label}: ${usedPct.toFixed(0)}% used, ${formatRemaining(remaining)} left — ${pace}`;
+    }
+
+    const profilesToCheck = profile
+      ? [profile]
+      : listProfiles().map((p) => p.name);
+
+    const lines: string[] = [];
+    for (const name of profilesToCheck) {
+      const snap = getLatestSnapshot(name);
+      if (!snap) continue;
+      const fh = paceForWindow(snap.five_hour_pct, snap.five_hour_resets_at, "five_hour", `${name} 5h`);
+      const sd = paceForWindow(snap.seven_day_pct, snap.seven_day_resets_at, "seven_day", `${name} 7d`);
+      if (fh) lines.push(fh);
+      if (sd) lines.push(sd);
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: lines.length > 0 ? lines.join("\n") : "No usage data available. Try poll_now first.",
+      }],
+    };
+  }
 );
 
 // --- get_usage ---
@@ -592,6 +673,9 @@ async function main(): Promise<void> {
   // Start background pollers
   startAllPollers();
 
+  // Start HTTP dashboard
+  startHttpServer();
+
   // Connect MCP server via stdio
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -601,6 +685,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     log("Shutting down...");
     stopAllPollers();
+    stopHttpServer();
     closeDb();
     process.exit(0);
   };

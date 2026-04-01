@@ -1,17 +1,16 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { ClaudeResponse, PollResult, Profile, AlertEvent } from "./types.js";
+import type { PollResult, Profile, AlertEvent } from "./types.js";
 import {
   insertSnapshot,
   listProfiles,
   getProfile,
+  getLastSuccessfulSnapshot,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
-
-const execFileAsync = promisify(execFile);
+import { fetchUsage } from "./usage.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
+const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
 
 let mcpServerInstance: McpServer | undefined;
 
@@ -28,9 +27,117 @@ function log(msg: string): void {
 }
 
 /**
+ * Check whether an error message indicates rate-limit / usage-window exhaustion.
+ */
+export function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const text = msg.toLowerCase();
+  return (
+    text.includes("rate limit") ||
+    text.includes("rate_limit") ||
+    text.includes("usage limit") ||
+    text.includes("too many requests") ||
+    text.includes("429") ||
+    text.includes("quota exceeded") ||
+    text.includes("resource_exhausted") ||
+    text.includes("overloaded") ||
+    text.includes("over capacity")
+  );
+}
+
+/**
+ * Pick the earliest future resets_at from a set of candidates.
+ */
+function earliestFutureReset(...candidates: (string | null | undefined)[]): string | null {
+  const now = Date.now();
+  let best: string | null = null;
+  let bestTime = Infinity;
+  for (const c of candidates) {
+    if (!c) continue;
+    const t = new Date(c).getTime();
+    if (t > now && t < bestTime) {
+      best = c;
+      bestTime = t;
+    }
+  }
+  return best;
+}
+
+/**
+ * Schedule a channel notification for when a usage window resets.
+ * Deduplicates by profile + resetsAt so the same window isn't scheduled twice.
+ */
+export function scheduleWindowResume(profile: string, resetsAt: string): void {
+  const key = `${profile}:${resetsAt}`;
+  if (pendingResumes.has(key)) return;
+
+  const resetTime = new Date(resetsAt).getTime();
+  const resumeTime = resetTime + 60_000; // 1 minute after reset
+  const delay = resumeTime - Date.now();
+
+  if (delay <= 0) {
+    log(`Reset time already passed for ${profile}, firing resume now`);
+    pushChannelResume(profile, resetsAt).catch((e) =>
+      log(`Failed to push immediate resume for ${profile}: ${e}`)
+    );
+    return;
+  }
+
+  log(
+    `Scheduled window resume for ${profile} at ${new Date(resumeTime).toISOString()} (in ${Math.round(delay / 60_000)} min)`
+  );
+
+  const timer = setTimeout(async () => {
+    pendingResumes.delete(key);
+    try {
+      await pushChannelResume(profile, resetsAt);
+    } catch (e) {
+      log(`Failed to push resume for ${profile}: ${e}`);
+    }
+  }, delay);
+
+  timer.unref();
+  pendingResumes.set(key, timer);
+}
+
+/**
+ * Send a channel notification telling Claude Code the usage window has reset.
+ */
+async function pushChannelResume(profile: string, resetsAt: string): Promise<void> {
+  if (!mcpServerInstance) return;
+  try {
+    await (mcpServerInstance.server as any).notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: `Usage window has reset for ${profile}. You may resume.`,
+        meta: {
+          event_type: "window_reset",
+          profile,
+          resets_at: resetsAt,
+        },
+      },
+    });
+    log(`Window reset notification pushed for ${profile}`);
+  } catch (err) {
+    log(`Failed to push window reset notification for ${profile}: ${err}`);
+  }
+}
+
+/**
+ * Cancel pending resume timers. If profile is given, only cancel that profile's timers.
+ */
+export function cancelPendingResumes(profile?: string): void {
+  for (const [key, timer] of pendingResumes) {
+    if (!profile || key.startsWith(`${profile}:`)) {
+      clearTimeout(timer);
+      pendingResumes.delete(key);
+      log(`Cancelled pending resume: ${key}`);
+    }
+  }
+}
+
+/**
  * Push a channel notification for a triggered alert event.
- * Uses notifications/claude/channel so it appears as a <channel source="claude-pulse" ...> tag
- * in the Claude Code session.
  */
 async function pushChannelAlert(evt: AlertEvent, profile: string, resetsAt: string | null): Promise<void> {
   if (!mcpServerInstance) return;
@@ -52,8 +159,6 @@ async function pushChannelAlert(evt: AlertEvent, profile: string, resetsAt: stri
   }
 
   try {
-    // Use the underlying low-level Server to send a custom notification
-    // that the Claude Code channel plugin protocol understands.
     await (mcpServerInstance.server as any).notification({
       method: "notifications/claude/channel",
       params: {
@@ -68,7 +173,7 @@ async function pushChannelAlert(evt: AlertEvent, profile: string, resetsAt: stri
 }
 
 /**
- * Determine the relevant reset time for an alert event based on its type and snapshot data.
+ * Determine the relevant reset time for an alert event based on its type.
  */
 function getResetsAt(
   evt: AlertEvent,
@@ -89,65 +194,49 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
   try {
     log(`Polling profile: ${profile.name} (config_dir: ${profile.config_dir})`);
 
-    const { stdout } = await execFileAsync(
-      "claude",
-      ["-p", "say ok", "--model", "haiku", "--output-format", "json", "--bare"],
-      {
-        env: {
-          ...process.env,
-          CLAUDE_CONFIG_DIR: profile.config_dir,
-        },
-        timeout: 60_000,
-      }
-    );
-
-    let parsed: ClaudeResponse;
-    try {
-      parsed = JSON.parse(stdout.trim());
-    } catch {
-      // Sometimes the output may have extra text before/after JSON
-      const jsonMatch = stdout.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error(`Failed to parse Claude response as JSON: ${stdout.slice(0, 200)}`);
-      }
-    }
-
-    const rateLimits = parsed.rate_limits;
-
-    const fiveHourPct = rateLimits?.five_hour?.used_percentage ?? null;
-    const fiveHourResets = rateLimits?.five_hour?.resets_at ?? null;
-    const sevenDayPct = rateLimits?.seven_day?.used_percentage ?? null;
-    const sevenDayResets = rateLimits?.seven_day?.resets_at ?? null;
+    const usage = await fetchUsage(profile.config_dir);
 
     const snapshot = insertSnapshot(
       profile.name,
-      fiveHourPct,
-      fiveHourResets,
-      sevenDayPct,
-      sevenDayResets,
-      stdout.trim()
+      usage.fiveHourPct,
+      usage.fiveHourResetsAt,
+      usage.sevenDayPct,
+      usage.sevenDayResetsAt,
+      usage.raw
     );
 
     log(
-      `Poll complete for ${profile.name}: 5h=${fiveHourPct}%, 7d=${sevenDayPct}%`
+      `Poll complete for ${profile.name}: 5h=${usage.fiveHourPct}%, 7d=${usage.sevenDayPct}%`
     );
 
     // Check alerts after successful poll
     const alertEvents = checkAlerts(profile.name, snapshot);
     for (const evt of alertEvents) {
-      const resetsAt = getResetsAt(evt, fiveHourResets, sevenDayResets);
+      const resetsAt = getResetsAt(evt, usage.fiveHourResetsAt, usage.sevenDayResetsAt);
       await pushChannelAlert(evt, profile.name, resetsAt);
     }
 
     return { profile: profile.name, success: true, snapshot };
   } catch (err: unknown) {
-    const errorMsg =
-      err instanceof Error ? err.message : String(err);
+    const errorMsg = err instanceof Error ? err.message : String(err);
     log(`Poll failed for ${profile.name}: ${errorMsg}`);
 
-    // Still record a snapshot with null values on error
+    // If rate-limited, schedule a resume notification for when the window resets
+    if (isRateLimitError(err)) {
+      log(`Rate-limit detected for ${profile.name}, looking for reset time`);
+      const lastGood = getLastSuccessfulSnapshot(profile.name);
+      const resetsAt = earliestFutureReset(
+        lastGood?.five_hour_resets_at,
+        lastGood?.seven_day_resets_at,
+      );
+      if (resetsAt) {
+        scheduleWindowResume(profile.name, resetsAt);
+      } else {
+        log(`No future resets_at found for ${profile.name}, cannot schedule resume`);
+      }
+    }
+
+    // Record a snapshot with null values on error
     const snapshot = insertSnapshot(
       profile.name,
       null,
@@ -235,11 +324,13 @@ export function restartPoller(profileName: string): void {
 
 export function stopPoller(profileName: string): void {
   stopProfileTimer(profileName);
+  cancelPendingResumes(profileName);
 }
 
 export function stopAllPollers(): void {
   for (const name of activeTimers.keys()) {
     stopProfileTimer(name);
   }
+  cancelPendingResumes();
   log("All pollers stopped");
 }

@@ -14,6 +14,7 @@ import {
   insertSnapshot,
   getLatestSnapshot,
   getLatestSnapshots,
+  getLastSuccessfulSnapshot,
   getHistory,
   createAlertSubscription,
   listAlertSubscriptions,
@@ -172,6 +173,38 @@ describe("insertSnapshot / getLatestSnapshot / getHistory", () => {
 
     const history = getHistory("lim-test", 24, 3);
     expect(history).toHaveLength(3);
+  });
+});
+
+describe("getLastSuccessfulSnapshot", () => {
+  it("returns the most recent snapshot with non-null resets_at", () => {
+    addProfile("resume-test", "/tmp/resume", 5);
+    insertSnapshot("resume-test", 45.0, "2026-03-25T18:00:00Z", 30.0, "2026-03-30T00:00:00Z", null);
+    // A later failed snapshot with null values
+    insertSnapshot("resume-test", null, null, null, null, '{"error":"rate limit"}');
+
+    const last = getLastSuccessfulSnapshot("resume-test");
+    expect(last).toBeDefined();
+    expect(last!.five_hour_pct).toBeCloseTo(45.0);
+    expect(last!.five_hour_resets_at).toBe("2026-03-25T18:00:00Z");
+  });
+
+  it("returns undefined when no successful snapshots exist", () => {
+    addProfile("no-success", "/tmp/nosuccess", 5);
+    insertSnapshot("no-success", null, null, null, null, '{"error":"auth"}');
+
+    const last = getLastSuccessfulSnapshot("no-success");
+    expect(last).toBeUndefined();
+  });
+
+  it("returns snapshot with only one resets_at present", () => {
+    addProfile("partial-reset", "/tmp/partial", 5);
+    insertSnapshot("partial-reset", 60.0, "2026-03-25T20:00:00Z", null, null, null);
+
+    const last = getLastSuccessfulSnapshot("partial-reset");
+    expect(last).toBeDefined();
+    expect(last!.five_hour_resets_at).toBe("2026-03-25T20:00:00Z");
+    expect(last!.seven_day_resets_at).toBeNull();
   });
 });
 
