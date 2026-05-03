@@ -38,6 +38,23 @@ export interface UsageSnapshot {
   polled_at: string;
 }
 
+export interface GeminiQuotaSnapshot {
+  id: number;
+  timestamp: string;
+  model_id: string;
+  remaining_fraction: number;
+  remaining_amount: string | null;
+  reset_time: string | null;
+}
+
+export interface GeminiQuotaUsage {
+  model_id: string;
+  used_pct: number;
+  reset_time: string | null;
+  remaining_amount: string | null;
+  timestamp: string;
+}
+
 export interface PollResult {
   profile: string;
   success: boolean;

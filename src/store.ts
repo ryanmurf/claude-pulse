@@ -2,7 +2,15 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import type { Profile, ProfileVendor, UsageSnapshot, AlertSubscription, AlertEvent, AlertType } from "./types.js";
+import type {
+  Profile,
+  ProfileVendor,
+  UsageSnapshot,
+  GeminiQuotaSnapshot,
+  AlertSubscription,
+  AlertEvent,
+  AlertType,
+} from "./types.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".claude-pulse");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "usage.db");
@@ -68,6 +76,22 @@ export function initDb(dbPath?: string): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_snapshots_profile_time
       ON usage_snapshots(profile, polled_at)
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gemini_quota (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      model_id TEXT NOT NULL,
+      remaining_fraction REAL NOT NULL,
+      remaining_amount TEXT,
+      reset_time TEXT
+    )
+  `);
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_gemini_quota_model_time
+      ON gemini_quota(model_id, timestamp)
   `);
 
   db.exec(`
@@ -284,6 +308,63 @@ export function getHistory(
      ORDER BY polled_at DESC
      LIMIT ?`
   ).all(profile, hours, limit) as unknown as UsageSnapshot[];
+}
+
+// --- Gemini quota functions ---
+
+export function insertGeminiQuotaSnapshots(
+  buckets: {
+    modelId: string;
+    remainingFraction: number;
+    remainingAmount: string | null;
+    resetTime: string | null;
+  }[]
+): GeminiQuotaSnapshot[] {
+  if (buckets.length === 0) return [];
+
+  const d = getDb();
+  const stmt = d.prepare(
+    `INSERT INTO gemini_quota
+       (model_id, remaining_fraction, remaining_amount, reset_time)
+     VALUES (?, ?, ?, ?)`
+  );
+  const rows: GeminiQuotaSnapshot[] = [];
+
+  d.exec("BEGIN");
+  try {
+    for (const bucket of buckets) {
+      const result = stmt.run(
+        bucket.modelId,
+        bucket.remainingFraction,
+        bucket.remainingAmount,
+        bucket.resetTime
+      );
+      rows.push(
+        d.prepare("SELECT * FROM gemini_quota WHERE id = ?")
+          .get(result.lastInsertRowid) as unknown as GeminiQuotaSnapshot
+      );
+    }
+    d.exec("COMMIT");
+  } catch (err) {
+    d.exec("ROLLBACK");
+    throw err;
+  }
+
+  return rows;
+}
+
+export function getLatestGeminiQuota(): GeminiQuotaSnapshot[] {
+  const d = getDb();
+  return d.prepare(
+    `SELECT *
+     FROM gemini_quota
+     WHERE id IN (
+       SELECT MAX(id)
+       FROM gemini_quota
+       GROUP BY model_id
+     )
+     ORDER BY model_id`
+  ).all() as unknown as GeminiQuotaSnapshot[];
 }
 
 // --- Alert Subscription functions ---

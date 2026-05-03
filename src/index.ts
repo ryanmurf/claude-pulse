@@ -15,6 +15,7 @@ import {
   updateProfileApiKey,
   getLatestSnapshot,
   getLatestSnapshots,
+  getLatestGeminiQuota,
   getHistory,
   closeDb,
   createAlertSubscription,
@@ -34,6 +35,12 @@ import {
   setMcpServer,
 } from "./poller.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
+import {
+  formatGeminiQuotaSnapshots,
+  pollGeminiQuota,
+  startGeminiPoller,
+  stopGeminiPoller,
+} from "./gemini.js";
 
 function log(msg: string): void {
   process.stderr.write(`[claude-pulse] ${new Date().toISOString()} ${msg}\n`);
@@ -187,6 +194,7 @@ server.tool(
           ],
         };
       }
+      const gemini = formatGeminiQuotaSnapshots(getLatestGeminiQuota());
       return {
         content: [
           {
@@ -199,6 +207,7 @@ server.tool(
                 seven_day_pct: snapshot.seven_day_pct,
                 seven_day_resets_at: snapshot.seven_day_resets_at,
                 polled_at: snapshot.polled_at,
+                gemini,
               },
               null,
               2
@@ -224,7 +233,37 @@ server.tool(
     });
 
     return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              profiles: result,
+              gemini: formatGeminiQuotaSnapshots(getLatestGeminiQuota()),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// --- get_gemini_quota ---
+server.tool(
+  "get_gemini_quota",
+  "Get current/latest Gemini consumer-tier quota by model. Returns used_pct and reset_time per bucket.",
+  {},
+  async () => {
+    const quota = formatGeminiQuotaSnapshots(getLatestGeminiQuota());
+    if (quota.length === 0) {
+      return {
+        content: [{ type: "text", text: "No Gemini quota data available yet." }],
+      };
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(quota, null, 2) }],
     };
   }
 );
@@ -486,9 +525,9 @@ server.tool(
       };
     }
 
-    const results = await pollAllProfiles();
+    const [results, gemini] = await Promise.all([pollAllProfiles(), pollGeminiQuota()]);
     return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify({ profiles: results, gemini }, null, 2) }],
     };
   }
 );
@@ -750,6 +789,7 @@ async function main(): Promise<void> {
 
   // Start background pollers
   startAllPollers();
+  startGeminiPoller();
 
   // Start HTTP dashboard
   startHttpServer();
@@ -763,6 +803,7 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     log("Shutting down...");
     stopAllPollers();
+    stopGeminiPoller();
     stopHttpServer();
     closeDb();
     process.exit(0);

@@ -112,7 +112,7 @@ describe("pollProfile", () => {
     expect(result.snapshot!.seven_day_pct).toBeNull();
   });
 
-  it("calls fetchUsage with the profile config_dir", async () => {
+  it("calls fetchUsage with the profile", async () => {
     mockUsageSuccess({
       fiveHourPct: 25.0,
       fiveHourResetsAt: "2026-03-25T15:00:00Z",
@@ -123,7 +123,13 @@ describe("pollProfile", () => {
 
     await pollProfile("test-profile");
 
-    expect(mockFetchUsage).toHaveBeenCalledWith("/tmp/test-config");
+    expect(mockFetchUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "test-profile",
+        config_dir: "/tmp/test-config",
+        vendor: "anthropic-oauth",
+      })
+    );
   });
 });
 
