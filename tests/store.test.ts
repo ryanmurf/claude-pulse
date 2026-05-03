@@ -25,6 +25,7 @@ import {
   acknowledgeAllAlerts,
   insertGeminiQuotaSnapshots,
   getLatestGeminiQuota,
+  redactProfile,
 } from "../src/store.js";
 
 let tmpDir: string;
@@ -96,6 +97,23 @@ describe("addProfile / getProfile / removeProfile", () => {
   it("returns false when removing non-existent profile", () => {
     const removed = removeProfile("ghost");
     expect(removed).toBe(false);
+  });
+});
+
+describe("redactProfile", () => {
+  it("masks stored API keys and preserves null keys", () => {
+    const profileWithKey = addProfile(
+      "with-key",
+      "/tmp/with-key",
+      5,
+      "deepseek-balance",
+      10,
+      "sk-secret"
+    );
+    const profileWithoutKey = addProfile("without-key", "/tmp/without-key", 5);
+
+    expect(redactProfile(profileWithKey).api_key).toBe("***");
+    expect(redactProfile(profileWithoutKey).api_key).toBeNull();
   });
 });
 

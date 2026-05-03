@@ -159,6 +159,10 @@ export function listProfiles(): Profile[] {
   return d.prepare("SELECT * FROM profiles ORDER BY name").all() as unknown as Profile[];
 }
 
+export function redactProfile(p: Profile): Omit<Profile, "api_key"> & { api_key: string | null } {
+  return { ...p, api_key: p.api_key ? "***" : null };
+}
+
 export function getProfile(name: string): Profile | undefined {
   const d = getDb();
   const row = d.prepare("SELECT * FROM profiles WHERE name = ?").get(name);

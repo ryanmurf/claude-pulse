@@ -7,6 +7,7 @@ import {
   initDb,
   ensureDefaultProfiles,
   listProfiles,
+  redactProfile,
   getProfile,
   addProfile,
   removeProfile,
@@ -357,7 +358,7 @@ server.tool(
   "List all configured profiles with their config dirs and poll intervals.",
   {},
   async () => {
-    const profiles = listProfiles();
+    const profiles = listProfiles().map(redactProfile);
     return {
       content: [{ type: "text", text: JSON.stringify(profiles, null, 2) }],
     };
@@ -422,7 +423,7 @@ server.tool(
       content: [
         {
           type: "text",
-          text: `Profile added and poller started:\n${JSON.stringify(profile, null, 2)}`,
+          text: `Profile added and poller started:\n${JSON.stringify(redactProfile(profile), null, 2)}`,
         },
       ],
     };
