@@ -360,7 +360,7 @@ server.tool(
   async () => {
     const profiles = listProfiles();
     return {
-      content: [{ type: "text", text: JSON.stringify(profiles, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(profiles.map(redactProfile), null, 2) }],
     };
   }
 );
