@@ -3,6 +3,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { redactProfile } from "./redact.js";
 import {
   initDb,
   ensureDefaultProfiles,
@@ -422,7 +423,11 @@ server.tool(
       content: [
         {
           type: "text",
-          text: `Profile added and poller started:\n${JSON.stringify(profile, null, 2)}`,
+          text: `Profile added and poller started:\n${JSON.stringify(
+            redactProfile(profile),
+            null,
+            2
+          )}`,
         },
       ],
     };

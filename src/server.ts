@@ -1,5 +1,6 @@
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { redactProfile } from "./redact.js";
 import {
   listProfiles,
   getLatestSnapshot,
@@ -148,7 +149,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/profiles
     if (pathname === "/api/profiles" && method === "GET") {
-      sendJson(res, listProfiles());
+      sendJson(res, listProfiles().map(redactProfile));
       return;
     }
 
