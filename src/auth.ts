@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import os from "node:os";
 
 const execFileAsync = promisify(execFile);
@@ -59,12 +61,42 @@ async function readFromMacKeychain(configDir: string): Promise<OAuthTokens | nul
 }
 
 /**
+ * Read OAuth credentials from the Linux plain-JSON credentials file.
+ * Claude Code on Linux stores credentials at `<configDir>/.credentials.json`.
+ */
+async function readFromLinuxCredentialsFile(configDir: string): Promise<OAuthTokens | null> {
+  if (process.platform === "darwin") return null;
+
+  const credsPath = path.join(configDir, ".credentials.json");
+  try {
+    const raw = await readFile(credsPath, "utf-8");
+    const creds: KeychainCredentials = JSON.parse(raw);
+    if (!creds.claudeAiOauth?.accessToken) {
+      log(`No claudeAiOauth.accessToken in ${credsPath}`);
+      return null;
+    }
+    return creds.claudeAiOauth;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      log(`No credentials file at ${credsPath}`);
+    } else {
+      log(`Failed to read ${credsPath}: ${err}`);
+    }
+    return null;
+  }
+}
+
+/**
  * Get OAuth tokens for a config dir.
- * Reads fresh from the keychain each time — the CLI handles token refresh,
- * so the keychain stays up-to-date as long as a session is active.
+ * Reads fresh each time — the CLI handles token refresh, so the source
+ * (keychain on macOS, plain JSON on Linux) stays up-to-date.
  */
 export async function getOAuthTokens(configDir: string): Promise<OAuthTokens | null> {
-  const tokens = await readFromMacKeychain(configDir);
+  const tokens =
+    process.platform === "darwin"
+      ? await readFromMacKeychain(configDir)
+      : await readFromLinuxCredentialsFile(configDir);
   if (!tokens) return null;
 
   if (tokens.expiresAt < Date.now()) {

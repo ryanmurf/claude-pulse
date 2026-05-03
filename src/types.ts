@@ -1,7 +1,12 @@
+export type ProfileVendor = "anthropic-oauth" | "deepseek-balance";
+
 export interface Profile {
   name: string;
   config_dir: string;
   poll_interval_minutes: number;
+  vendor: ProfileVendor;
+  monthly_budget_usd: number | null;
+  api_key: string | null;
   created_at: string;
   updated_at: string;
 }

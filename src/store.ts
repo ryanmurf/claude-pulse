@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import type { Profile, UsageSnapshot, AlertSubscription, AlertEvent, AlertType } from "./types.js";
+import type { Profile, ProfileVendor, UsageSnapshot, AlertSubscription, AlertEvent, AlertType } from "./types.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".claude-pulse");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "usage.db");
@@ -30,10 +30,27 @@ export function initDb(dbPath?: string): void {
       name TEXT PRIMARY KEY,
       config_dir TEXT NOT NULL,
       poll_interval_minutes INTEGER NOT NULL DEFAULT 5,
+      vendor TEXT NOT NULL DEFAULT 'anthropic-oauth',
+      monthly_budget_usd REAL,
+      api_key TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+
+  // Migrate older DBs that pre-date the vendor/budget/api_key columns.
+  const cols = (db
+    .prepare("PRAGMA table_info(profiles)")
+    .all() as { name: string }[]).map((c) => c.name);
+  if (!cols.includes("vendor")) {
+    db.exec("ALTER TABLE profiles ADD COLUMN vendor TEXT NOT NULL DEFAULT 'anthropic-oauth'");
+  }
+  if (!cols.includes("monthly_budget_usd")) {
+    db.exec("ALTER TABLE profiles ADD COLUMN monthly_budget_usd REAL");
+  }
+  if (!cols.includes("api_key")) {
+    db.exec("ALTER TABLE profiles ADD COLUMN api_key TEXT");
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS usage_snapshots (
@@ -127,14 +144,43 @@ export function getProfile(name: string): Profile | undefined {
 export function addProfile(
   name: string,
   configDir: string,
-  pollIntervalMinutes: number = 5
+  pollIntervalMinutes: number = 5,
+  vendor: ProfileVendor = "anthropic-oauth",
+  monthlyBudgetUsd: number | null = null,
+  apiKey: string | null = null
 ): Profile {
   const d = getDb();
   d.prepare(
-    `INSERT INTO profiles (name, config_dir, poll_interval_minutes)
-     VALUES (?, ?, ?)`
-  ).run(name, configDir, pollIntervalMinutes);
+    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(name, configDir, pollIntervalMinutes, vendor, monthlyBudgetUsd, apiKey);
   return getProfile(name)!;
+}
+
+export function updateProfileBudget(
+  name: string,
+  monthlyBudgetUsd: number | null
+): boolean {
+  const d = getDb();
+  const result = d.prepare(
+    `UPDATE profiles
+     SET monthly_budget_usd = ?, updated_at = datetime('now')
+     WHERE name = ?`
+  ).run(monthlyBudgetUsd, name);
+  return Number(result.changes) > 0;
+}
+
+export function updateProfileApiKey(
+  name: string,
+  apiKey: string | null
+): boolean {
+  const d = getDb();
+  const result = d.prepare(
+    `UPDATE profiles
+     SET api_key = ?, updated_at = datetime('now')
+     WHERE name = ?`
+  ).run(apiKey, name);
+  return Number(result.changes) > 0;
 }
 
 export function removeProfile(name: string): boolean {

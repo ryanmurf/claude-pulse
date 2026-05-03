@@ -194,7 +194,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
   try {
     log(`Polling profile: ${profile.name} (config_dir: ${profile.config_dir})`);
 
-    const usage = await fetchUsage(profile.config_dir);
+    const usage = await fetchUsage(profile);
 
     const snapshot = insertSnapshot(
       profile.name,

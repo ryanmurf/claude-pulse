@@ -11,6 +11,8 @@ import {
   addProfile,
   removeProfile,
   updatePollInterval,
+  updateProfileBudget,
+  updateProfileApiKey,
   getLatestSnapshot,
   getLatestSnapshots,
   getHistory,
@@ -326,7 +328,7 @@ server.tool(
 // --- add_profile ---
 server.tool(
   "add_profile",
-  "Add a new profile with name, config_dir, and optional poll_interval.",
+  "Add a new profile. Vendor controls how usage is polled: 'anthropic-oauth' (default) reads OAuth tokens from config_dir; 'deepseek-balance' polls the DeepSeek balance API and computes % from monthly_budget_usd.",
   {
     name: z.string().describe("Profile name (unique identifier)"),
     config_dir: z.string().describe("Path to CLAUDE_CONFIG_DIR for this profile"),
@@ -335,8 +337,21 @@ server.tool(
       .optional()
       .default(5)
       .describe("Polling interval in minutes (default 5)"),
+    vendor: z
+      .enum(["anthropic-oauth", "deepseek-balance"])
+      .optional()
+      .default("anthropic-oauth")
+      .describe("Usage data source. Default 'anthropic-oauth'."),
+    monthly_budget_usd: z
+      .number()
+      .optional()
+      .describe("Monthly USD budget — required for 'deepseek-balance' to compute %."),
+    api_key: z
+      .string()
+      .optional()
+      .describe("API key for balance-vendor profiles (e.g. DeepSeek sk-...). Required for 'deepseek-balance'."),
   },
-  async ({ name, config_dir, poll_interval_minutes }) => {
+  async ({ name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key }) => {
     const existing = getProfile(name);
     if (existing) {
       return {
@@ -349,13 +364,76 @@ server.tool(
       };
     }
 
-    const profile = addProfile(name, config_dir, poll_interval_minutes);
+    if (vendor === "deepseek-balance" && !api_key) {
+      return {
+        content: [{ type: "text", text: "vendor=deepseek-balance requires api_key." }],
+      };
+    }
+
+    const profile = addProfile(
+      name,
+      config_dir,
+      poll_interval_minutes,
+      vendor,
+      monthly_budget_usd ?? null,
+      api_key ?? null
+    );
     restartPoller(name);
     return {
       content: [
         {
           type: "text",
           text: `Profile added and poller started:\n${JSON.stringify(profile, null, 2)}`,
+        },
+      ],
+    };
+  }
+);
+
+// --- set_budget ---
+server.tool(
+  "set_budget",
+  "Set or clear the monthly USD budget for a balance-vendor profile (e.g. claude-deepseek). Pass null/omit monthly_budget_usd to clear.",
+  {
+    name: z.string().describe("Profile name"),
+    monthly_budget_usd: z.number().nullable().optional().describe("Monthly budget in USD; null/omit to clear"),
+  },
+  async ({ name, monthly_budget_usd }) => {
+    const profile = getProfile(name);
+    if (!profile) {
+      return { content: [{ type: "text", text: `Profile "${name}" not found.` }] };
+    }
+    updateProfileBudget(name, monthly_budget_usd ?? null);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Set monthly_budget_usd=${monthly_budget_usd ?? "null"} for ${name}. Re-poll to see updated %.`,
+        },
+      ],
+    };
+  }
+);
+
+// --- set_api_key ---
+server.tool(
+  "set_api_key",
+  "Set or rotate the API key for a balance-vendor profile (e.g. DeepSeek sk-...). Pass null/omit api_key to clear.",
+  {
+    name: z.string().describe("Profile name"),
+    api_key: z.string().nullable().optional().describe("API key value; null/omit to clear"),
+  },
+  async ({ name, api_key }) => {
+    const profile = getProfile(name);
+    if (!profile) {
+      return { content: [{ type: "text", text: `Profile "${name}" not found.` }] };
+    }
+    updateProfileApiKey(name, api_key ?? null);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Updated api_key for ${name}.`,
         },
       ],
     };

@@ -1,8 +1,20 @@
 import { getOAuthTokens, hasProfileScope, hasInferenceScope } from "./auth.js";
 import type { OAuthTokens } from "./auth.js";
+import type { Profile } from "./types.js";
 
 function log(msg: string): void {
   process.stderr.write(`[claude-pulse] ${new Date().toISOString()} ${msg}\n`);
+}
+
+/**
+ * First UTC instant of the next calendar month — used as the synthetic
+ * "reset" time for monthly-budget vendors so dashboards/alerts can show
+ * a countdown without inventing a separate field.
+ */
+function firstOfNextMonthUtc(now: Date = new Date()): string {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  return new Date(Date.UTC(m === 11 ? y + 1 : y, m === 11 ? 0 : m + 1, 1, 0, 0, 0, 0)).toISOString();
 }
 
 export interface UsageData {
@@ -98,9 +110,85 @@ async function fetchViaHeaders(tokens: OAuthTokens): Promise<UsageData> {
   return { fiveHourPct, fiveHourResetsAt, sevenDayPct, sevenDayResetsAt, raw: body };
 }
 
-// ── Public: fetch with A → B fallback ───────────────────────────────────────
+// ── DeepSeek balance vendor ────────────────────────────────────────────────
 
-export async function fetchUsage(configDir: string): Promise<UsageData> {
+interface DeepSeekBalanceInfo {
+  currency: "USD" | "CNY";
+  total_balance: string;
+  granted_balance: string;
+  topped_up_balance: string;
+}
+
+interface DeepSeekBalanceResponse {
+  is_available: boolean;
+  balance_infos: DeepSeekBalanceInfo[];
+}
+
+async function fetchDeepSeekBalance(
+  apiKey: string,
+  monthlyBudgetUsd: number | null
+): Promise<UsageData> {
+  const response = await fetch("https://api.deepseek.com/user/balance", {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`DeepSeek balance API returned ${response.status}: ${await response.text()}`);
+  }
+
+  const data: DeepSeekBalanceResponse = (await response.json()) as DeepSeekBalanceResponse;
+  const usd = data.balance_infos.find((b) => b.currency === "USD");
+  const balanceUsd = usd ? parseFloat(usd.total_balance) : null;
+
+  // Map balance → seven_day_pct as "% of monthly budget consumed".
+  // Anchoring to monthly budget rather than topped-up balance because top-ups
+  // can happen mid-month; the budget is the user's intent.
+  let pct: number | null = null;
+  if (monthlyBudgetUsd !== null && monthlyBudgetUsd > 0 && balanceUsd !== null) {
+    const used = monthlyBudgetUsd - balanceUsd;
+    pct = Math.max(0, Math.min(100, (used / monthlyBudgetUsd) * 100));
+  }
+
+  return {
+    fiveHourPct: null,
+    fiveHourResetsAt: null,
+    sevenDayPct: pct,
+    sevenDayResetsAt: firstOfNextMonthUtc(),
+    raw: JSON.stringify({
+      vendor: "deepseek-balance",
+      balanceUsd,
+      monthlyBudgetUsd,
+      isAvailable: data.is_available,
+      apiResponse: data,
+    }),
+  };
+}
+
+// ── Public: fetch usage for a profile (vendor-aware) ───────────────────────
+
+export async function fetchUsage(configDirOrProfile: string | Profile): Promise<UsageData> {
+  if (typeof configDirOrProfile === "string") {
+    return fetchAnthropicOAuth(configDirOrProfile);
+  }
+  const profile = configDirOrProfile;
+  switch (profile.vendor) {
+    case "deepseek-balance": {
+      if (!profile.api_key) {
+        throw new Error(`Profile "${profile.name}" is vendor=deepseek-balance but has no api_key set`);
+      }
+      return fetchDeepSeekBalance(profile.api_key, profile.monthly_budget_usd);
+    }
+    case "anthropic-oauth":
+    default:
+      return fetchAnthropicOAuth(profile.config_dir);
+  }
+}
+
+async function fetchAnthropicOAuth(configDir: string): Promise<UsageData> {
   const tokens = await getOAuthTokens(configDir);
   if (!tokens) {
     throw new Error(`No OAuth tokens found for ${configDir}`);
