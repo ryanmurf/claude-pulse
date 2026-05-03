@@ -2,6 +2,7 @@ import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   listProfiles,
+  redactProfile,
   getLatestSnapshot,
   getLatestSnapshots,
   getHistory,
@@ -12,8 +13,10 @@ import {
   createAlertSubscription,
   removeAlertSubscription,
   getProfile,
+  getLatestGeminiQuota,
 } from "./store.js";
 import { pollProfile, pollAllProfiles } from "./poller.js";
+import { formatGeminiQuotaSnapshots, pollGeminiQuota } from "./gemini.js";
 import type { AlertType } from "./types.js";
 
 let httpServer: http.Server | undefined;
@@ -146,7 +149,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/profiles
     if (pathname === "/api/profiles" && method === "GET") {
-      sendJson(res, listProfiles());
+      sendJson(res, listProfiles().map(redactProfile));
       return;
     }
 
@@ -166,6 +169,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         };
       });
       sendJson(res, result);
+      return;
+    }
+
+    // GET /api/gemini-quota
+    if (pathname === "/api/gemini-quota" && method === "GET") {
+      sendJson(res, formatGeminiQuotaSnapshots(getLatestGeminiQuota()));
       return;
     }
 
@@ -256,7 +265,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       if (body.profile) {
         sendJson(res, await pollProfile(body.profile));
       } else {
-        sendJson(res, await pollAllProfiles());
+        const [profiles, gemini] = await Promise.all([pollAllProfiles(), pollGeminiQuota()]);
+        sendJson(res, { profiles, gemini });
       }
       return;
     }
@@ -361,6 +371,11 @@ tr:last-child td{border-bottom:none}
   </div>
 
   <div class="section">
+    <div class="section-hdr"><h2>Gemini</h2></div>
+    <div class="usage-grid" id="gemini-grid"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section">
     <div class="section-hdr">
       <h2>Recent Alerts</h2>
       <button class="btn btn-sm" onclick="ackAll()">Acknowledge All</button>
@@ -408,6 +423,18 @@ function timeAgo(iso){
 function barColor(p){if(p===null)return'bar-none';if(p>=80)return'bar-red';if(p>=50)return'bar-yellow';return'bar-green'}
 function paceClass(p){return'pace-'+p.replace(/ /g,'-')}
 function fmtPct(p){return p!==null?p.toFixed(1)+'%':'\\u2014'}
+function countdown(iso){
+  if(!iso)return'';
+  const ms=new Date(iso).getTime()-Date.now();
+  if(Number.isNaN(ms))return'';
+  if(ms<=0)return'resetting now';
+  const m=Math.floor(ms/60000);
+  if(m<60)return m+'m';
+  const h=Math.floor(m/60),rm=m%60;
+  if(h<24)return rm?h+'h '+rm+'m':h+'h';
+  const d=Math.floor(h/24),rh=h%24;
+  return rh?d+'d '+rh+'h':d+'d';
+}
 
 function renderUsage(usage,pace){
   const g=$('#usage-grid');
@@ -427,6 +454,17 @@ function renderWin(label,pct,pi){
   const rem=pi?pi.remaining:'';
   const pb=pi?\`<span class="pace \${paceClass(pi.pace)}">\${pi.pace}</span>\`:'';
   return\`<div class="win-row"><div class="win-lbl"><span>\${label} \${pb}</span><span><span class="pct">\${fmtPct(pct)}</span>\${rem?' <span class="resets">'+rem+' left</span>':''}</span></div><div class="bar \${c}"><div class="bar-fill" style="width:\${v}%"></div></div></div>\`;
+}
+
+function renderGemini(quota){
+  const g=$('#gemini-grid');
+  if(!quota.length){g.innerHTML='<div class="empty">No Gemini quota data yet</div>';return}
+  g.innerHTML=quota.map(q=>{
+    const reset=countdown(q.reset_time);
+    return\`<div class="card">
+      <div class="card-title">\${q.model_id}<span class="meta">\${q.timestamp?timeAgo(q.timestamp):'never polled'}</span></div>
+      <div class="win-row"><div class="win-lbl"><span>quota</span><span><span class="pct">\${fmtPct(q.used_pct)}</span>\${reset?' <span class="resets">'+reset+' left</span>':''}</span></div><div class="bar \${barColor(q.used_pct)}"><div class="bar-fill" style="width:\${Math.max(0,Math.min(100,q.used_pct))}%"></div></div></div>
+    </div>\`}).join('');
 }
 
 function renderAlerts(alerts){
@@ -467,10 +505,10 @@ function toggleThreshold(){
 
 async function refresh(){
   try{
-    const[usage,pace,alerts,subs,profiles]=await Promise.all([
-      fj('/api/usage'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles')
+    const[usage,gemini,pace,alerts,subs,profiles]=await Promise.all([
+      fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles')
     ]);
-    renderUsage(usage,pace);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
+    renderUsage(usage,pace);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
     $('#status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){$('#status').textContent='error: '+e.message}
 }

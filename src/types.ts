@@ -1,7 +1,12 @@
+export type ProfileVendor = "anthropic-oauth" | "deepseek-balance";
+
 export interface Profile {
   name: string;
   config_dir: string;
   poll_interval_minutes: number;
+  vendor: ProfileVendor;
+  monthly_budget_usd: number | null;
+  api_key: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -31,6 +36,23 @@ export interface UsageSnapshot {
   seven_day_resets_at: string | null;
   raw_response: string | null;
   polled_at: string;
+}
+
+export interface GeminiQuotaSnapshot {
+  id: number;
+  timestamp: string;
+  model_id: string;
+  remaining_fraction: number;
+  remaining_amount: string | null;
+  reset_time: string | null;
+}
+
+export interface GeminiQuotaUsage {
+  model_id: string;
+  used_pct: number;
+  reset_time: string | null;
+  remaining_amount: string | null;
+  timestamp: string;
 }
 
 export interface PollResult {

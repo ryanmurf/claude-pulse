@@ -23,6 +23,9 @@ import {
   getTriggeredAlerts,
   acknowledgeAlert,
   acknowledgeAllAlerts,
+  insertGeminiQuotaSnapshots,
+  getLatestGeminiQuota,
+  redactProfile,
 } from "../src/store.js";
 
 let tmpDir: string;
@@ -94,6 +97,23 @@ describe("addProfile / getProfile / removeProfile", () => {
   it("returns false when removing non-existent profile", () => {
     const removed = removeProfile("ghost");
     expect(removed).toBe(false);
+  });
+});
+
+describe("redactProfile", () => {
+  it("masks stored API keys and preserves null keys", () => {
+    const profileWithKey = addProfile(
+      "with-key",
+      "/tmp/with-key",
+      5,
+      "deepseek-balance",
+      10,
+      "sk-secret"
+    );
+    const profileWithoutKey = addProfile("without-key", "/tmp/without-key", 5);
+
+    expect(redactProfile(profileWithKey).api_key).toBe("***");
+    expect(redactProfile(profileWithoutKey).api_key).toBeNull();
   });
 });
 
@@ -205,6 +225,38 @@ describe("getLastSuccessfulSnapshot", () => {
     expect(last).toBeDefined();
     expect(last!.five_hour_resets_at).toBe("2026-03-25T20:00:00Z");
     expect(last!.seven_day_resets_at).toBeNull();
+  });
+});
+
+describe("gemini quota snapshots", () => {
+  it("inserts and returns latest Gemini quota per model", () => {
+    insertGeminiQuotaSnapshots([
+      {
+        modelId: "gemini-2.5-pro",
+        remainingFraction: 0.73,
+        remainingAmount: "730",
+        resetTime: "2026-05-04T07:00:00Z",
+      },
+      {
+        modelId: "gemini-2.5-flash",
+        remainingFraction: 0.5,
+        remainingAmount: null,
+        resetTime: "2026-05-04T07:00:00Z",
+      },
+    ]);
+    insertGeminiQuotaSnapshots([
+      {
+        modelId: "gemini-2.5-pro",
+        remainingFraction: 0.2,
+        remainingAmount: "200",
+        resetTime: "2026-05-05T07:00:00Z",
+      },
+    ]);
+
+    const latest = getLatestGeminiQuota();
+    expect(latest).toHaveLength(2);
+    expect(latest.find((q) => q.model_id === "gemini-2.5-pro")!.remaining_fraction).toBeCloseTo(0.2);
+    expect(latest.find((q) => q.model_id === "gemini-2.5-flash")!.remaining_fraction).toBeCloseTo(0.5);
   });
 });
 
