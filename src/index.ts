@@ -34,7 +34,10 @@ import {
   stopPoller,
   stopAllPollers,
   setMcpServer,
+  startContextPoller,
+  pollContextOnce,
 } from "./poller.js";
+import { getContextForProfile } from "./context.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
   formatGeminiQuotaSnapshots,
@@ -247,6 +250,112 @@ server.tool(
           ),
         },
       ],
+    };
+  }
+);
+
+// --- get_context_usage ---
+server.tool(
+  "get_context_usage",
+  "Get current context-window usage for a profile (or all). Reads the most-recently-modified session JSONL under <config_dir>/projects/<slug>/, sums input + cache_read + cache_creation on the latest assistant turn, and computes pct against the model's effective context window. Use this to decide when to /compact.",
+  {
+    profile: z
+      .string()
+      .optional()
+      .describe("Profile name. Omit for all profiles."),
+    live: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("If true, re-read JSONL right now instead of returning cached snapshot."),
+  },
+  async ({ profile, live }) => {
+    // Optional fresh read
+    if (live) {
+      await pollContextOnce();
+    }
+    const profilesToShow = profile
+      ? (getProfile(profile) ? [getProfile(profile)!] : [])
+      : listProfiles();
+    if (profile && profilesToShow.length === 0) {
+      return { content: [{ type: "text", text: `Profile "${profile}" not found.` }] };
+    }
+    const out = profilesToShow.map((p) => {
+      const snap = getLatestSnapshot(p.name);
+      if (!snap || snap.context_pct === null) {
+        // Attempt one direct read for profiles that have never been polled
+        const direct = p.vendor === "deepseek-balance" ? null : getContextForProfile(p.config_dir);
+        if (!direct) {
+          return { profile: p.name, context_tokens: null, context_pct: null, effective_context: null, session_id: null, model: null, last_reset_at: null, tokens_until_compact_recommended: null, polled_at: null };
+        }
+        return {
+          profile: p.name,
+          context_tokens: direct.context_tokens,
+          context_pct: direct.context_pct,
+          effective_context: direct.effective_context,
+          session_id: direct.session_id,
+          model: direct.model,
+          last_reset_at: direct.last_reset_at,
+          tokens_until_compact_recommended: direct.tokens_until_compact_recommended,
+          polled_at: null,
+        };
+      }
+      const tokens = snap.context_tokens ?? 0;
+      const limit = snap.context_effective_limit ?? 200_000;
+      const compactAt = Math.floor(limit * 0.75);
+      return {
+        profile: p.name,
+        context_tokens: snap.context_tokens,
+        context_pct: snap.context_pct,
+        effective_context: snap.context_effective_limit,
+        session_id: snap.context_session_id,
+        model: snap.context_model,
+        last_reset_at: snap.context_last_reset_at,
+        tokens_until_compact_recommended: Math.max(0, compactAt - tokens),
+        polled_at: snap.polled_at,
+      };
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(profile ? out[0] : { profiles: out }, null, 2) }],
+    };
+  }
+);
+
+// --- get_context_pace ---
+server.tool(
+  "get_context_pace",
+  "Compact one-line context pace summary per profile (similar to get_pace but for context windows).",
+  {
+    profile: z.string().optional().describe("Profile name. Omit for all profiles."),
+  },
+  async ({ profile }) => {
+    const profilesToShow = profile
+      ? (getProfile(profile) ? [getProfile(profile)!] : [])
+      : listProfiles();
+    if (profile && profilesToShow.length === 0) {
+      return { content: [{ type: "text", text: `Profile "${profile}" not found.` }] };
+    }
+    const lines: string[] = [];
+    for (const p of profilesToShow) {
+      const snap = getLatestSnapshot(p.name);
+      if (!snap || snap.context_pct === null) {
+        lines.push(`${p.name} ctx: (no data)`);
+        continue;
+      }
+      const pct = snap.context_pct;
+      const tokens = snap.context_tokens ?? 0;
+      const limit = snap.context_effective_limit ?? 200_000;
+      let band: string;
+      if (pct >= 90) band = "CRITICAL — compact now";
+      else if (pct >= 75) band = "high — consider /compact";
+      else if (pct >= 50) band = "moderate";
+      else band = "ok";
+      lines.push(
+        `${p.name} ctx: ${pct.toFixed(1)}% (${tokens.toLocaleString()}/${limit.toLocaleString()}, model=${snap.context_model ?? "?"}) — ${band}`
+      );
+    }
+    return {
+      content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No context data." }],
     };
   }
 );
@@ -540,8 +649,8 @@ server.tool(
   {
     profile: z.string().describe("Profile name to subscribe alerts for"),
     alert_type: z
-      .enum(["five_hour_threshold", "seven_day_threshold", "auth_failure"])
-      .describe("Type of alert"),
+      .enum(["five_hour_threshold", "seven_day_threshold", "auth_failure", "context_threshold"])
+      .describe("Type of alert. context_threshold fires when the current session's context-window % exceeds the threshold (use to drive auto-/compact)."),
     threshold: z
       .number()
       .optional()
@@ -791,6 +900,7 @@ async function main(): Promise<void> {
   // Start background pollers
   startAllPollers();
   startGeminiPoller();
+  startContextPoller();
 
   // Start HTTP dashboard
   startHttpServer();

@@ -5,12 +5,17 @@ import {
   listProfiles,
   getProfile,
   getLastSuccessfulSnapshot,
+  upsertContextOnLatestSnapshot,
+  type ContextSnapshotFields,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
 import { fetchUsage } from "./usage.js";
+import { getContextForProfile, type ContextReadResult } from "./context.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
+let contextTimer: ReturnType<typeof setInterval> | undefined;
+const CONTEXT_POLL_INTERVAL_MS = 30_000; // 30s — JSONL-scan is cheap (tail read)
 
 let mcpServerInstance: McpServer | undefined;
 
@@ -185,6 +190,18 @@ function getResetsAt(
   return null;
 }
 
+function contextResultToFields(r: ContextReadResult | null): ContextSnapshotFields | null {
+  if (!r) return null;
+  return {
+    context_tokens: r.context_tokens,
+    context_pct: r.context_pct,
+    context_session_id: r.session_id,
+    context_model: r.model,
+    context_effective_limit: r.effective_context,
+    context_last_reset_at: r.last_reset_at,
+  };
+}
+
 export async function pollProfile(profileName: string): Promise<PollResult> {
   const profile = getProfile(profileName);
   if (!profile) {
@@ -196,13 +213,25 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
 
     const usage = await fetchUsage(profile);
 
+    // Read current context-window state from the most recent session JSONL.
+    // Anthropic-oauth profiles only — DeepSeek-balance has no Claude Code session.
+    let ctxFields: ContextSnapshotFields | null = null;
+    if (profile.vendor !== "deepseek-balance") {
+      try {
+        ctxFields = contextResultToFields(getContextForProfile(profile.config_dir));
+      } catch (e) {
+        log(`Context read failed for ${profile.name}: ${(e as Error).message}`);
+      }
+    }
+
     const snapshot = insertSnapshot(
       profile.name,
       usage.fiveHourPct,
       usage.fiveHourResetsAt,
       usage.sevenDayPct,
       usage.sevenDayResetsAt,
-      usage.raw
+      usage.raw,
+      ctxFields
     );
 
     log(
@@ -236,14 +265,23 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
       }
     }
 
-    // Record a snapshot with null values on error
+    // Record a snapshot with null usage values on error, but still try to capture context
+    let ctxFields: ContextSnapshotFields | null = null;
+    if (profile.vendor !== "deepseek-balance") {
+      try {
+        ctxFields = contextResultToFields(getContextForProfile(profile.config_dir));
+      } catch (e) {
+        log(`Context read failed during error path for ${profile.name}: ${(e as Error).message}`);
+      }
+    }
     const snapshot = insertSnapshot(
       profile.name,
       null,
       null,
       null,
       null,
-      JSON.stringify({ error: errorMsg })
+      JSON.stringify({ error: errorMsg }),
+      ctxFields
     );
 
     // Check alerts after failed poll (auth_failure detection)
@@ -332,5 +370,56 @@ export function stopAllPollers(): void {
     stopProfileTimer(name);
   }
   cancelPendingResumes();
+  stopContextPoller();
   log("All pollers stopped");
+}
+
+// ── Context-only polling loop ──────────────────────────────────────────────
+// Reads each profile's current-session JSONL on a fast cadence (30s) and
+// updates context_* fields on the latest snapshot. Cheap (tail read).
+
+export async function pollContextOnce(): Promise<void> {
+  const profiles = listProfiles();
+  for (const p of profiles) {
+    if (p.vendor === "deepseek-balance") continue;
+    try {
+      const ctx = getContextForProfile(p.config_dir);
+      if (!ctx) continue;
+      const fields: ContextSnapshotFields = {
+        context_tokens: ctx.context_tokens,
+        context_pct: ctx.context_pct,
+        context_session_id: ctx.session_id,
+        context_model: ctx.model,
+        context_effective_limit: ctx.effective_context,
+        context_last_reset_at: ctx.last_reset_at,
+      };
+      const snapshot = upsertContextOnLatestSnapshot(p.name, fields);
+      // Evaluate ONLY context alerts on this fast loop — 5h/7d are handled by the slow loop.
+      const alertEvents = checkAlerts(p.name, snapshot, ["context_threshold"]);
+      for (const evt of alertEvents) {
+        await pushChannelAlert(evt, p.name, null);
+      }
+    } catch (e) {
+      log(`Context poll failed for ${p.name}: ${(e as Error).message}`);
+    }
+  }
+}
+
+export function startContextPoller(intervalMs: number = CONTEXT_POLL_INTERVAL_MS): void {
+  stopContextPoller();
+  // Run immediately then on interval
+  pollContextOnce().catch((e) => log(`Initial context poll error: ${e}`));
+  contextTimer = setInterval(() => {
+    pollContextOnce().catch((e) => log(`Context poll error: ${e}`));
+  }, intervalMs);
+  contextTimer.unref();
+  log(`Context poller started (every ${Math.round(intervalMs / 1000)}s)`);
+}
+
+export function stopContextPoller(): void {
+  if (contextTimer) {
+    clearInterval(contextTimer);
+    contextTimer = undefined;
+    log("Context poller stopped");
+  }
 }

@@ -69,9 +69,33 @@ export function initDb(dbPath?: string): void {
       seven_day_pct REAL,
       seven_day_resets_at TEXT,
       raw_response TEXT,
-      polled_at TEXT NOT NULL DEFAULT (datetime('now'))
+      polled_at TEXT NOT NULL DEFAULT (datetime('now')),
+      context_tokens INTEGER,
+      context_pct REAL,
+      context_session_id TEXT,
+      context_model TEXT,
+      context_effective_limit INTEGER,
+      context_last_reset_at TEXT
     )
   `);
+
+  // Migrate older snapshot rows that pre-date the context-* columns.
+  const snapCols = (db
+    .prepare("PRAGMA table_info(usage_snapshots)")
+    .all() as { name: string }[]).map((c) => c.name);
+  for (const c of [
+    "context_tokens INTEGER",
+    "context_pct REAL",
+    "context_session_id TEXT",
+    "context_model TEXT",
+    "context_effective_limit INTEGER",
+    "context_last_reset_at TEXT",
+  ]) {
+    const colName = c.split(" ")[0];
+    if (!snapCols.includes(colName)) {
+      db.exec(`ALTER TABLE usage_snapshots ADD COLUMN ${c}`);
+    }
+  }
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_snapshots_profile_time
@@ -98,7 +122,7 @@ export function initDb(dbPath?: string): void {
     CREATE TABLE IF NOT EXISTS alert_subscriptions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
-      alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure')),
+      alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
       threshold REAL,
       channel TEXT,
       cooldown_minutes INTEGER NOT NULL DEFAULT 30,
@@ -106,6 +130,46 @@ export function initDb(dbPath?: string): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+
+  // For existing DBs created with the old CHECK constraint, recreate the table
+  // without the constraint blocking 'context_threshold'. SQLite can't ALTER a
+  // CHECK constraint in place, so detect-and-rebuild only when needed.
+  // BEGIN IMMEDIATE acquires an exclusive write lock so concurrent claude-pulse
+  // processes don't race on the DROP/RENAME.
+  try {
+    const tableSql = (db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'")
+      .get() as { sql: string } | undefined)?.sql ?? "";
+    if (tableSql && !tableSql.includes("context_threshold")) {
+      db.exec("BEGIN IMMEDIATE");
+      // Re-check inside the transaction in case another process already migrated.
+      const recheckSql = (db
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'")
+        .get() as { sql: string } | undefined)?.sql ?? "";
+      if (!recheckSql.includes("context_threshold")) {
+        db.exec(`DROP TABLE IF EXISTS alert_subscriptions__new`);
+        db.exec(`
+          CREATE TABLE alert_subscriptions__new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
+            alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
+            threshold REAL,
+            channel TEXT,
+            cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )
+        `);
+        db.exec(`INSERT INTO alert_subscriptions__new SELECT * FROM alert_subscriptions`);
+        db.exec(`DROP TABLE alert_subscriptions`);
+        db.exec(`ALTER TABLE alert_subscriptions__new RENAME TO alert_subscriptions`);
+      }
+      db.exec("COMMIT");
+    }
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* noop */ }
+    process.stderr.write(`[claude-pulse] alert_subscriptions migration warning: ${(e as Error).message}\n`);
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS alert_events (
@@ -232,30 +296,84 @@ export function updatePollInterval(
   return Number(result.changes) > 0;
 }
 
+export interface ContextSnapshotFields {
+  context_tokens: number | null;
+  context_pct: number | null;
+  context_session_id: string | null;
+  context_model: string | null;
+  context_effective_limit: number | null;
+  context_last_reset_at: string | null;
+}
+
 export function insertSnapshot(
   profile: string,
   fiveHourPct: number | null,
   fiveHourResetsAt: string | null,
   sevenDayPct: number | null,
   sevenDayResetsAt: string | null,
-  rawResponse: string | null
+  rawResponse: string | null,
+  ctx?: ContextSnapshotFields | null
 ): UsageSnapshot {
   const d = getDb();
   const result = d.prepare(
     `INSERT INTO usage_snapshots
-       (profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response)
-     VALUES (?, ?, ?, ?, ?, ?)`
+       (profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
+        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     profile,
     fiveHourPct,
     fiveHourResetsAt,
     sevenDayPct,
     sevenDayResetsAt,
-    rawResponse
+    rawResponse,
+    ctx?.context_tokens ?? null,
+    ctx?.context_pct ?? null,
+    ctx?.context_session_id ?? null,
+    ctx?.context_model ?? null,
+    ctx?.context_effective_limit ?? null,
+    ctx?.context_last_reset_at ?? null,
   );
 
   return d.prepare("SELECT * FROM usage_snapshots WHERE id = ?")
     .get(result.lastInsertRowid) as unknown as UsageSnapshot;
+}
+
+/**
+ * Update only the context-* fields on the most recent snapshot for a profile,
+ * or insert a synthetic snapshot if none exists. Used by the standalone
+ * context poller which runs on its own cadence.
+ */
+export function upsertContextOnLatestSnapshot(
+  profile: string,
+  ctx: ContextSnapshotFields,
+): UsageSnapshot {
+  const d = getDb();
+  const latest = d.prepare(
+    `SELECT * FROM usage_snapshots WHERE profile = ? ORDER BY polled_at DESC LIMIT 1`
+  ).get(profile) as unknown as UsageSnapshot | undefined;
+
+  if (latest) {
+    d.prepare(
+      `UPDATE usage_snapshots
+       SET context_tokens = ?, context_pct = ?, context_session_id = ?,
+           context_model = ?, context_effective_limit = ?, context_last_reset_at = ?
+       WHERE id = ?`
+    ).run(
+      ctx.context_tokens,
+      ctx.context_pct,
+      ctx.context_session_id,
+      ctx.context_model,
+      ctx.context_effective_limit,
+      ctx.context_last_reset_at,
+      latest.id,
+    );
+    return d.prepare("SELECT * FROM usage_snapshots WHERE id = ?")
+      .get(latest.id) as unknown as UsageSnapshot;
+  }
+
+  // No prior snapshot — insert a fresh row with only context fields populated.
+  return insertSnapshot(profile, null, null, null, null, null, ctx);
 }
 
 export function getLastSuccessfulSnapshot(
