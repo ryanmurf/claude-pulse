@@ -36,6 +36,13 @@ export interface UsageSnapshot {
   seven_day_resets_at: string | null;
   raw_response: string | null;
   polled_at: string;
+  // Context-window monitoring (nullable for backwards compat with old rows)
+  context_tokens: number | null;
+  context_pct: number | null;
+  context_session_id: string | null;
+  context_model: string | null;
+  context_effective_limit: number | null;
+  context_last_reset_at: string | null;
 }
 
 export interface GeminiQuotaSnapshot {
@@ -62,7 +69,11 @@ export interface PollResult {
   error?: string;
 }
 
-export type AlertType = "five_hour_threshold" | "seven_day_threshold" | "auth_failure";
+export type AlertType =
+  | "five_hour_threshold"
+  | "seven_day_threshold"
+  | "auth_failure"
+  | "context_threshold";
 
 export interface AlertSubscription {
   id: number;

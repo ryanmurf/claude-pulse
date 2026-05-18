@@ -195,6 +195,26 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    // GET /api/context — context-window % per profile (latest snapshot)
+    if (pathname === "/api/context" && method === "GET") {
+      const profiles = listProfiles();
+      const snapshots = getLatestSnapshots();
+      const result = profiles.map((p) => {
+        const snap = snapshots.find((s) => s.profile === p.name);
+        return {
+          profile: p.name,
+          context_tokens: snap?.context_tokens ?? null,
+          context_pct: snap?.context_pct ?? null,
+          effective_context: snap?.context_effective_limit ?? null,
+          session_id: snap?.context_session_id ?? null,
+          model: snap?.context_model ?? null,
+          last_reset_at: snap?.context_last_reset_at ?? null,
+        };
+      });
+      sendJson(res, result);
+      return;
+    }
+
     // GET /api/alerts
     if (pathname === "/api/alerts" && method === "GET") {
       const profile = url.searchParams.get("profile") || undefined;
@@ -397,6 +417,7 @@ tr:last-child td{border-bottom:none}
       <select id="sub-type" onchange="toggleThreshold()">
         <option value="five_hour_threshold">5h threshold</option>
         <option value="seven_day_threshold">7d threshold</option>
+        <option value="context_threshold">context threshold</option>
         <option value="auth_failure">Auth failure</option>
       </select>
       <input type="number" id="sub-threshold" placeholder="Threshold %" min="1" max="100" style="width:100px">
@@ -436,18 +457,29 @@ function countdown(iso){
   return rh?d+'d '+rh+'h':d+'d';
 }
 
-function renderUsage(usage,pace){
+function renderUsage(usage,pace,context){
   const g=$('#usage-grid');
   if(!usage.length){g.innerHTML='<div class="empty">No profiles configured</div>';return}
   g.innerHTML=usage.map(u=>{
     const fh=pace.find(p=>p.profile===u.profile&&p.window==='5h');
     const sd=pace.find(p=>p.profile===u.profile&&p.window==='7d');
+    const ctx=context.find(c=>c.profile===u.profile);
     return\`<div class="card">
       <div class="card-title">\${u.profile}<span class="meta">\${u.polled_at?timeAgo(u.polled_at):'never polled'}
         <button class="btn btn-sm" onclick="pollOne('\${u.profile}')">Poll</button></span></div>
       \${renderWin('5-hour',u.five_hour_pct,fh)}
       \${renderWin('7-day',u.seven_day_pct,sd)}
+      \${renderCtx(ctx)}
     </div>\`}).join('');
+}
+function renderCtx(c){
+  if(!c||c.context_pct===null)return'';
+  const pct=c.context_pct;
+  const cls=pct>=75?'bar-red':(pct>=50?'bar-yellow':'bar-green');
+  const tok=c.context_tokens!==null?c.context_tokens.toLocaleString():'?';
+  const lim=c.effective_context!==null?c.effective_context.toLocaleString():'?';
+  const mdl=c.model||'?';
+  return\`<div class="win-row"><div class="win-lbl"><span>context <span class="resets">\${mdl}</span></span><span><span class="pct">\${pct.toFixed(1)}%</span> <span class="resets">\${tok}/\${lim}</span></span></div><div class="bar \${cls}"><div class="bar-fill" style="width:\${Math.min(100,pct)}%"></div></div></div>\`;
 }
 function renderWin(label,pct,pi){
   const v=pct!==null?pct:0,c=barColor(pct);
@@ -505,10 +537,10 @@ function toggleThreshold(){
 
 async function refresh(){
   try{
-    const[usage,gemini,pace,alerts,subs,profiles]=await Promise.all([
-      fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles')
+    const[usage,gemini,pace,alerts,subs,profiles,context]=await Promise.all([
+      fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles'),fj('/api/context')
     ]);
-    renderUsage(usage,pace);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
+    renderUsage(usage,pace,context);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
     $('#status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){$('#status').textContent='error: '+e.message}
 }

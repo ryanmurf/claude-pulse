@@ -13,15 +13,20 @@ function log(msg: string): void {
  * Check all enabled alert subscriptions for a profile against the latest snapshot.
  * Creates alert events for any triggered alerts (respecting cooldown).
  * Returns the list of newly created alert events.
+ *
+ * `onlyTypes` optionally restricts evaluation to a subset (e.g. ["context_threshold"]
+ * when called from the fast context-only poller so we don't double-evaluate 5h/7d).
  */
 export function checkAlerts(
   profile: string,
-  snapshot: UsageSnapshot
+  snapshot: UsageSnapshot,
+  onlyTypes?: import("./types.js").AlertType[],
 ): AlertEvent[] {
   const subscriptions = getEnabledAlertSubscriptions(profile);
   const triggered: AlertEvent[] = [];
 
   for (const sub of subscriptions) {
+    if (onlyTypes && !onlyTypes.includes(sub.alert_type)) continue;
     let shouldAlert = false;
     let currentValue: number | null = null;
     let message = "";
@@ -58,6 +63,20 @@ export function checkAlerts(
         ) {
           shouldAlert = true;
           message = `Auth failure: ${profile} failed to authenticate during poll`;
+        }
+        break;
+      }
+      case "context_threshold": {
+        if (
+          snapshot.context_pct !== null &&
+          sub.threshold !== null &&
+          snapshot.context_pct >= sub.threshold
+        ) {
+          shouldAlert = true;
+          currentValue = snapshot.context_pct;
+          const tokens = snapshot.context_tokens ?? 0;
+          const limit = snapshot.context_effective_limit ?? 0;
+          message = `Context alert: ${profile} session ${snapshot.context_session_id ?? "?"} at ${snapshot.context_pct.toFixed(1)}% (${tokens.toLocaleString()}/${limit.toLocaleString()} tokens, threshold: ${sub.threshold}%). Consider /compact.`;
         }
         break;
       }
