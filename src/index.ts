@@ -284,7 +284,7 @@ server.tool(
       const snap = getLatestSnapshot(p.name);
       if (!snap || snap.context_pct === null) {
         // Attempt one direct read for profiles that have never been polled
-        const direct = p.vendor === "deepseek-balance" ? null : getContextForProfile(p.config_dir);
+        const direct = p.vendor === "anthropic-oauth" ? getContextForProfile(p.config_dir) : null;
         if (!direct) {
           return { profile: p.name, context_tokens: null, context_pct: null, effective_context: null, session_id: null, model: null, last_reset_at: null, tokens_until_compact_recommended: null, polled_at: null };
         }
@@ -477,7 +477,7 @@ server.tool(
 // --- add_profile ---
 server.tool(
   "add_profile",
-  "Add a new profile. Vendor controls how usage is polled: 'anthropic-oauth' (default) reads OAuth tokens from config_dir; 'deepseek-balance' polls the DeepSeek balance API and computes % from monthly_budget_usd.",
+  "Add a new profile. Vendor controls how usage is polled: 'anthropic-oauth' (default) reads OAuth tokens from config_dir; 'deepseek-balance' polls the DeepSeek balance API and computes % from monthly_budget_usd; 'openai-codex' reads the Codex CLI session rate_limits from config_dir (e.g. ~/.codex).",
   {
     name: z.string().describe("Profile name (unique identifier)"),
     config_dir: z.string().describe("Path to CLAUDE_CONFIG_DIR for this profile"),
@@ -487,7 +487,7 @@ server.tool(
       .default(5)
       .describe("Polling interval in minutes (default 5)"),
     vendor: z
-      .enum(["anthropic-oauth", "deepseek-balance"])
+      .enum(["anthropic-oauth", "deepseek-balance", "openai-codex"])
       .optional()
       .default("anthropic-oauth")
       .describe("Usage data source. Default 'anthropic-oauth'."),

@@ -213,10 +213,10 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
 
     const usage = await fetchUsage(profile);
 
-    // Read current context-window state from the most recent session JSONL.
-    // Anthropic-oauth profiles only — DeepSeek-balance has no Claude Code session.
+    // Read current context-window state from the most recent Claude Code session JSONL.
+    // Anthropic-oauth profiles only.
     let ctxFields: ContextSnapshotFields | null = null;
-    if (profile.vendor !== "deepseek-balance") {
+    if (profile.vendor === "anthropic-oauth") {
       try {
         ctxFields = contextResultToFields(getContextForProfile(profile.config_dir));
       } catch (e) {
@@ -267,7 +267,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
 
     // Record a snapshot with null usage values on error, but still try to capture context
     let ctxFields: ContextSnapshotFields | null = null;
-    if (profile.vendor !== "deepseek-balance") {
+    if (profile.vendor === "anthropic-oauth") {
       try {
         ctxFields = contextResultToFields(getContextForProfile(profile.config_dir));
       } catch (e) {
@@ -381,7 +381,7 @@ export function stopAllPollers(): void {
 export async function pollContextOnce(): Promise<void> {
   const profiles = listProfiles();
   for (const p of profiles) {
-    if (p.vendor === "deepseek-balance") continue;
+    if (p.vendor !== "anthropic-oauth") continue;
     try {
       const ctx = getContextForProfile(p.config_dir);
       if (!ctx) continue;

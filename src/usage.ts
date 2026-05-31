@@ -1,3 +1,7 @@
+import { readdir, readFile, stat } from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import type { Dirent } from "node:fs";
 import { getOAuthTokens, hasProfileScope, hasInferenceScope } from "./auth.js";
 import type { OAuthTokens } from "./auth.js";
 import type { Profile } from "./types.js";
@@ -168,6 +172,157 @@ async function fetchDeepSeekBalance(
   };
 }
 
+// ── OpenAI Codex CLI session rate limits vendor ────────────────────────────
+
+interface CodexRolloutFile {
+  path: string;
+  mtimeMs: number;
+}
+
+function expandHome(dir: string): string {
+  if (dir === "~") return os.homedir();
+  if (dir.startsWith("~/")) return path.join(os.homedir(), dir.slice(2));
+  return dir;
+}
+
+async function findCodexRolloutFiles(dir: string): Promise<CodexRolloutFile[]> {
+  const files: CodexRolloutFile[] = [];
+
+  async function walk(current: string): Promise<void> {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && /^rollout-.*\.jsonl$/.test(entry.name)) {
+        try {
+          const st = await stat(full);
+          files.push({ path: full, mtimeMs: st.mtimeMs });
+        } catch {
+          // File may disappear while a Codex session rotates; skip it.
+        }
+      }
+    }
+  }
+
+  await walk(dir);
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function findNestedCodexRateLimits(
+  value: unknown,
+  seen: Set<object> = new Set()
+): Record<string, unknown> | null {
+  if (typeof value === "string") {
+    if (!value.includes("rate_limits")) return null;
+    try {
+      return findNestedCodexRateLimits(JSON.parse(value), seen);
+    } catch {
+      return null;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return null;
+    seen.add(value);
+    for (const item of value) {
+      const found = findNestedCodexRateLimits(item, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (!isRecord(value)) return null;
+  if (seen.has(value)) return null;
+  seen.add(value);
+
+  const candidate = value.rate_limits;
+  if (isRecord(candidate) && isRecord(candidate.primary)) {
+    return candidate;
+  }
+
+  for (const child of Object.values(value)) {
+    const found = findNestedCodexRateLimits(child, seen);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function readCodexRateLimitsFromFile(jsonlPath: string): Promise<Record<string, unknown> | null> {
+  const raw = await readFile(jsonlPath, "utf8");
+  let latest: Record<string, unknown> | null = null;
+
+  for (const line of raw.split("\n")) {
+    if (!line.trim() || !line.includes("rate_limits")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const found = findNestedCodexRateLimits(parsed);
+    if (found) latest = found;
+  }
+
+  return latest;
+}
+
+function usedPercent(window: unknown): number | null {
+  if (!isRecord(window)) return null;
+  return typeof window.used_percent === "number" && Number.isFinite(window.used_percent)
+    ? window.used_percent
+    : null;
+}
+
+function epochSecondsToIso(value: unknown): string | null {
+  const seconds = typeof value === "number" || typeof value === "string"
+    ? Number(value)
+    : NaN;
+  if (!Number.isFinite(seconds)) return null;
+  const date = new Date(seconds * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function resetTime(window: unknown): string | null {
+  if (!isRecord(window)) return null;
+  return epochSecondsToIso(window.resets_at);
+}
+
+export async function fetchCodexRateLimits(configDir: string): Promise<UsageData> {
+  const sessionsDir = path.join(expandHome(configDir), "sessions");
+  const rolloutFiles = (await findCodexRolloutFiles(sessionsDir)).slice(0, 3);
+
+  for (const file of rolloutFiles) {
+    const rateLimits = await readCodexRateLimitsFromFile(file.path);
+    if (!rateLimits) continue;
+
+    return {
+      fiveHourPct: usedPercent(rateLimits.primary),
+      fiveHourResetsAt: resetTime(rateLimits.primary),
+      sevenDayPct: usedPercent(rateLimits.secondary),
+      sevenDayResetsAt: resetTime(rateLimits.secondary),
+      raw: JSON.stringify({
+        vendor: "openai-codex",
+        source: file.path,
+        rate_limits: rateLimits,
+      }),
+    };
+  }
+
+  throw new Error(`No codex rate_limits found under ${sessionsDir}`);
+}
+
 // ── Public: fetch usage for a profile (vendor-aware) ───────────────────────
 
 export async function fetchUsage(configDirOrProfile: string | Profile): Promise<UsageData> {
@@ -182,6 +337,8 @@ export async function fetchUsage(configDirOrProfile: string | Profile): Promise<
       }
       return fetchDeepSeekBalance(profile.api_key, profile.monthly_budget_usd);
     }
+    case "openai-codex":
+      return fetchCodexRateLimits(profile.config_dir);
     case "anthropic-oauth":
     default:
       return fetchAnthropicOAuth(profile.config_dir);
