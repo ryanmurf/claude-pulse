@@ -1,4 +1,4 @@
-export type ProfileVendor = "anthropic-oauth" | "deepseek-balance";
+export type ProfileVendor = "anthropic-oauth" | "deepseek-balance" | "openai-codex";
 
 export interface Profile {
   name: string;
