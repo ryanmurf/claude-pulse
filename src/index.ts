@@ -38,9 +38,9 @@ import {
   pollContextOnce,
   startTokenRollup,
 } from "./poller.js";
-import { tallyProfileTokens } from "./tokens.js";
+import { tallyProfileFineGrained } from "./tokens.js";
 import os from "node:os";
-import { getContextForProfile } from "./context.js";
+import { getContextForProfile, getAllSessionContextsForProfile } from "./context.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
   formatGeminiQuotaSnapshots,
@@ -913,38 +913,74 @@ async function uploadOnce(): Promise<number> {
   const sinceMs = Date.now() - UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
   const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
 
+  // Fine-grained token_usage rows (account + machine are inferred server-side
+  // from the ingest token — we never send them).
   const rollups: Array<{
     profile: string;
+    session_id: string;
     day: string;
     model: string;
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_tokens: number;
-    cache_read_tokens: number;
-    cost_usd: number;
+    settings: Record<string, unknown>;
+    tokens_in: number;
+    tokens_out: number;
+    cache_write_5m: number;
+    cache_write_1h: number;
+    cache_read: number;
+  }> = [];
+
+  // Current live context sessions for all local profiles.
+  const context: Array<{
+    profile: string;
+    session_id: string;
+    model: string | null;
+    context_tokens: number | null;
+    context_pct: number | null;
+    effective_limit: number | null;
+    last_active_at: string;
   }> = [];
 
   for (const p of listProfiles()) {
     try {
-      const rows = await tallyProfileTokens(p, sinceDay);
+      const rows = await tallyProfileFineGrained(p, sinceDay);
       for (const r of rows) {
         rollups.push({
           profile: p.name,
+          session_id: r.session_id,
           day: r.day,
           model: r.model,
-          input_tokens: r.input_tokens,
-          output_tokens: r.output_tokens,
-          cache_creation_tokens: r.cache_creation_tokens,
-          cache_read_tokens: r.cache_read_tokens,
-          cost_usd: r.cost_usd,
+          settings: JSON.parse(r.settings_json || "{}"),
+          tokens_in: r.tokens_in,
+          tokens_out: r.tokens_out,
+          cache_write_5m: r.cache_write_5m,
+          cache_write_1h: r.cache_write_1h,
+          cache_read: r.cache_read,
         });
       }
     } catch (e) {
       log(`Upload mode: tally failed for ${p.name}: ${(e as Error).message}`);
     }
+
+    // Live per-session context (anthropic-oauth profiles only).
+    if (p.vendor === "anthropic-oauth") {
+      try {
+        for (const s of getAllSessionContextsForProfile(p.config_dir)) {
+          context.push({
+            profile: p.name,
+            session_id: s.session_id,
+            model: s.model,
+            context_tokens: s.context_tokens,
+            context_pct: s.context_pct,
+            effective_limit: s.effective_context,
+            last_active_at: s.mtime,
+          });
+        }
+      } catch (e) {
+        log(`Upload mode: context read failed for ${p.name}: ${(e as Error).message}`);
+      }
+    }
   }
 
-  log(`Upload mode: computed ${rollups.length} rollup row(s) for host ${host}; POSTing to ${target}/api/ingest`);
+  log(`Upload mode: computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${target}/api/ingest`);
 
   const url = `${target.replace(/\/$/, "")}/api/ingest`;
   try {
@@ -954,7 +990,7 @@ async function uploadOnce(): Promise<number> {
         "Content-Type": "application/json",
         Authorization: `Bearer ${ingestToken}`,
       },
-      body: JSON.stringify({ host, rollups }),
+      body: JSON.stringify({ rollups, context }),
       signal: AbortSignal.timeout(30_000),
     });
     const text = await resp.text();

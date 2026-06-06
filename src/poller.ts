@@ -8,12 +8,17 @@ import {
   getLastSuccessfulSnapshot,
   upsertContextOnLatestSnapshot,
   upsertTokenRollup,
+  upsertTokenUsage,
+  upsertContextSession,
+  sweepStaleContextSessions,
+  resolveAccount,
+  DEFAULT_ACCOUNT_IDENTITY,
   type ContextSnapshotFields,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
 import { fetchUsage } from "./usage.js";
-import { getContextForProfile, type ContextReadResult } from "./context.js";
-import { tallyProfileTokens } from "./tokens.js";
+import { getAllSessionContextsForProfile, getContextForProfile, type ContextReadResult } from "./context.js";
+import { tallyProfileTokens, tallyProfileFineGrained } from "./tokens.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
@@ -388,28 +393,57 @@ export function stopAllPollers(): void {
 
 export async function pollContextOnce(): Promise<void> {
   const profiles = listProfiles();
+  const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
+  const machine = os.hostname();
   for (const p of profiles) {
     if (p.vendor !== "anthropic-oauth") continue;
     try {
+      // Single most-recent session drives the snapshot context_* fields +
+      // context_threshold alert (back-compat with the per-profile view).
       const ctx = getContextForProfile(p.config_dir);
-      if (!ctx) continue;
-      const fields: ContextSnapshotFields = {
-        context_tokens: ctx.context_tokens,
-        context_pct: ctx.context_pct,
-        context_session_id: ctx.session_id,
-        context_model: ctx.model,
-        context_effective_limit: ctx.effective_context,
-        context_last_reset_at: ctx.last_reset_at,
-      };
-      const snapshot = upsertContextOnLatestSnapshot(p.name, fields);
-      // Evaluate ONLY context alerts on this fast loop — 5h/7d are handled by the slow loop.
-      const alertEvents = checkAlerts(p.name, snapshot, ["context_threshold"]);
-      for (const evt of alertEvents) {
-        await pushChannelAlert(evt, p.name, null);
+      if (ctx) {
+        const fields: ContextSnapshotFields = {
+          context_tokens: ctx.context_tokens,
+          context_pct: ctx.context_pct,
+          context_session_id: ctx.session_id,
+          context_model: ctx.model,
+          context_effective_limit: ctx.effective_context,
+          context_last_reset_at: ctx.last_reset_at,
+        };
+        const snapshot = upsertContextOnLatestSnapshot(p.name, fields, accountId);
+        // Evaluate ONLY context alerts on this fast loop — 5h/7d are handled by the slow loop.
+        const alertEvents = checkAlerts(p.name, snapshot, ["context_threshold"]);
+        for (const evt of alertEvents) {
+          await pushChannelAlert(evt, p.name, null);
+        }
+      }
+
+      // Multi-session: populate context_sessions for every live session on
+      // this machine, tagged with hostname + last_active_at (the JSONL mtime).
+      const sessions = getAllSessionContextsForProfile(p.config_dir);
+      for (const s of sessions) {
+        upsertContextSession({
+          account_id: accountId,
+          profile: p.name,
+          machine,
+          session_id: s.session_id,
+          model: s.model,
+          settings_json: "{}",
+          context_tokens: s.context_tokens,
+          context_pct: s.context_pct,
+          effective_limit: s.effective_context,
+          last_active_at: s.mtime,
+        });
       }
     } catch (e) {
       log(`Context poll failed for ${p.name}: ${(e as Error).message}`);
     }
+  }
+  // Periodically drop sessions that have gone stale (>1 day inactive).
+  try {
+    sweepStaleContextSessions();
+  } catch (e) {
+    log(`Context sweep failed: ${(e as Error).message}`);
   }
 }
 
@@ -450,10 +484,12 @@ export async function runTokenRollupOnce(
   lookbackDays: number = TOKEN_ROLLUP_LOOKBACK_DAYS,
 ): Promise<void> {
   const host = os.hostname();
+  const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
   const sinceDay = lookbackSinceDay(lookbackDays);
   const profiles = listProfiles();
   for (const p of profiles) {
     try {
+      // Legacy coarse (profile,host,day,model) rollup — kept for back-compat.
       const rows = await tallyProfileTokens(p, sinceDay);
       for (const row of rows) {
         upsertTokenRollup({
@@ -471,6 +507,30 @@ export async function runTokenRollupOnce(
       }
       if (rows.length > 0) {
         log(`Token rollup: ${p.name} upserted ${rows.length} (day,model) row(s) for host ${host}`);
+      }
+
+      // Fine-grained token_usage for the local/default account.
+      const fineRows = await tallyProfileFineGrained(p, sinceDay);
+      for (const fr of fineRows) {
+        upsertTokenUsage({
+          account_id: accountId,
+          profile: p.name,
+          machine: host,
+          session_id: fr.session_id,
+          model: fr.model,
+          settings_hash: fr.settings_hash,
+          settings_json: fr.settings_json,
+          day: fr.day,
+          tokens_in: fr.tokens_in,
+          tokens_out: fr.tokens_out,
+          cache_write_5m: fr.cache_write_5m,
+          cache_write_1h: fr.cache_write_1h,
+          cache_read: fr.cache_read,
+          source: "local",
+        });
+      }
+      if (fineRows.length > 0) {
+        log(`Token usage(fine): ${p.name} upserted ${fineRows.length} grain row(s) for machine ${host}`);
       }
     } catch (e) {
       log(`Token rollup failed for ${p.name}: ${(e as Error).message}`);

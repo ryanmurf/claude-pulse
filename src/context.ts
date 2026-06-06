@@ -269,3 +269,53 @@ export function getContextForProfile(configDir: string): ContextReadResult | nul
   if (!jsonl) return null;
   return readJsonlContext(jsonl);
 }
+
+/**
+ * Read context for ALL recently-active top-level session JSONLs under a
+ * profile's config_dir (not just the single most-recent one). A machine may
+ * run several concurrent sessions; each becomes its own context_session.
+ *
+ * @param maxAgeMs only consider session files modified within this window
+ *                 (default 24h) so we don't resurrect long-dead sessions.
+ */
+export function getAllSessionContextsForProfile(
+  configDir: string,
+  maxAgeMs: number = 24 * 60 * 60 * 1000,
+): ContextReadResult[] {
+  let dir = configDir;
+  if (dir.startsWith("~/")) {
+    dir = path.join(process.env.HOME || "", dir.slice(2));
+  }
+  const projectsDir = path.join(dir, "projects");
+  let slugs: string[];
+  try {
+    slugs = fs.readdirSync(projectsDir);
+  } catch {
+    return [];
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  const out: ContextReadResult[] = [];
+  for (const slug of slugs) {
+    const slugPath = path.join(projectsDir, slug);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(slugPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (!ent.isFile() || !ent.name.endsWith(".jsonl")) continue;
+      const full = path.join(slugPath, ent.name);
+      let st: fs.Stats;
+      try {
+        st = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (st.mtimeMs < cutoff) continue;
+      const ctx = readJsonlContext(full);
+      if (ctx) out.push(ctx);
+    }
+  }
+  return out;
+}

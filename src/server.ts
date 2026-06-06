@@ -14,12 +14,26 @@ import {
   removeAlertSubscription,
   getProfile,
   getLatestGeminiQuota,
-  upsertTokenRollup,
-  getTokenReport,
+  resolveAccount,
+  listMachines,
+  mintIngestToken,
+  listIngestTokens,
+  revokeIngestToken,
+  validateIngestToken,
+  upsertTokenUsage,
+  upsertContextSession,
+  upsertMachine,
+  getActiveContextSessions,
+  getFineTokenReport,
+  getPricingDefaults,
+  getPricingOverrides,
+  upsertPricingOverride,
+  deletePricingOverride,
 } from "./store.js";
 import { pollProfile, pollAllProfiles } from "./poller.js";
 import { formatGeminiQuotaSnapshots, pollGeminiQuota } from "./gemini.js";
-import type { AlertType, TokenRollupInput } from "./types.js";
+import { mergePricing, canonicalSettings, type PricingOverrideRow } from "./pricing.js";
+import type { Account, AlertType, ReportDrill, TokenUsageInput, ContextSessionInput } from "./types.js";
 
 let httpServer: http.Server | undefined;
 
@@ -60,6 +74,11 @@ function toFiniteNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function safeParseJson(s: string | null | undefined): unknown {
+  if (!s) return {};
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
 function sendJson(res: ServerResponse, data: unknown, status = 200): void {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -79,6 +98,17 @@ function sendHtml(res: ServerResponse, html: string): void {
 
 function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, { error: message }, status);
+}
+
+/**
+ * Resolve the account for a browser/dashboard request from the oauth2-proxy
+ * `X-Auth-Request-Email` header (auto-creating on first sight). Falls back to
+ * the default account when the header is absent (direct/in-cluster calls).
+ */
+function accountForRequest(req: IncomingMessage): Account {
+  const raw = req.headers["x-auth-request-email"];
+  const email = Array.isArray(raw) ? raw[0] : raw;
+  return resolveAccount(email && email.trim() ? email : null);
 }
 
 // ── Pace computation (shared with get_pace tool) ─────────────────────────────
@@ -109,14 +139,14 @@ function formatRemaining(ms: number): string {
   return rh > 0 ? `${days}d ${rh}h` : `${days}d`;
 }
 
-function computePace(profileFilter?: string): PaceInfo[] {
+function computePace(accountId: number, profileFilter?: string): PaceInfo[] {
   const results: PaceInfo[] = [];
   const names = profileFilter
     ? [profileFilter]
     : listProfiles().map((p) => p.name);
 
   for (const name of names) {
-    const snap = getLatestSnapshot(name);
+    const snap = getLatestSnapshot(name, accountId);
     if (!snap) continue;
 
     const windows = [
@@ -175,9 +205,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/usage
+    // GET /api/me — account identity + this account's machines
+    if (pathname === "/api/me" && method === "GET") {
+      const account = accountForRequest(req);
+      sendJson(res, {
+        account: account.identity,
+        display_name: account.display_name,
+        machines: listMachines(account.id),
+      });
+      return;
+    }
+
+    // GET /api/usage — account-scoped 5h/7d per profile
     if (pathname === "/api/usage" && method === "GET") {
-      const snapshots = getLatestSnapshots();
+      const account = accountForRequest(req);
+      const snapshots = getLatestSnapshots(account.id);
       const profiles = listProfiles();
       const result = profiles.map((p) => {
         const snap = snapshots.find((s) => s.profile === p.name);
@@ -202,37 +244,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/history?profile=X&hours=24
     if (pathname === "/api/history" && method === "GET") {
+      const account = accountForRequest(req);
       const profile = url.searchParams.get("profile");
       if (!profile) { sendError(res, 400, "Missing profile parameter"); return; }
       const hours = parseInt(url.searchParams.get("hours") || "24", 10);
       const limit = parseInt(url.searchParams.get("limit") || "100", 10);
-      sendJson(res, getHistory(profile, hours, limit));
+      sendJson(res, getHistory(profile, hours, limit, account.id));
       return;
     }
 
     // GET /api/pace
     if (pathname === "/api/pace" && method === "GET") {
+      const account = accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
-      sendJson(res, computePace(profile));
+      sendJson(res, computePace(account.id, profile));
       return;
     }
 
-    // GET /api/context — context-window % per profile (latest snapshot)
+    // GET /api/context — live multi-machine context sessions grouped
+    // profile → machine → session, excluding >1-day-stale.
     if (pathname === "/api/context" && method === "GET") {
-      const profiles = listProfiles();
-      const snapshots = getLatestSnapshots();
-      const result = profiles.map((p) => {
-        const snap = snapshots.find((s) => s.profile === p.name);
-        return {
-          profile: p.name,
-          context_tokens: snap?.context_tokens ?? null,
-          context_pct: snap?.context_pct ?? null,
-          effective_context: snap?.context_effective_limit ?? null,
-          session_id: snap?.context_session_id ?? null,
-          model: snap?.context_model ?? null,
-          last_reset_at: snap?.context_last_reset_at ?? null,
-        };
-      });
+      const account = accountForRequest(req);
+      const sessions = getActiveContextSessions(account.id);
+      // Group profile → machine → session[]
+      const byProfile = new Map<string, Map<string, unknown[]>>();
+      for (const s of sessions) {
+        let machines = byProfile.get(s.profile);
+        if (!machines) { machines = new Map(); byProfile.set(s.profile, machines); }
+        let list = machines.get(s.machine);
+        if (!list) { list = []; machines.set(s.machine, list); }
+        (list as unknown[]).push({
+          session_id: s.session_id,
+          model: s.model,
+          settings: safeParseJson(s.settings_json),
+          context_tokens: s.context_tokens,
+          context_pct: s.context_pct,
+          effective_context: s.effective_limit,
+          last_active_at: s.last_active_at,
+          updated_at: s.updated_at,
+        });
+      }
+      const result = [...byProfile.entries()].map(([profile, machines]) => ({
+        profile,
+        machines: [...machines.entries()].map(([machine, list]) => ({ machine, sessions: list })),
+      }));
       sendJson(res, result);
       return;
     }
@@ -300,29 +355,84 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/reports?granularity=daily|weekly&days=30
+    // GET /api/reports?granularity=daily|weekly&days=30&drill=...&profile=...&machine=...
     if (pathname === "/api/reports" && method === "GET") {
+      const account = accountForRequest(req);
       const granularityParam = url.searchParams.get("granularity");
       const granularity = granularityParam === "weekly" ? "weekly" : "daily";
       let days = parseInt(url.searchParams.get("days") || "30", 10);
       if (!Number.isFinite(days) || days <= 0) days = 30;
       days = Math.min(days, 365);
-      sendJson(res, getTokenReport({ granularity, days }));
+      const drillParam = url.searchParams.get("drill");
+      const drill: ReportDrill =
+        drillParam === "machine" || drillParam === "session" || drillParam === "model" || drillParam === "account"
+          ? drillParam
+          : "profile";
+      const profile = url.searchParams.get("profile") || undefined;
+      const machine = url.searchParams.get("machine") || undefined;
+      sendJson(res, getFineTokenReport({
+        accountId: account.id,
+        identity: account.identity,
+        granularity,
+        days,
+        drill,
+        profile,
+        machine,
+      }));
       return;
     }
 
-    // POST /api/ingest — remote machines push their token rollups here.
+    // GET/POST/DELETE /api/ingest-tokens — mint/list/revoke (behind oauth).
+    if (pathname === "/api/ingest-tokens" && method === "GET") {
+      const account = accountForRequest(req);
+      sendJson(res, listIngestTokens(account.id));
+      return;
+    }
+    if (pathname === "/api/ingest-tokens" && method === "POST") {
+      const account = accountForRequest(req);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
+      if (!machine) { sendError(res, 400, "Missing machine name"); return; }
+      const { plaintext, token } = mintIngestToken(account.id, machine);
+      // Plaintext shown ONCE — never stored, never retrievable again.
+      sendJson(res, {
+        id: token.id,
+        account: account.identity,
+        machine: token.machine,
+        token: plaintext,
+        created_at: token.created_at,
+        note: "Store this token now — it will not be shown again.",
+      }, 201);
+      return;
+    }
+    if (pathname.startsWith("/api/ingest-tokens/") && method === "DELETE") {
+      const account = accountForRequest(req);
+      const id = parseInt(pathname.split("/").pop()!, 10);
+      if (isNaN(id)) { sendError(res, 400, "Invalid token ID"); return; }
+      sendJson(res, { success: revokeIngestToken(account.id, id) });
+      return;
+    }
+
+    // POST /api/ingest — machines push fine-grained token_usage + context.
+    // Authenticated by a per-(account,machine) ingest token (bypasses oauth).
+    // Rows are attributed to the TOKEN's account + machine — never the body.
     if (pathname === "/api/ingest" && method === "POST") {
-      const token = process.env.CLAUDE_PULSE_INGEST_TOKEN;
-      if (!token) {
-        sendError(res, 503, "Ingest disabled (CLAUDE_PULSE_INGEST_TOKEN not set)");
+      if (process.env.CLAUDE_PULSE_INGEST_DISABLED === "1") {
+        sendError(res, 503, "Ingest disabled");
         return;
       }
       const auth = req.headers["authorization"];
-      if (auth !== `Bearer ${token}`) {
-        sendError(res, 401, "Unauthorized");
-        return;
-      }
+      const bearer = typeof auth === "string" && auth.startsWith("Bearer ")
+        ? auth.slice(7).trim()
+        : "";
+      if (!bearer) { sendError(res, 401, "Missing bearer token"); return; }
+      const tokenRow = validateIngestToken(bearer);
+      if (!tokenRow) { sendError(res, 401, "Unauthorized"); return; }
+      // Authoritative (account, machine) come from the token, not the body.
+      const accountId = tokenRow.account_id;
+      const machine = tokenRow.machine;
+      upsertMachine(accountId, machine);
+
       let raw: string;
       try {
         raw = await readBody(req, INGEST_MAX_BYTES);
@@ -340,39 +450,109 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         sendError(res, 400, "Invalid JSON");
         return;
       }
-      const host = typeof body?.host === "string" ? body.host.trim() : "";
-      if (!host) {
-        sendError(res, 400, "Missing host");
-        return;
-      }
-      if (!Array.isArray(body?.rollups)) {
-        sendError(res, 400, "Missing rollups array");
-        return;
-      }
+
       let upserted = 0;
-      for (const r of body.rollups) {
-        if (!r || typeof r !== "object") continue;
-        const profile = typeof r.profile === "string" ? r.profile : "";
-        const day = typeof r.day === "string" ? r.day : "";
-        const model = typeof r.model === "string" ? r.model : "";
-        // Require the natural-key fields; skip malformed rows rather than 400 the batch.
-        if (!profile || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !model) continue;
-        const rollup: TokenRollupInput = {
-          profile,
-          host,
-          day,
-          model,
-          input_tokens: toFiniteInt(r.input_tokens),
-          output_tokens: toFiniteInt(r.output_tokens),
-          cache_creation_tokens: toFiniteInt(r.cache_creation_tokens),
-          cache_read_tokens: toFiniteInt(r.cache_read_tokens),
-          cost_usd: toFiniteNum(r.cost_usd),
-          source: "ingest",
-        };
-        upsertTokenRollup(rollup);
-        upserted++;
+      if (Array.isArray(body?.rollups)) {
+        for (const r of body.rollups) {
+          if (!r || typeof r !== "object") continue;
+          const profile = typeof r.profile === "string" ? r.profile : "";
+          const day = typeof r.day === "string" ? r.day : "";
+          const model = typeof r.model === "string" ? r.model : "";
+          const session_id = typeof r.session_id === "string" && r.session_id ? r.session_id : "";
+          if (!profile || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !model || !session_id) continue;
+          const settings = (r.settings && typeof r.settings === "object") ? r.settings : {};
+          const settings_json = canonicalSettings(settings);
+          const usageRow: TokenUsageInput = {
+            account_id: accountId,
+            profile,
+            machine,
+            session_id,
+            model,
+            settings_hash: settings_json,
+            settings_json,
+            day,
+            tokens_in: toFiniteInt(r.tokens_in),
+            tokens_out: toFiniteInt(r.tokens_out),
+            cache_write_5m: toFiniteInt(r.cache_write_5m),
+            cache_write_1h: toFiniteInt(r.cache_write_1h),
+            cache_read: toFiniteInt(r.cache_read),
+            source: "ingest",
+          };
+          upsertTokenUsage(usageRow);
+          upserted++;
+        }
       }
-      sendJson(res, { ok: true, upserted });
+
+      let contextUpserted = 0;
+      if (Array.isArray(body?.context)) {
+        for (const c of body.context) {
+          if (!c || typeof c !== "object") continue;
+          const profile = typeof c.profile === "string" ? c.profile : "";
+          const session_id = typeof c.session_id === "string" && c.session_id ? c.session_id : "";
+          if (!profile || !session_id) continue;
+          const settings = (c.settings && typeof c.settings === "object") ? c.settings : {};
+          const ctxRow: ContextSessionInput = {
+            account_id: accountId,
+            profile,
+            machine,
+            session_id,
+            model: typeof c.model === "string" ? c.model : null,
+            settings_json: canonicalSettings(settings),
+            context_tokens: c.context_tokens != null ? toFiniteInt(c.context_tokens) : null,
+            context_pct: c.context_pct != null ? toFiniteNum(c.context_pct) : null,
+            effective_limit: c.effective_limit != null ? toFiniteInt(c.effective_limit) : null,
+            last_active_at: typeof c.last_active_at === "string" && c.last_active_at
+              ? c.last_active_at
+              : new Date().toISOString(),
+          };
+          upsertContextSession(ctxRow);
+          contextUpserted++;
+        }
+      }
+
+      sendJson(res, { ok: true, upserted, context_upserted: contextUpserted });
+      return;
+    }
+
+    // GET/PUT /api/pricing · DELETE /api/pricing/:model
+    if (pathname === "/api/pricing" && method === "GET") {
+      const account = accountForRequest(req);
+      const merged = mergePricing(getPricingDefaults(), getPricingOverrides(account.id));
+      sendJson(res, { account: account.identity, rows: merged });
+      return;
+    }
+    if (pathname === "/api/pricing" && method === "PUT") {
+      const account = accountForRequest(req);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const rows = Array.isArray(body?.rows) ? body.rows : (body && typeof body === "object" ? [body] : []);
+      let saved = 0;
+      for (const r of rows) {
+        if (!r || typeof r !== "object" || typeof r.model !== "string" || !r.model) continue;
+        const settings = (r.settings_match && typeof r.settings_match === "object") ? r.settings_match : {};
+        const override: PricingOverrideRow = {
+          model: r.model,
+          settings_match_json: typeof r.settings_match_json === "string"
+            ? canonicalSettings(safeParseJson(r.settings_match_json) as Record<string, unknown>)
+            : canonicalSettings(settings),
+          input: toFiniteNum(r.input),
+          output: toFiniteNum(r.output),
+          cache_write_5m: toFiniteNum(r.cache_write_5m),
+          cache_write_1h: toFiniteNum(r.cache_write_1h),
+          cache_read: toFiniteNum(r.cache_read),
+        };
+        upsertPricingOverride(account.id, override);
+        saved++;
+      }
+      const merged = mergePricing(getPricingDefaults(), getPricingOverrides(account.id));
+      sendJson(res, { ok: true, saved, rows: merged });
+      return;
+    }
+    if (pathname.startsWith("/api/pricing/") && method === "DELETE") {
+      const account = accountForRequest(req);
+      const model = decodeURIComponent(pathname.slice("/api/pricing/".length));
+      if (!model) { sendError(res, 400, "Missing model"); return; }
+      const removed = deletePricingOverride(account.id, model);
+      sendJson(res, { ok: true, removed });
       return;
     }
 
@@ -525,10 +705,44 @@ tr:last-child td{border-bottom:none}
           <option value="30" selected>30d</option>
           <option value="90">90d</option>
         </select>
+        <select id="rpt-drill" onchange="loadReports()">
+          <option value="profile" selected>by profile</option>
+          <option value="machine">drill: machine</option>
+          <option value="session">drill: session</option>
+          <option value="model">drill: model</option>
+        </select>
       </div>
     </div>
     <div id="report-total" class="report-total"></div>
     <div class="usage-grid" id="report-grid"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-hdr"><h2>Sessions / Context</h2></div>
+    <div id="context-grid" class="usage-grid"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-hdr">
+      <h2>Settings · Machines &amp; Tokens</h2>
+    </div>
+    <div class="tbl-wrap">
+      <table><thead><tr><th>ID</th><th>Machine</th><th>Token</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+      <tbody id="tokens-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody></table>
+    </div>
+    <div class="form-row">
+      <input type="text" id="tok-machine" placeholder="machine name (e.g. laptop)" style="width:220px">
+      <button class="btn" onclick="mintToken()">Mint ingest token</button>
+      <span id="mint-result" style="font-family:var(--mono);font-size:.75rem;color:var(--green)"></span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-hdr"><h2>Settings · Pricing (USD per 1M tokens)</h2></div>
+    <div class="tbl-wrap">
+      <table><thead><tr><th>Model</th><th>Variant</th><th>Input</th><th>Output</th><th>Cache 5m</th><th>Cache 1h</th><th>Cache read</th><th></th></tr></thead>
+      <tbody id="pricing-body"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody></table>
+    </div>
   </div>
 
   <div class="section">
@@ -593,29 +807,18 @@ function countdown(iso){
   return rh?d+'d '+rh+'h':d+'d';
 }
 
-function renderUsage(usage,pace,context){
+function renderUsage(usage,pace){
   const g=$('#usage-grid');
   if(!usage.length){g.innerHTML='<div class="empty">No profiles configured</div>';return}
   g.innerHTML=usage.map(u=>{
     const fh=pace.find(p=>p.profile===u.profile&&p.window==='5h');
     const sd=pace.find(p=>p.profile===u.profile&&p.window==='7d');
-    const ctx=context.find(c=>c.profile===u.profile);
     return\`<div class="card">
       <div class="card-title">\${u.profile}<span class="meta">\${u.polled_at?timeAgo(u.polled_at):'never polled'}
         <button class="btn btn-sm" onclick="pollOne('\${u.profile}')">Poll</button></span></div>
       \${renderWin('5-hour',u.five_hour_pct,fh)}
       \${renderWin('7-day',u.seven_day_pct,sd)}
-      \${renderCtx(ctx)}
     </div>\`}).join('');
-}
-function renderCtx(c){
-  if(!c||c.context_pct===null)return'';
-  const pct=c.context_pct;
-  const cls=pct>=75?'bar-red':(pct>=50?'bar-yellow':'bar-green');
-  const tok=c.context_tokens!==null?c.context_tokens.toLocaleString():'?';
-  const lim=c.effective_context!==null?c.effective_context.toLocaleString():'?';
-  const mdl=c.model||'?';
-  return\`<div class="win-row"><div class="win-lbl"><span>context <span class="resets">\${mdl}</span></span><span><span class="pct">\${pct.toFixed(1)}%</span> <span class="resets">\${tok}/\${lim}</span></span></div><div class="bar \${cls}"><div class="bar-fill" style="width:\${Math.min(100,pct)}%"></div></div></div>\`;
 }
 function renderWin(label,pct,pi){
   const v=pct!==null?pct:0,c=barColor(pct);
@@ -685,45 +888,130 @@ function fmtCost(n){
   return '$'+(n>=100?n.toFixed(0):n.toFixed(2));
 }
 function renderReports(rep){
-  const tot=rep.total||{input_tokens:0,output_tokens:0,cache_creation_tokens:0,cache_read_tokens:0,total_tokens:0,cost_usd:0};
+  const tot=rep.total||{tokens_in:0,tokens_out:0,cache_write_5m:0,cache_write_1h:0,cache_read:0,total_tokens:0,cost_usd:0};
   $('#report-total').innerHTML=
+    '<div class="rt-item"><span class="rt-lbl">account</span><span class="rt-val">'+(rep.account||'—')+'</span></div>'+
     '<div class="rt-item"><span class="rt-lbl">period</span><span class="rt-val">'+rep.days+'d since '+rep.since_day+'</span></div>'+
     '<div class="rt-item"><span class="rt-lbl">total tokens</span><span class="rt-val">'+fmtTokens(tot.total_tokens)+'</span></div>'+
     '<div class="rt-item"><span class="rt-lbl">est. cost</span><span class="rt-val rt-cost">'+fmtCost(tot.cost_usd)+'</span></div>';
   const g=$('#report-grid');
   if(!rep.profiles||!rep.profiles.length){g.innerHTML='<div class="empty">No token data yet</div>';return}
   const maxCost=Math.max(...rep.profiles.flatMap(p=>p.by_day.map(d=>d.cost_usd)),0.000001);
+  const drill=$('#rpt-drill')?$('#rpt-drill').value:'profile';
   g.innerHTML=rep.profiles.map(p=>{
     const spark=p.by_day.map(d=>{
       const h=Math.max(2,Math.round((d.cost_usd/maxCost)*100));
       return '<div class="sbar" style="height:'+h+'%" title="'+d.day+': '+fmtTokens(d.total_tokens)+' tok, '+fmtCost(d.cost_usd)+'"></div>';
     }).join('');
-    const hosts=p.by_host.map(h=>
-      '<div class="rh-row"><span class="rh-host">'+h.host+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>'
+    const machines=(p.by_machine||[]).map(h=>
+      '<div class="rh-row"><span class="rh-host">'+h.key+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>'
     ).join('');
+    const drillRows=(p.drill&&p.drill.length)?
+      '<div class="rpt-hosts" style="margin-top:8px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:2px">by '+drill+'</div>'+
+      p.drill.map(h=>'<div class="rh-row"><span class="rh-host">'+h.key+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>').join('')+'</div>':'';
     return '<div class="card">'+
       '<div class="card-title">'+p.profile+'<span class="rpt-cost">'+fmtCost(p.cost_usd)+'</span></div>'+
-      '<div class="rpt-stats"><span>total <b>'+fmtTokens(p.total_tokens)+'</b></span><span>in <b>'+fmtTokens(p.input_tokens)+'</b></span><span>out <b>'+fmtTokens(p.output_tokens)+'</b></span><span>cache-w <b>'+fmtTokens(p.cache_creation_tokens)+'</b></span><span>cache-r <b>'+fmtTokens(p.cache_read_tokens)+'</b></span></div>'+
+      '<div class="rpt-stats"><span>total <b>'+fmtTokens(p.total_tokens)+'</b></span><span>in <b>'+fmtTokens(p.tokens_in)+'</b></span><span>out <b>'+fmtTokens(p.tokens_out)+'</b></span><span>cw5m <b>'+fmtTokens(p.cache_write_5m)+'</b></span><span>cw1h <b>'+fmtTokens(p.cache_write_1h)+'</b></span><span>cr <b>'+fmtTokens(p.cache_read)+'</b></span></div>'+
       (spark?'<div class="spark">'+spark+'</div>':'')+
-      '<div class="rpt-hosts">'+hosts+'</div>'+
+      '<div class="rpt-hosts">'+machines+'</div>'+
+      drillRows+
     '</div>';
   }).join('');
 }
 async function loadReports(){
   try{
     const gran=$('#rpt-granularity').value,days=$('#rpt-days').value;
-    const rep=await fj('/api/reports?granularity='+gran+'&days='+days);
+    const drill=$('#rpt-drill')?$('#rpt-drill').value:'profile';
+    const rep=await fj('/api/reports?granularity='+gran+'&days='+days+'&drill='+drill);
     renderReports(rep);
   }catch(e){$('#report-grid').innerHTML='<div class="empty">error: '+e.message+'</div>'}
 }
 
+function renderContext(groups){
+  const g=$('#context-grid');
+  if(!groups||!groups.length){g.innerHTML='<div class="empty">No live sessions (none active in last 24h)</div>';return}
+  g.innerHTML=groups.map(grp=>{
+    const machines=grp.machines.map(m=>{
+      const sessions=m.sessions.map(s=>{
+        const pct=s.context_pct!=null?s.context_pct:0;
+        const cls=pct>=75?'bar-red':(pct>=50?'bar-yellow':'bar-green');
+        const tok=s.context_tokens!=null?s.context_tokens.toLocaleString():'?';
+        const lim=s.effective_context!=null?s.effective_context.toLocaleString():'?';
+        const sid=(s.session_id||'').slice(0,8);
+        return '<div class="win-row"><div class="win-lbl"><span>'+sid+' <span class="resets">'+(s.model||'?')+'</span></span><span><span class="pct">'+pct.toFixed(1)+'%</span> <span class="resets">'+tok+'/'+lim+'</span></span></div><div class="bar '+cls+'"><div class="bar-fill" style="width:'+Math.min(100,pct)+'%"></div></div></div>';
+      }).join('');
+      return '<div style="margin-bottom:10px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:4px">'+m.machine+'</div>'+sessions+'</div>';
+    }).join('');
+    return '<div class="card"><div class="card-title">'+grp.profile+'</div>'+machines+'</div>';
+  }).join('');
+}
+async function loadContext(){
+  try{const groups=await fj('/api/context');renderContext(groups);}
+  catch(e){$('#context-grid').innerHTML='<div class="empty">error: '+e.message+'</div>'}
+}
+
+function renderTokens(tokens){
+  const b=$('#tokens-body');
+  if(!tokens||!tokens.length){b.innerHTML='<tr><td colspan="6" class="empty">No ingest tokens minted</td></tr>';return}
+  b.innerHTML=tokens.map(t=>'<tr>'+
+    '<td style="font-family:var(--mono)">'+t.id+'</td>'+
+    '<td>'+t.machine+'</td>'+
+    '<td style="font-family:var(--mono);font-size:.72rem">'+t.token_preview+'</td>'+
+    '<td>'+(t.last_used_at?timeAgo(t.last_used_at):'never')+'</td>'+
+    '<td>'+(t.revoked_at?'<span class="badge badge-unacked">revoked</span>':'<span class="badge badge-acked">active</span>')+'</td>'+
+    '<td>'+(t.revoked_at?'':'<button class="btn btn-sm btn-danger" onclick="revokeToken('+t.id+')">Revoke</button>')+'</td>'+
+  '</tr>').join('');
+}
+async function loadTokens(){
+  try{const tokens=await fj('/api/ingest-tokens');renderTokens(tokens);}
+  catch(e){$('#tokens-body').innerHTML='<tr><td colspan="6" class="empty">error: '+e.message+'</td></tr>'}
+}
+async function mintToken(){
+  const machine=$('#tok-machine').value.trim();
+  if(!machine){alert('Machine name required');return}
+  const r=await pj('/api/ingest-tokens',{machine});
+  if(r.token){$('#mint-result').textContent='Token (copy now, shown once): '+r.token;$('#tok-machine').value=''}
+  else{$('#mint-result').textContent='error: '+(r.error||'failed')}
+  await loadTokens();
+}
+async function revokeToken(id){await fetch('/api/ingest-tokens/'+id,{method:'DELETE'});await loadTokens()}
+
+let pricingRows=[];
+function renderPricing(data){
+  pricingRows=data.rows||[];
+  const b=$('#pricing-body');
+  if(!pricingRows.length){b.innerHTML='<tr><td colspan="8" class="empty">No pricing rows</td></tr>';return}
+  b.innerHTML=pricingRows.map((r,i)=>{
+    const variant=(r.settings_match_json&&r.settings_match_json!=='{}')?r.settings_match_json:'base';
+    const num=(k)=>'<input type="number" step="0.0001" id="pr-'+i+'-'+k+'" value="'+r[k]+'" style="width:78px;padding:3px 6px;font-family:var(--mono);font-size:.74rem">';
+    return '<tr'+(r.overridden?' style="background:rgba(139,92,246,.06)"':'')+'>'+
+      '<td style="font-family:var(--mono)">'+r.model+'</td>'+
+      '<td style="font-family:var(--mono);font-size:.72rem">'+variant+(r.overridden?' <span class="badge badge-type">override</span>':'')+'</td>'+
+      '<td>'+num('input')+'</td><td>'+num('output')+'</td><td>'+num('cache_write_5m')+'</td><td>'+num('cache_write_1h')+'</td><td>'+num('cache_read')+'</td>'+
+      '<td><button class="btn btn-sm" onclick="savePricing('+i+')">Save</button>'+(r.overridden?' <button class="btn btn-sm btn-danger" onclick="resetPricing(\\''+r.model+'\\')">Reset</button>':'')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+async function loadPricing(){
+  try{const data=await fj('/api/pricing');renderPricing(data);}
+  catch(e){$('#pricing-body').innerHTML='<tr><td colspan="8" class="empty">error: '+e.message+'</td></tr>'}
+}
+async function savePricing(i){
+  const r=pricingRows[i];
+  const g=(k)=>parseFloat($('#pr-'+i+'-'+k).value)||0;
+  const row={model:r.model,settings_match_json:r.settings_match_json,input:g('input'),output:g('output'),cache_write_5m:g('cache_write_5m'),cache_write_1h:g('cache_write_1h'),cache_read:g('cache_read')};
+  await fetch('/api/pricing',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(row)});
+  await loadPricing();
+}
+async function resetPricing(model){await fetch('/api/pricing/'+encodeURIComponent(model),{method:'DELETE'});await loadPricing()}
+
 async function refresh(){
   try{
-    const[usage,gemini,pace,alerts,subs,profiles,context]=await Promise.all([
-      fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles'),fj('/api/context')
+    const[usage,gemini,pace,alerts,subs,profiles]=await Promise.all([
+      fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles')
     ]);
-    renderUsage(usage,pace,context);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
-    loadReports();
+    renderUsage(usage,pace);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
+    loadReports();loadContext();loadTokens();loadPricing();
     $('#status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){$('#status').textContent='error: '+e.message}
 }
