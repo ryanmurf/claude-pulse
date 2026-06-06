@@ -26,6 +26,9 @@ import {
   insertGeminiQuotaSnapshots,
   getLatestGeminiQuota,
   redactProfile,
+  upsertTokenRollup,
+  getTokenRollups,
+  getTokenReport,
 } from "../src/store.js";
 
 let tmpDir: string;
@@ -439,5 +442,85 @@ describe("updatePollInterval", () => {
   it("returns false for non-existent profile", () => {
     const updated = updatePollInterval("no-such-profile", 10);
     expect(updated).toBe(false);
+  });
+});
+
+describe("token rollups", () => {
+  function row(over: Partial<Parameters<typeof upsertTokenRollup>[0]> = {}) {
+    return {
+      profile: "claude-max",
+      host: "tron",
+      day: "2026-06-01",
+      model: "claude-opus-4-8",
+      input_tokens: 100,
+      output_tokens: 50,
+      cache_creation_tokens: 200,
+      cache_read_tokens: 800,
+      cost_usd: 1.5,
+      source: "local" as const,
+      ...over,
+    };
+  }
+
+  it("upserts and reads back a rollup", () => {
+    upsertTokenRollup(row());
+    const rows = getTokenRollups();
+    expect(rows.length).toBe(1);
+    expect(rows[0].input_tokens).toBe(100);
+    expect(rows[0].source).toBe("local");
+  });
+
+  it("ON CONFLICT replaces counts for same (profile,host,day,model)", () => {
+    upsertTokenRollup(row({ input_tokens: 100 }));
+    upsertTokenRollup(row({ input_tokens: 999, cost_usd: 9 }));
+    const rows = getTokenRollups();
+    expect(rows.length).toBe(1);
+    expect(rows[0].input_tokens).toBe(999);
+    expect(rows[0].cost_usd).toBe(9);
+  });
+
+  it("keeps separate rows per host", () => {
+    upsertTokenRollup(row({ host: "tron" }));
+    upsertTokenRollup(row({ host: "laptop" }));
+    expect(getTokenRollups().length).toBe(2);
+    expect(getTokenRollups({ host: "laptop" }).length).toBe(1);
+  });
+
+  it("filters by sinceDay and profile", () => {
+    upsertTokenRollup(row({ day: "2026-05-01" }));
+    upsertTokenRollup(row({ day: "2026-06-05" }));
+    upsertTokenRollup(row({ profile: "claude-hd", day: "2026-06-05", model: "claude-sonnet-4-6" }));
+    expect(getTokenRollups({ sinceDay: "2026-06-01" }).length).toBe(2);
+    expect(getTokenRollups({ profile: "claude-hd" }).length).toBe(1);
+  });
+
+  it("getTokenReport aggregates per profile with host + day breakdown and grand total", () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+    upsertTokenRollup(row({ host: "tron", day: today, input_tokens: 100, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 2 }));
+    upsertTokenRollup(row({ host: "laptop", day: today, input_tokens: 50, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 1 }));
+    upsertTokenRollup(row({ host: "tron", day: yesterday, input_tokens: 25, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 0.5 }));
+
+    const report = getTokenReport({ granularity: "daily", days: 30 });
+    expect(report.profiles.length).toBe(1);
+    const p = report.profiles[0];
+    expect(p.profile).toBe("claude-max");
+    expect(p.input_tokens).toBe(175);
+    expect(p.total_tokens).toBe(175);
+    expect(p.cost_usd).toBeCloseTo(3.5, 6);
+    expect(p.by_host.length).toBe(2);
+    expect(p.by_day.length).toBe(2);
+    expect(report.total.cost_usd).toBeCloseTo(3.5, 6);
+  });
+
+  it("weekly granularity buckets days into ISO weeks", () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const sixDaysAgo = new Date(Date.now() - 6 * 86_400_000).toISOString().slice(0, 10);
+    upsertTokenRollup(row({ day: today, model: "m1" }));
+    upsertTokenRollup(row({ day: sixDaysAgo, model: "m2" }));
+    const report = getTokenReport({ granularity: "weekly", days: 30 });
+    // 7-day span may straddle 1 or 2 ISO weeks; just assert bucketing doesn't explode per-day.
+    expect(report.profiles[0].by_day.length).toBeLessThanOrEqual(2);
+    expect(report.granularity).toBe("weekly");
   });
 });

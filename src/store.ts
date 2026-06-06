@@ -10,6 +10,13 @@ import type {
   AlertSubscription,
   AlertEvent,
   AlertType,
+  TokenRollup,
+  TokenRollupInput,
+  TokenReport,
+  TokenReportProfile,
+  TokenReportTotals,
+  TokenReportDayPoint,
+  TokenReportHostBreakdown,
 } from "./types.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".claude-pulse");
@@ -188,6 +195,38 @@ export function initDb(dbPath?: string): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_alert_events_sub
       ON alert_events(subscription_id, triggered_at)
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS token_rollups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile TEXT NOT NULL,
+      host TEXT NOT NULL,
+      day TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT 'local',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(profile, host, day, model)
+    )
+  `);
+
+  // Migration-safe guard: if an older DB has a token_rollups table missing the
+  // source column (mirrors the vendor-column pattern above), add it.
+  const trCols = (db
+    .prepare("PRAGMA table_info(token_rollups)")
+    .all() as { name: string }[]).map((c) => c.name);
+  if (trCols.length > 0 && !trCols.includes("source")) {
+    db.exec("ALTER TABLE token_rollups ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_token_rollups_day
+      ON token_rollups(day, profile)
   `);
 }
 
@@ -610,6 +649,174 @@ export function getLastAlertEvent(subscriptionId: number): AlertEvent | undefine
      LIMIT 1`
   ).get(subscriptionId);
   return row as unknown as AlertEvent | undefined;
+}
+
+// --- Token rollup functions ---
+
+/**
+ * Upsert one (profile, host, day, model) rollup. On conflict the counts are
+ * REPLACED (not summed) — the caller computes complete per-day totals from the
+ * transcripts each run, so the latest computation is authoritative.
+ */
+export function upsertTokenRollup(row: TokenRollupInput): void {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO token_rollups
+       (profile, host, day, model, input_tokens, output_tokens,
+        cache_creation_tokens, cache_read_tokens, cost_usd, source, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(profile, host, day, model) DO UPDATE SET
+       input_tokens = excluded.input_tokens,
+       output_tokens = excluded.output_tokens,
+       cache_creation_tokens = excluded.cache_creation_tokens,
+       cache_read_tokens = excluded.cache_read_tokens,
+       cost_usd = excluded.cost_usd,
+       source = excluded.source,
+       updated_at = datetime('now')`
+  ).run(
+    row.profile,
+    row.host,
+    row.day,
+    row.model,
+    row.input_tokens,
+    row.output_tokens,
+    row.cache_creation_tokens,
+    row.cache_read_tokens,
+    row.cost_usd,
+    row.source,
+  );
+}
+
+export function getTokenRollups(opts: {
+  sinceDay?: string;
+  profile?: string;
+  host?: string;
+} = {}): TokenRollup[] {
+  const d = getDb();
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+  if (opts.sinceDay) {
+    clauses.push("day >= ?");
+    params.push(opts.sinceDay);
+  }
+  if (opts.profile) {
+    clauses.push("profile = ?");
+    params.push(opts.profile);
+  }
+  if (opts.host) {
+    clauses.push("host = ?");
+    params.push(opts.host);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  return d
+    .prepare(`SELECT * FROM token_rollups ${where} ORDER BY day DESC, profile, host, model`)
+    .all(...params) as unknown as TokenRollup[];
+}
+
+function emptyReportTotals(): TokenReportTotals {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_tokens: 0,
+    cache_read_tokens: 0,
+    total_tokens: 0,
+    cost_usd: 0,
+  };
+}
+
+function addInto(acc: TokenReportTotals, r: TokenRollup): void {
+  acc.input_tokens += r.input_tokens;
+  acc.output_tokens += r.output_tokens;
+  acc.cache_creation_tokens += r.cache_creation_tokens;
+  acc.cache_read_tokens += r.cache_read_tokens;
+  acc.total_tokens +=
+    r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens;
+  acc.cost_usd += r.cost_usd;
+}
+
+function roundCost(t: TokenReportTotals): void {
+  t.cost_usd = Math.round(t.cost_usd * 1e6) / 1e6;
+}
+
+/** Bucket a YYYY-MM-DD day to the ISO Monday of its week (for weekly granularity). */
+function weekBucket(day: string): string {
+  const d = new Date(`${day}T00:00:00.000Z`);
+  const dow = (d.getUTCDay() + 6) % 7; // 0 = Monday
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Aggregate rollups into a per-profile report with per-host breakdown, a
+ * per-bucket (day or week) time series, and a combined grand total.
+ */
+export function getTokenReport(opts: {
+  granularity?: "daily" | "weekly";
+  days?: number;
+}): TokenReport {
+  const granularity = opts.granularity ?? "daily";
+  const days = opts.days ?? 30;
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+
+  const rollups = getTokenRollups({ sinceDay });
+
+  const profileMap = new Map<
+    string,
+    {
+      totals: TokenReportTotals;
+      byDay: Map<string, TokenReportTotals>;
+      byHost: Map<string, TokenReportTotals>;
+    }
+  >();
+  const grand = emptyReportTotals();
+
+  for (const r of rollups) {
+    let p = profileMap.get(r.profile);
+    if (!p) {
+      p = { totals: emptyReportTotals(), byDay: new Map(), byHost: new Map() };
+      profileMap.set(r.profile, p);
+    }
+    addInto(p.totals, r);
+    addInto(grand, r);
+
+    const bucket = granularity === "weekly" ? weekBucket(r.day) : r.day;
+    let dayAcc = p.byDay.get(bucket);
+    if (!dayAcc) {
+      dayAcc = emptyReportTotals();
+      p.byDay.set(bucket, dayAcc);
+    }
+    addInto(dayAcc, r);
+
+    let hostAcc = p.byHost.get(r.host);
+    if (!hostAcc) {
+      hostAcc = emptyReportTotals();
+      p.byHost.set(r.host, hostAcc);
+    }
+    addInto(hostAcc, r);
+  }
+
+  const profiles: TokenReportProfile[] = [];
+  for (const [name, p] of profileMap) {
+    roundCost(p.totals);
+    const by_day: TokenReportDayPoint[] = [...p.byDay.entries()]
+      .map(([day, t]) => {
+        roundCost(t);
+        return { day, ...t };
+      })
+      .sort((a, b) => a.day.localeCompare(b.day));
+    const by_host: TokenReportHostBreakdown[] = [...p.byHost.entries()]
+      .map(([host, t]) => {
+        roundCost(t);
+        return { host, ...t };
+      })
+      .sort((a, b) => b.cost_usd - a.cost_usd);
+    profiles.push({ profile: name, ...p.totals, by_day, by_host });
+  }
+  profiles.sort((a, b) => b.cost_usd - a.cost_usd);
+  roundCost(grand);
+
+  return { granularity, days, since_day: sinceDay, profiles, total: grand };
 }
 
 export function closeDb(): void {
