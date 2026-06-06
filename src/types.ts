@@ -97,3 +97,64 @@ export interface AlertEvent {
   acknowledged: number;
   triggered_at: string;
 }
+
+export type TokenRollupSource = "local" | "ingest";
+
+export interface TokenRollup {
+  id: number;
+  profile: string;
+  host: string;
+  day: string; // YYYY-MM-DD
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  source: TokenRollupSource;
+  updated_at: string;
+}
+
+export interface TokenRollupInput {
+  profile: string;
+  host: string;
+  day: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  source: TokenRollupSource;
+}
+
+export interface TokenReportTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface TokenReportDayPoint extends TokenReportTotals {
+  day: string;
+}
+
+export interface TokenReportHostBreakdown extends TokenReportTotals {
+  host: string;
+}
+
+export interface TokenReportProfile extends TokenReportTotals {
+  profile: string;
+  by_day: TokenReportDayPoint[];
+  by_host: TokenReportHostBreakdown[];
+}
+
+export interface TokenReport {
+  granularity: "daily" | "weekly";
+  days: number;
+  since_day: string;
+  profiles: TokenReportProfile[];
+  total: TokenReportTotals;
+}
