@@ -344,8 +344,9 @@ header h1 span{color:var(--purple)}
 .win-lbl{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;font-size:.85rem}
 .win-lbl .pct{font-family:var(--mono);font-weight:600}
 .win-lbl .resets{font-size:.72rem;color:var(--muted)}
-.bar{height:8px;background:var(--surface-2);border-radius:4px;overflow:hidden}
-.bar-fill{height:100%;border-radius:4px;transition:width .4s ease}
+.bar{position:relative;height:8px;background:var(--surface-2);border-radius:4px}
+.bar-fill{height:100%;border-radius:4px;overflow:hidden;transition:width .4s ease}
+.bar-tick{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--text);opacity:.7;border-radius:1px}
 .bar-green .bar-fill{background:var(--green)}
 .bar-yellow .bar-fill{background:var(--yellow)}
 .bar-red .bar-fill{background:var(--red)}
@@ -485,7 +486,9 @@ function renderWin(label,pct,pi){
   const v=pct!==null?pct:0,c=barColor(pct);
   const rem=pi?pi.remaining:'';
   const pb=pi?\`<span class="pace \${paceClass(pi.pace)}">\${pi.pace}</span>\`:'';
-  return\`<div class="win-row"><div class="win-lbl"><span>\${label} \${pb}</span><span><span class="pct">\${fmtPct(pct)}</span>\${rem?' <span class="resets">'+rem+' left</span>':''}</span></div><div class="bar \${c}"><div class="bar-fill" style="width:\${v}%"></div></div></div>\`;
+  const exp=pi&&pi.elapsed_pct!=null?\` <span class="resets">vs ~\${pi.elapsed_pct}% exp</span>\`:'';
+  const tick=pi&&pi.elapsed_pct!=null?\`<div class="bar-tick" style="left:\${Math.max(0,Math.min(100,pi.elapsed_pct))}%"></div>\`:'';
+  return\`<div class="win-row"><div class="win-lbl"><span>\${label} \${pb}</span><span><span class="pct">\${fmtPct(pct)}</span>\${exp}\${rem?' <span class="resets">'+rem+' left</span>':''}</span></div><div class="bar \${c}"><div class="bar-fill" style="width:\${v}%"></div>\${tick}</div></div>\`;
 }
 
 function renderGemini(quota){

@@ -894,8 +894,13 @@ async function main(): Promise<void> {
   ensureDefaultProfiles();
   log("Database initialized with default profiles");
 
+  const serverOnly = process.env.CLAUDE_PULSE_SERVER_ONLY === "1";
+
   // Give the poller access to the MCP server for channel notifications
-  setMcpServer(server);
+  // (skip in server-only mode — there is no MCP client / stdio transport)
+  if (!serverOnly) {
+    setMcpServer(server);
+  }
 
   // Start background pollers
   startAllPollers();
@@ -905,10 +910,16 @@ async function main(): Promise<void> {
   // Start HTTP dashboard
   startHttpServer();
 
-  // Connect MCP server via stdio
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  log("Channel plugin connected via stdio");
+  if (serverOnly) {
+    log(
+      "Server-only mode: HTTP dashboard + pollers running (no MCP stdio transport)"
+    );
+  } else {
+    // Connect MCP server via stdio
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    log("Channel plugin connected via stdio");
+  }
 
   // Graceful shutdown
   const shutdown = (): void => {
