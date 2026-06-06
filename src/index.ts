@@ -36,7 +36,10 @@ import {
   setMcpServer,
   startContextPoller,
   pollContextOnce,
+  startTokenRollup,
 } from "./poller.js";
+import { tallyProfileTokens } from "./tokens.js";
+import os from "node:os";
 import { getContextForProfile } from "./context.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
@@ -885,6 +888,90 @@ server.tool(
   }
 );
 
+// --- Upload mode ---
+// Remote machines run this from cron: compute local rollups for all profiles
+// (last 2 days) and POST them to a central claude-pulse server's /api/ingest.
+// Does NOT start the HTTP server or pollers. Exits 0 on success, non-zero on failure.
+const UPLOAD_LOOKBACK_DAYS = 2;
+
+async function uploadOnce(): Promise<number> {
+  const target = process.env.CLAUDE_PULSE_UPLOAD_TO;
+  const ingestToken = process.env.CLAUDE_PULSE_INGEST_TOKEN;
+  if (!target) {
+    log("Upload mode: CLAUDE_PULSE_UPLOAD_TO is not set");
+    return 1;
+  }
+  if (!ingestToken) {
+    log("Upload mode: CLAUDE_PULSE_INGEST_TOKEN is not set");
+    return 1;
+  }
+
+  initDb();
+  ensureDefaultProfiles();
+
+  const host = os.hostname();
+  const sinceMs = Date.now() - UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+
+  const rollups: Array<{
+    profile: string;
+    day: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_tokens: number;
+    cache_read_tokens: number;
+    cost_usd: number;
+  }> = [];
+
+  for (const p of listProfiles()) {
+    try {
+      const rows = await tallyProfileTokens(p, sinceDay);
+      for (const r of rows) {
+        rollups.push({
+          profile: p.name,
+          day: r.day,
+          model: r.model,
+          input_tokens: r.input_tokens,
+          output_tokens: r.output_tokens,
+          cache_creation_tokens: r.cache_creation_tokens,
+          cache_read_tokens: r.cache_read_tokens,
+          cost_usd: r.cost_usd,
+        });
+      }
+    } catch (e) {
+      log(`Upload mode: tally failed for ${p.name}: ${(e as Error).message}`);
+    }
+  }
+
+  log(`Upload mode: computed ${rollups.length} rollup row(s) for host ${host}; POSTing to ${target}/api/ingest`);
+
+  const url = `${target.replace(/\/$/, "")}/api/ingest`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ingestToken}`,
+      },
+      body: JSON.stringify({ host, rollups }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      log(`Upload mode: ingest returned HTTP ${resp.status}: ${text.slice(0, 300)}`);
+      return 1;
+    }
+    log(`Upload mode: success — ${text.slice(0, 300)}`);
+    return 0;
+  } catch (e) {
+    log(`Upload mode: POST failed: ${(e as Error).message}`);
+    return 1;
+  } finally {
+    closeDb();
+  }
+}
+
 // --- Main ---
 async function main(): Promise<void> {
   log("Initializing claude-pulse channel plugin...");
@@ -906,6 +993,7 @@ async function main(): Promise<void> {
   startAllPollers();
   startGeminiPoller();
   startContextPoller();
+  startTokenRollup();
 
   // Start HTTP dashboard
   startHttpServer();
@@ -935,7 +1023,19 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  process.stderr.write(`[claude-pulse] Fatal error: ${err}\n`);
-  process.exit(1);
-});
+const uploadMode =
+  process.env.CLAUDE_PULSE_MODE === "upload" || process.argv.includes("--upload-once");
+
+if (uploadMode) {
+  uploadOnce()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      process.stderr.write(`[claude-pulse] Upload fatal error: ${err}\n`);
+      process.exit(1);
+    });
+} else {
+  main().catch((err) => {
+    process.stderr.write(`[claude-pulse] Fatal error: ${err}\n`);
+    process.exit(1);
+  });
+}
