@@ -45,25 +45,89 @@ function log(msg: string): void {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function readBody(req: IncomingMessage, maxBytes = Infinity): Promise<string> {
+/** Default cap on browser-route request bodies (256KB). /api/ingest overrides. */
+const DEFAULT_MAX_BYTES = 256 * 1024;
+
+function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    req.on("data", (chunk: Buffer) => {
+    let aborted = false;
+    const onData = (chunk: Buffer) => {
+      if (aborted) return;
       size += chunk.length;
       if (size > maxBytes) {
+        aborted = true;
+        // Stop buffering and drain the rest of the request so the handler can
+        // still send a clean 413 response (destroying the socket here would
+        // surface as a connection reset to the client instead).
+        req.removeListener("data", onData);
+        req.resume();
         reject(new Error("PAYLOAD_TOO_LARGE"));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    };
+    req.on("data", onData);
+    req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks).toString()); });
     req.on("error", reject);
   });
 }
 
 const INGEST_MAX_BYTES = 1024 * 1024; // 1MB cap on /api/ingest bodies
+
+/**
+ * HTML-escape a value before interpolating into innerHTML. Defense-in-depth
+ * against stored XSS: ingest/user-controlled strings (profile, session_id,
+ * model, machine names, alert messages) get escaped at render time.
+ */
+export function esc(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Thrown by accountForRequest when the trust boundary rejects a browser request. */
+class AuthError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+// ── /api/ingest rate limiting (M1) ──────────────────────────────────────────
+// Dependency-free token bucket, per-token AND per-IP, ~60 req/min each.
+const INGEST_RATE_CAPACITY = 60; // burst + sustained ceiling per window
+const INGEST_RATE_REFILL_PER_MS = 60 / 60_000; // 60 tokens per 60s
+interface Bucket { tokens: number; last: number; }
+const ingestBuckets = new Map<string, Bucket>();
+
+/** Returns true if the call is allowed; false → 429. Keyed independently. */
+function rateLimitAllow(key: string): boolean {
+  const now = Date.now();
+  let b = ingestBuckets.get(key);
+  if (!b) {
+    b = { tokens: INGEST_RATE_CAPACITY, last: now };
+    ingestBuckets.set(key, b);
+  }
+  // Refill based on elapsed time.
+  b.tokens = Math.min(
+    INGEST_RATE_CAPACITY,
+    b.tokens + (now - b.last) * INGEST_RATE_REFILL_PER_MS,
+  );
+  b.last = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** Test/maintenance hook: clear all rate-limit buckets. */
+export function _resetIngestRateLimit(): void {
+  ingestBuckets.clear();
+}
 
 function toFiniteInt(v: unknown): number {
   const n = Number(v);
@@ -100,15 +164,54 @@ function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, { error: message }, status);
 }
 
+function header(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  return v && v.trim() ? v.trim() : undefined;
+}
+
 /**
- * Resolve the account for a browser/dashboard request from the oauth2-proxy
- * `X-Auth-Request-Email` header (auto-creating on first sight). Falls back to
- * the default account when the header is absent (direct/in-cluster calls).
+ * Resolve the account for a browser/dashboard request (H4 — header trust boundary).
+ *
+ * Trust model:
+ * - `CLAUDE_PULSE_TRUSTED_PROXY_SECRET` set → the request MUST carry
+ *   `X-Pulse-Proxy-Auth` equal to that secret (injected only by our
+ *   ingress/oauth2-proxy, never a browser). Missing/wrong → 401. Only then is
+ *   the proxy-supplied `X-Auth-Request-Email` honored.
+ * - The silent default/`local` account fallback (no authenticated email) is
+ *   gated behind `CLAUDE_PULSE_SINGLE_TENANT=1`. When that is NOT set and there
+ *   is no authenticated email, browser routes 401 instead of serving `local`.
+ * - When neither env is set (dev), behavior is unchanged: header honored if
+ *   present, else the default account.
+ *
+ * A client-supplied email is NEVER honored except on the proxy-validated path.
  */
 function accountForRequest(req: IncomingMessage): Account {
-  const raw = req.headers["x-auth-request-email"];
-  const email = Array.isArray(raw) ? raw[0] : raw;
-  return resolveAccount(email && email.trim() ? email : null);
+  const proxySecret = process.env.CLAUDE_PULSE_TRUSTED_PROXY_SECRET;
+  const singleTenant = process.env.CLAUDE_PULSE_SINGLE_TENANT === "1";
+
+  if (proxySecret) {
+    // The proxy gate is mandatory: only requests carrying the shared secret
+    // (i.e. routed through our ingress) may assert an identity at all.
+    const presented = header(req, "x-pulse-proxy-auth");
+    if (presented !== proxySecret) {
+      throw new AuthError(401, "Unauthorized");
+    }
+    const email = header(req, "x-auth-request-email");
+    if (email) return resolveAccount(email);
+    // Proxy authenticated the request but supplied no email.
+    if (singleTenant) return resolveAccount(null);
+    throw new AuthError(401, "Unauthorized");
+  }
+
+  // No proxy secret configured.
+  const email = header(req, "x-auth-request-email");
+  if (email) return resolveAccount(email);
+  if (singleTenant) return resolveAccount(null);
+  // Dev convenience (no proxy secret, single-tenant not explicitly disabled):
+  // fall back to the default account so direct/in-cluster calls still work.
+  // Production hardening sets CLAUDE_PULSE_TRUSTED_PROXY_SECRET to disable this.
+  return resolveAccount(null);
 }
 
 // ── Pace computation (shared with get_pace tool) ─────────────────────────────
@@ -143,7 +246,7 @@ function computePace(accountId: number, profileFilter?: string): PaceInfo[] {
   const results: PaceInfo[] = [];
   const names = profileFilter
     ? [profileFilter]
-    : listProfiles().map((p) => p.name);
+    : listProfiles(accountId).map((p) => p.name);
 
   for (const name of names) {
     const snap = getLatestSnapshot(name, accountId);
@@ -199,9 +302,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/profiles
+    // GET /api/profiles — only the requesting account's profiles (H2/L4)
     if (pathname === "/api/profiles" && method === "GET") {
-      sendJson(res, listProfiles().map(redactProfile));
+      const account = accountForRequest(req);
+      sendJson(res, listProfiles(account.id).map(redactProfile));
       return;
     }
 
@@ -220,7 +324,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (pathname === "/api/usage" && method === "GET") {
       const account = accountForRequest(req);
       const snapshots = getLatestSnapshots(account.id);
-      const profiles = listProfiles();
+      const profiles = listProfiles(account.id);
       const result = profiles.map((p) => {
         const snap = snapshots.find((s) => s.profile === p.name);
         return {
@@ -292,42 +396,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/alerts
+    // GET /api/alerts — scoped to the requesting account (H1/H3)
     if (pathname === "/api/alerts" && method === "GET") {
+      const account = accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
       const hours = parseInt(url.searchParams.get("hours") || "24", 10);
       const unacked = url.searchParams.get("unacknowledged_only") === "true";
-      sendJson(res, getTriggeredAlerts(profile, hours, unacked));
+      sendJson(res, getTriggeredAlerts(account.id, profile, hours, unacked));
       return;
     }
 
-    // POST /api/alerts/acknowledge
+    // POST /api/alerts/acknowledge — by-id path verifies account ownership (IDOR fix)
     if (pathname === "/api/alerts/acknowledge" && method === "POST") {
+      const account = accountForRequest(req);
       const body = JSON.parse(await readBody(req));
       if (body.id !== undefined) {
-        sendJson(res, { success: acknowledgeAlert(body.id) });
+        const ok = acknowledgeAlert(account.id, body.id);
+        if (!ok) { sendError(res, 404, "Alert not found"); return; }
+        sendJson(res, { success: true });
       } else {
-        const count = acknowledgeAllAlerts(body.profile || undefined);
+        const count = acknowledgeAllAlerts(account.id, body.profile || undefined);
         sendJson(res, { success: true, count });
       }
       return;
     }
 
-    // GET /api/subscriptions
+    // GET /api/subscriptions — scoped to the requesting account (H1/H3)
     if (pathname === "/api/subscriptions" && method === "GET") {
+      const account = accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
-      sendJson(res, listAlertSubscriptions(profile));
+      sendJson(res, listAlertSubscriptions(account.id, profile));
       return;
     }
 
     // POST /api/subscriptions
     if (pathname === "/api/subscriptions" && method === "POST") {
+      const account = accountForRequest(req);
       const body = JSON.parse(await readBody(req));
       if (!body.profile || !body.alert_type) {
         sendError(res, 400, "Missing profile or alert_type");
         return;
       }
-      if (!getProfile(body.profile)) {
+      // Profile lookup is scoped to the caller's account — can't subscribe to
+      // another account's profile.
+      if (!getProfile(body.profile, account.id)) {
         sendError(res, 404, `Profile "${body.profile}" not found`);
         return;
       }
@@ -337,6 +449,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
       const sub = createAlertSubscription(
+        account.id,
         body.profile,
         body.alert_type as AlertType,
         threshold,
@@ -347,11 +460,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // DELETE /api/subscriptions/:id
+    // DELETE /api/subscriptions/:id — verifies ownership (IDOR fix: 404 on mismatch)
     if (pathname.startsWith("/api/subscriptions/") && method === "DELETE") {
+      const account = accountForRequest(req);
       const id = parseInt(pathname.split("/").pop()!, 10);
       if (isNaN(id)) { sendError(res, 400, "Invalid subscription ID"); return; }
-      sendJson(res, { success: removeAlertSubscription(id) });
+      const ok = removeAlertSubscription(account.id, id);
+      if (!ok) { sendError(res, 404, "Subscription not found"); return; }
+      sendJson(res, { success: true });
       return;
     }
 
@@ -428,6 +544,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       if (!bearer) { sendError(res, 401, "Missing bearer token"); return; }
       const tokenRow = validateIngestToken(bearer);
       if (!tokenRow) { sendError(res, 401, "Unauthorized"); return; }
+
+      // M1 — per-token AND per-IP throttle (~60 req/min each). 429 when exceeded.
+      const ip = (req.socket && req.socket.remoteAddress) || "unknown";
+      if (!rateLimitAllow(`tok:${tokenRow.id}`) || !rateLimitAllow(`ip:${ip}`)) {
+        res.setHeader("Retry-After", "1");
+        sendError(res, 429, "Too many requests");
+        return;
+      }
+
       // Authoritative (account, machine) come from the token, not the body.
       const accountId = tokenRow.account_id;
       const machine = tokenRow.machine;
@@ -571,6 +696,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     sendError(res, 404, "Not found");
   } catch (err) {
+    if (err instanceof AuthError) {
+      sendError(res, err.status, err.message);
+      return;
+    }
+    if ((err as Error)?.message === "PAYLOAD_TOO_LARGE") {
+      sendError(res, 413, "Payload too large");
+      return;
+    }
     log(`HTTP handler error: ${err}`);
     sendError(res, 500, "Internal server error");
   }
@@ -780,6 +913,13 @@ tr:last-child td{border-bottom:none}
 <script>
 const $=s=>document.querySelector(s);
 
+// N3 — HTML-escape any value that can originate from ingest/user data before
+// putting it into innerHTML (defense-in-depth against stored XSS).
+function esc(v){
+  if(v===null||v===undefined)return'';
+  return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
 async function fj(url){const r=await fetch(url);return r.json()}
 async function pj(url,body={}){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json()}
 
@@ -814,8 +954,8 @@ function renderUsage(usage,pace){
     const fh=pace.find(p=>p.profile===u.profile&&p.window==='5h');
     const sd=pace.find(p=>p.profile===u.profile&&p.window==='7d');
     return\`<div class="card">
-      <div class="card-title">\${u.profile}<span class="meta">\${u.polled_at?timeAgo(u.polled_at):'never polled'}
-        <button class="btn btn-sm" onclick="pollOne('\${u.profile}')">Poll</button></span></div>
+      <div class="card-title">\${esc(u.profile)}<span class="meta">\${u.polled_at?timeAgo(u.polled_at):'never polled'}
+        <button class="btn btn-sm" onclick="pollOne('\${esc(u.profile)}')">Poll</button></span></div>
       \${renderWin('5-hour',u.five_hour_pct,fh)}
       \${renderWin('7-day',u.seven_day_pct,sd)}
     </div>\`}).join('');
@@ -835,7 +975,7 @@ function renderGemini(quota){
   g.innerHTML=quota.map(q=>{
     const reset=countdown(q.reset_time);
     return\`<div class="card">
-      <div class="card-title">\${q.model_id}<span class="meta">\${q.timestamp?timeAgo(q.timestamp):'never polled'}</span></div>
+      <div class="card-title">\${esc(q.model_id)}<span class="meta">\${q.timestamp?timeAgo(q.timestamp):'never polled'}</span></div>
       <div class="win-row"><div class="win-lbl"><span>quota</span><span><span class="pct">\${fmtPct(q.used_pct)}</span>\${reset?' <span class="resets">'+reset+' left</span>':''}</span></div><div class="bar \${barColor(q.used_pct)}"><div class="bar-fill" style="width:\${Math.max(0,Math.min(100,q.used_pct))}%"></div></div></div>
     </div>\`}).join('');
 }
@@ -845,9 +985,9 @@ function renderAlerts(alerts){
   if(!alerts.length){b.innerHTML='<tr><td colspan="6" class="empty">No recent alerts</td></tr>';return}
   b.innerHTML=alerts.map(a=>\`<tr>
     <td style="font-family:var(--mono);font-size:.72rem">\${timeAgo(a.triggered_at)}</td>
-    <td>\${a.profile}</td>
-    <td><span class="badge badge-type">\${a.alert_type}</span></td>
-    <td>\${a.message}</td>
+    <td>\${esc(a.profile)}</td>
+    <td><span class="badge badge-type">\${esc(a.alert_type)}</span></td>
+    <td>\${esc(a.message)}</td>
     <td>\${a.acknowledged?'<span class="badge badge-acked">acked</span>':'<span class="badge badge-unacked">pending</span>'}</td>
     <td>\${!a.acknowledged?'<button class="btn btn-sm" onclick="ackOne('+a.id+')">Ack</button>':''}</td>
   </tr>\`).join('');
@@ -858,8 +998,8 @@ function renderSubs(subs){
   if(!subs.length){b.innerHTML='<tr><td colspan="7" class="empty">No subscriptions</td></tr>';return}
   b.innerHTML=subs.map(s=>\`<tr>
     <td style="font-family:var(--mono)">\${s.id}</td>
-    <td>\${s.profile}</td>
-    <td><span class="badge badge-type">\${s.alert_type}</span></td>
+    <td>\${esc(s.profile)}</td>
+    <td><span class="badge badge-type">\${esc(s.alert_type)}</span></td>
     <td>\${s.threshold!==null?s.threshold+'%':'\\u2014'}</td>
     <td>\${s.cooldown_minutes}m</td>
     <td>\${s.enabled?'<span class="badge badge-acked">active</span>':'<span class="badge badge-unacked">off</span>'}</td>
@@ -869,7 +1009,7 @@ function renderSubs(subs){
 
 function fillProfiles(profiles){
   const s=$('#sub-profile');
-  s.innerHTML=profiles.map(p=>'<option value="'+p.name+'">'+p.name+'</option>').join('');
+  s.innerHTML=profiles.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
 }
 
 function toggleThreshold(){
@@ -890,8 +1030,8 @@ function fmtCost(n){
 function renderReports(rep){
   const tot=rep.total||{tokens_in:0,tokens_out:0,cache_write_5m:0,cache_write_1h:0,cache_read:0,total_tokens:0,cost_usd:0};
   $('#report-total').innerHTML=
-    '<div class="rt-item"><span class="rt-lbl">account</span><span class="rt-val">'+(rep.account||'—')+'</span></div>'+
-    '<div class="rt-item"><span class="rt-lbl">period</span><span class="rt-val">'+rep.days+'d since '+rep.since_day+'</span></div>'+
+    '<div class="rt-item"><span class="rt-lbl">account</span><span class="rt-val">'+esc(rep.account||'—')+'</span></div>'+
+    '<div class="rt-item"><span class="rt-lbl">period</span><span class="rt-val">'+rep.days+'d since '+esc(rep.since_day)+'</span></div>'+
     '<div class="rt-item"><span class="rt-lbl">total tokens</span><span class="rt-val">'+fmtTokens(tot.total_tokens)+'</span></div>'+
     '<div class="rt-item"><span class="rt-lbl">est. cost</span><span class="rt-val rt-cost">'+fmtCost(tot.cost_usd)+'</span></div>';
   const g=$('#report-grid');
@@ -901,16 +1041,16 @@ function renderReports(rep){
   g.innerHTML=rep.profiles.map(p=>{
     const spark=p.by_day.map(d=>{
       const h=Math.max(2,Math.round((d.cost_usd/maxCost)*100));
-      return '<div class="sbar" style="height:'+h+'%" title="'+d.day+': '+fmtTokens(d.total_tokens)+' tok, '+fmtCost(d.cost_usd)+'"></div>';
+      return '<div class="sbar" style="height:'+h+'%" title="'+esc(d.day)+': '+fmtTokens(d.total_tokens)+' tok, '+fmtCost(d.cost_usd)+'"></div>';
     }).join('');
     const machines=(p.by_machine||[]).map(h=>
-      '<div class="rh-row"><span class="rh-host">'+h.key+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>'
+      '<div class="rh-row"><span class="rh-host">'+esc(h.key)+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>'
     ).join('');
     const drillRows=(p.drill&&p.drill.length)?
-      '<div class="rpt-hosts" style="margin-top:8px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:2px">by '+drill+'</div>'+
-      p.drill.map(h=>'<div class="rh-row"><span class="rh-host">'+h.key+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>').join('')+'</div>':'';
+      '<div class="rpt-hosts" style="margin-top:8px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:2px">by '+esc(drill)+'</div>'+
+      p.drill.map(h=>'<div class="rh-row"><span class="rh-host">'+esc(h.key)+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>').join('')+'</div>':'';
     return '<div class="card">'+
-      '<div class="card-title">'+p.profile+'<span class="rpt-cost">'+fmtCost(p.cost_usd)+'</span></div>'+
+      '<div class="card-title">'+esc(p.profile)+'<span class="rpt-cost">'+fmtCost(p.cost_usd)+'</span></div>'+
       '<div class="rpt-stats"><span>total <b>'+fmtTokens(p.total_tokens)+'</b></span><span>in <b>'+fmtTokens(p.tokens_in)+'</b></span><span>out <b>'+fmtTokens(p.tokens_out)+'</b></span><span>cw5m <b>'+fmtTokens(p.cache_write_5m)+'</b></span><span>cw1h <b>'+fmtTokens(p.cache_write_1h)+'</b></span><span>cr <b>'+fmtTokens(p.cache_read)+'</b></span></div>'+
       (spark?'<div class="spark">'+spark+'</div>':'')+
       '<div class="rpt-hosts">'+machines+'</div>'+
@@ -937,12 +1077,12 @@ function renderContext(groups){
         const cls=pct>=75?'bar-red':(pct>=50?'bar-yellow':'bar-green');
         const tok=s.context_tokens!=null?s.context_tokens.toLocaleString():'?';
         const lim=s.effective_context!=null?s.effective_context.toLocaleString():'?';
-        const sid=(s.session_id||'').slice(0,8);
-        return '<div class="win-row"><div class="win-lbl"><span>'+sid+' <span class="resets">'+(s.model||'?')+'</span></span><span><span class="pct">'+pct.toFixed(1)+'%</span> <span class="resets">'+tok+'/'+lim+'</span></span></div><div class="bar '+cls+'"><div class="bar-fill" style="width:'+Math.min(100,pct)+'%"></div></div></div>';
+        const sid=esc((s.session_id||'').slice(0,8));
+        return '<div class="win-row"><div class="win-lbl"><span>'+sid+' <span class="resets">'+esc(s.model||'?')+'</span></span><span><span class="pct">'+pct.toFixed(1)+'%</span> <span class="resets">'+tok+'/'+lim+'</span></span></div><div class="bar '+cls+'"><div class="bar-fill" style="width:'+Math.min(100,pct)+'%"></div></div></div>';
       }).join('');
-      return '<div style="margin-bottom:10px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:4px">'+m.machine+'</div>'+sessions+'</div>';
+      return '<div style="margin-bottom:10px"><div class="rt-lbl" style="font-size:.66rem;margin-bottom:4px">'+esc(m.machine)+'</div>'+sessions+'</div>';
     }).join('');
-    return '<div class="card"><div class="card-title">'+grp.profile+'</div>'+machines+'</div>';
+    return '<div class="card"><div class="card-title">'+esc(grp.profile)+'</div>'+machines+'</div>';
   }).join('');
 }
 async function loadContext(){
@@ -955,8 +1095,8 @@ function renderTokens(tokens){
   if(!tokens||!tokens.length){b.innerHTML='<tr><td colspan="6" class="empty">No ingest tokens minted</td></tr>';return}
   b.innerHTML=tokens.map(t=>'<tr>'+
     '<td style="font-family:var(--mono)">'+t.id+'</td>'+
-    '<td>'+t.machine+'</td>'+
-    '<td style="font-family:var(--mono);font-size:.72rem">'+t.token_preview+'</td>'+
+    '<td>'+esc(t.machine)+'</td>'+
+    '<td style="font-family:var(--mono);font-size:.72rem">'+esc(t.token_preview)+'</td>'+
     '<td>'+(t.last_used_at?timeAgo(t.last_used_at):'never')+'</td>'+
     '<td>'+(t.revoked_at?'<span class="badge badge-unacked">revoked</span>':'<span class="badge badge-acked">active</span>')+'</td>'+
     '<td>'+(t.revoked_at?'':'<button class="btn btn-sm btn-danger" onclick="revokeToken('+t.id+')">Revoke</button>')+'</td>'+
@@ -985,8 +1125,8 @@ function renderPricing(data){
     const variant=(r.settings_match_json&&r.settings_match_json!=='{}')?r.settings_match_json:'base';
     const num=(k)=>'<input type="number" step="0.0001" id="pr-'+i+'-'+k+'" value="'+r[k]+'" style="width:78px;padding:3px 6px;font-family:var(--mono);font-size:.74rem">';
     return '<tr'+(r.overridden?' style="background:rgba(139,92,246,.06)"':'')+'>'+
-      '<td style="font-family:var(--mono)">'+r.model+'</td>'+
-      '<td style="font-family:var(--mono);font-size:.72rem">'+variant+(r.overridden?' <span class="badge badge-type">override</span>':'')+'</td>'+
+      '<td style="font-family:var(--mono)">'+esc(r.model)+'</td>'+
+      '<td style="font-family:var(--mono);font-size:.72rem">'+esc(variant)+(r.overridden?' <span class="badge badge-type">override</span>':'')+'</td>'+
       '<td>'+num('input')+'</td><td>'+num('output')+'</td><td>'+num('cache_write_5m')+'</td><td>'+num('cache_write_1h')+'</td><td>'+num('cache_read')+'</td>'+
       '<td><button class="btn btn-sm" onclick="savePricing('+i+')">Save</button>'+(r.overridden?' <button class="btn btn-sm btn-danger" onclick="resetPricing(\\''+r.model+'\\')">Reset</button>':'')+'</td>'+
     '</tr>';
