@@ -1,5 +1,87 @@
 export type ProfileVendor = "anthropic-oauth" | "deepseek-balance" | "openai-codex";
 
+// ── Multi-tenant: accounts, ingest tokens, machines ──────────────────────────
+
+export interface Account {
+  id: number;
+  identity: string;
+  display_name: string | null;
+  created_at: string;
+}
+
+export interface IngestToken {
+  id: number;
+  account_id: number;
+  machine: string;
+  token_hash: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/** Masked view returned to the dashboard (never exposes the hash). */
+export interface IngestTokenMasked {
+  id: number;
+  account_id: number;
+  machine: string;
+  token_preview: string; // last 6 chars of the hash, for disambiguation only
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface MachineRow {
+  account_id: number;
+  name: string;
+  first_seen: string;
+  last_seen: string;
+}
+
+// ── Fine-grained token usage grain ───────────────────────────────────────────
+
+export type TokenUsageSource = "local" | "ingest";
+
+export interface TokenUsageInput {
+  account_id: number;
+  profile: string;
+  machine: string;
+  session_id: string;
+  model: string;
+  settings_hash: string;
+  settings_json: string;
+  day: string; // YYYY-MM-DD
+  tokens_in: number;
+  tokens_out: number;
+  cache_write_5m: number;
+  cache_write_1h: number;
+  cache_read: number;
+  source: TokenUsageSource;
+}
+
+export interface TokenUsageRow extends TokenUsageInput {
+  id: number;
+  updated_at: string;
+}
+
+// ── Live multi-machine context sessions ──────────────────────────────────────
+
+export interface ContextSessionInput {
+  account_id: number;
+  profile: string;
+  machine: string;
+  session_id: string;
+  model: string | null;
+  settings_json: string;
+  context_tokens: number | null;
+  context_pct: number | null;
+  effective_limit: number | null;
+  last_active_at: string; // ISO
+}
+
+export interface ContextSessionRow extends ContextSessionInput {
+  updated_at: string;
+}
+
 export interface Profile {
   name: string;
   config_dir: string;
@@ -7,6 +89,7 @@ export interface Profile {
   vendor: ProfileVendor;
   monthly_budget_usd: number | null;
   api_key: string | null;
+  account_id: number;
   created_at: string;
   updated_at: string;
 }
@@ -77,6 +160,7 @@ export type AlertType =
 
 export interface AlertSubscription {
   id: number;
+  account_id: number;
   profile: string;
   alert_type: AlertType;
   threshold: number | null;
@@ -88,6 +172,7 @@ export interface AlertSubscription {
 
 export interface AlertEvent {
   id: number;
+  account_id: number;
   subscription_id: number;
   profile: string;
   alert_type: AlertType;
@@ -157,4 +242,45 @@ export interface TokenReport {
   since_day: string;
   profiles: TokenReportProfile[];
   total: TokenReportTotals;
+}
+
+// ── Fine-grained reports (token_usage) ───────────────────────────────────────
+
+export interface ReportTotals {
+  tokens_in: number;
+  tokens_out: number;
+  cache_write_5m: number;
+  cache_write_1h: number;
+  cache_read: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface ReportDayPoint extends ReportTotals {
+  day: string;
+}
+
+export interface ReportBreakdown extends ReportTotals {
+  /** The drill key value: machine name, session_id, model id, or profile. */
+  key: string;
+}
+
+export interface ReportProfileGroup extends ReportTotals {
+  profile: string;
+  by_machine: ReportBreakdown[];
+  by_day: ReportDayPoint[];
+  /** Present only when drilling deeper than profile (machine/session/model). */
+  drill?: ReportBreakdown[];
+}
+
+export type ReportDrill = "account" | "profile" | "machine" | "session" | "model";
+
+export interface FineTokenReport {
+  granularity: "daily" | "weekly";
+  days: number;
+  since_day: string;
+  drill: ReportDrill;
+  account: string;
+  profiles: ReportProfileGroup[];
+  total: ReportTotals;
 }

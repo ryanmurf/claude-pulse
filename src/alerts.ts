@@ -18,11 +18,12 @@ function log(msg: string): void {
  * when called from the fast context-only poller so we don't double-evaluate 5h/7d).
  */
 export function checkAlerts(
+  accountId: number,
   profile: string,
   snapshot: UsageSnapshot,
   onlyTypes?: import("./types.js").AlertType[],
 ): AlertEvent[] {
-  const subscriptions = getEnabledAlertSubscriptions(profile);
+  const subscriptions = getEnabledAlertSubscriptions(accountId, profile);
   const triggered: AlertEvent[] = [];
 
   for (const sub of subscriptions) {
@@ -98,8 +99,9 @@ export function checkAlerts(
       }
     }
 
-    // Create the alert event
+    // Create the alert event (attributed to the owning account)
     const event = createAlertEvent(
+      accountId,
       sub.id,
       profile,
       sub.alert_type,
