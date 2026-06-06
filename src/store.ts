@@ -235,10 +235,17 @@ export function initDb(dbPath?: string): void {
     db.exec("ALTER TABLE alert_subscriptions ADD COLUMN account_id INTEGER");
   }
 
-  // Subscriptions are unique per (account, profile, alert_type) — not globally.
+  // Subscriptions are unique per (account, profile, alert_type, threshold) — not
+  // globally, and threshold IS part of the key so a profile can have several
+  // threshold alerts on the same window (e.g. 65% AND 90% five_hour). COALESCE
+  // folds NULL threshold (auth_failure) to a sentinel so those stay unique per
+  // (account, profile, alert_type). An earlier build created this index WITHOUT
+  // threshold, which made the account_id backfill collide on multi-threshold
+  // rows and crash startup — drop that older form first.
+  db.exec(`DROP INDEX IF EXISTS idx_alert_subs_unique`);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_subs_unique
-      ON alert_subscriptions(account_id, profile, alert_type)
+      ON alert_subscriptions(account_id, profile, alert_type, COALESCE(threshold, -1))
   `);
 
   db.exec(`
