@@ -44,14 +44,14 @@ describe("resolveRate", () => {
 
   it("picks the most-specific settings_match when multiple rows match", () => {
     const { rate } = resolveRate("gpt-5.5", { service_tier: "batch" }, DEFAULT_PRICING, []);
-    // batch variant placeholder = input 0.625 vs base 1.25
-    expect(rate.input).toBe(0.625);
+    // gpt-5.5 batch tier = input 2.5 vs base 5
+    expect(rate.input).toBe(2.5);
   });
 
   it("ignores a settings_match that is not a subset of usage settings", () => {
     const { rate } = resolveRate("gpt-5.5", { service_tier: "standard" }, DEFAULT_PRICING, []);
     // standard != batch → base row
-    expect(rate.input).toBe(1.25);
+    expect(rate.input).toBe(5);
   });
 
   it("account override variant beats default variant", () => {
@@ -83,7 +83,7 @@ describe("mergePricing", () => {
     const opus = merged.find((r) => r.model === "claude-opus-4" && r.settings_match_json === "{}")!;
     expect(opus.overridden).toBe(true);
     expect(opus.input).toBe(99); // effective = override
-    expect(opus.default_rate!.input).toBe(15); // original default preserved
+    expect(opus.default_rate!.input).toBe(5); // original default preserved
     const sonnet = merged.find((r) => r.model === "claude-sonnet-4")!;
     expect(sonnet.overridden).toBe(false);
   });

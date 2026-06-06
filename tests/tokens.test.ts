@@ -64,12 +64,12 @@ describe("rateForModel", () => {
 
 describe("costForTokens", () => {
   it("computes opus cost across all four token classes", () => {
-    // opus: input 15, output 75, cacheWrite 18.75, cacheRead 1.5 (per 1M)
+    // opus: input 5, output 25, cacheWrite 6.25, cacheRead 0.5 (per 1M)
     const cost = costForTokens(
       { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_creation_tokens: 1_000_000, cache_read_tokens: 1_000_000 },
       "claude-opus-4-8",
     );
-    expect(cost).toBeCloseTo(15 + 75 + 18.75 + 1.5, 6);
+    expect(cost).toBeCloseTo(5 + 25 + 6.25 + 0.5, 6);
   });
   it("scales linearly with token volume", () => {
     const cost = costForTokens(
@@ -100,9 +100,9 @@ describe("tallyProfileTokens — Claude", () => {
     expect(opusD1.output_tokens).toBe(500);
     expect(opusD1.cache_creation_tokens).toBe(2000);
     expect(opusD1.cache_read_tokens).toBe(8000);
-    // opus cost = (1000*15 + 500*75 + 2000*18.75 + 8000*1.5)/1e6
+    // opus cost = (1000*5 + 500*25 + 2000*6.25 + 8000*0.5)/1e6
     expect(opusD1.cost_usd).toBeCloseTo(
-      (1000 * 15 + 500 * 75 + 2000 * 18.75 + 8000 * 1.5) / 1_000_000,
+      (1000 * 5 + 500 * 25 + 2000 * 6.25 + 8000 * 0.5) / 1_000_000,
       6,
     );
 

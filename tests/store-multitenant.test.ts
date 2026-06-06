@@ -211,8 +211,8 @@ describe("getFineTokenReport", () => {
     upsertTokenUsage(usageRow(a.id, { day: today, model: "claude-opus-4-8", tokens_in: 1_000_000, tokens_out: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0 }));
 
     const before = getFineTokenReport({ accountId: a.id, identity: a.identity, days: 30 });
-    // default opus input = 15 / 1M
-    expect(before.profiles[0].cost_usd).toBeCloseTo(15, 6);
+    // default opus input = 5 / 1M
+    expect(before.profiles[0].cost_usd).toBeCloseTo(5, 6);
 
     upsertPricingOverride(a.id, { model: "claude-opus-4", settings_match_json: "{}", input: 1, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0 });
     const after = getFineTokenReport({ accountId: a.id, identity: a.identity, days: 30 });
@@ -221,7 +221,7 @@ describe("getFineTokenReport", () => {
     // Reset override → back to default.
     expect(deletePricingOverride(a.id, "claude-opus-4")).toBe(1);
     const reset = getFineTokenReport({ accountId: a.id, identity: a.identity, days: 30 });
-    expect(reset.profiles[0].cost_usd).toBeCloseTo(15, 6);
+    expect(reset.profiles[0].cost_usd).toBeCloseTo(5, 6);
   });
 });
 

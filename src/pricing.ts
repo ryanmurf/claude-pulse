@@ -42,35 +42,60 @@ export interface PricingOverrideRow extends PricingRate {
   settings_match_json: string;
 }
 
-// ── PLACEHOLDER DEFAULT PRICING ──────────────────────────────────────────────
+// ── DEFAULT PRICING (researched 2026-06-06) ──────────────────────────────────
 //
-// TODO(ryan): REPLACE THESE NUMBERS WITH RESEARCHED VALUES. Every rate below is
-// a PLACEHOLDER carried over from the prior single-tenant MODEL_PRICING table
-// (USD per 1e6 tokens). The 5m/1h cache-write split is also a placeholder: most
-// public price sheets quote a single "cache write" rate, so 5m == base write and
-// 1h == 2x base write here purely as a stand-in until real numbers land.
-// The STRUCTURE (keys, settings_match variants, override logic) is what matters;
-// the magnitudes are not authoritative.
+// USD per 1,000,000 tokens. Sources (seen 2026-06-06):
+//   Anthropic  https://platform.claude.com/docs/en/about-claude/pricing
+//   OpenAI     https://developers.openai.com/api/docs/pricing
+//   DeepSeek   https://api-docs.deepseek.com/quick_start/pricing
+//   Google     https://ai.google.dev/gemini-api/docs/pricing
 //
-// Keyed by a normalised (lowercased) model id, prefix-matched downstream so a
-// dated id like "claude-opus-4-8-20260115" resolves via the "claude-opus-4" key.
+// These are the global defaults; each account can override any row via the
+// Pricing settings (pricing_overrides). They are intentionally editable — treat
+// them as current-as-of the date above, not eternal truth.
+//
+// Notes:
+//  - Only Anthropic charges a separate cache-WRITE with a 5m/1h TTL split. For
+//    every non-Anthropic model cache_write_5m/1h = 0 (no such charge), and
+//    cache_read = the provider's discounted cached-input rate.
+//  - Reasoning "effort" is NOT a per-token rate lever for any provider — higher
+//    effort just emits more output tokens, which we already meter. The only true
+//    rate variants are service tiers (batch/flex/priority), Anthropic Fast Mode,
+//    and data residency — model those as settings_match variants below.
+//  - Keyed by a normalised (lowercased) model id, LONGEST-prefix-matched
+//    downstream, so "claude-opus-4-8-20260115" resolves via "claude-opus-4" and
+//    "gpt-5.4-mini-…" resolves via "gpt-5.4-mini" (more specific) over "gpt-5.4".
 export const DEFAULT_PRICING: PricingRow[] = [
-  // Anthropic Opus 4.x — $15 / $75, cache write 1.25x input, cache read 0.1x input
-  { model: "claude-opus-4", settings_match_json: "{}", input: 15, output: 75, cache_write_5m: 18.75, cache_write_1h: 30, cache_read: 1.5 },
-  // Anthropic Sonnet 4.x — $3 / $15
+  // Anthropic Claude 4.x (current Opus 4.5–4.8 = $5/$25; cache write 5m=1.25x, 1h=2x, read=0.1x of input)
+  { model: "claude-opus-4", settings_match_json: "{}", input: 5, output: 25, cache_write_5m: 6.25, cache_write_1h: 10, cache_read: 0.5 },
   { model: "claude-sonnet-4", settings_match_json: "{}", input: 3, output: 15, cache_write_5m: 3.75, cache_write_1h: 6, cache_read: 0.3 },
-  // Anthropic Haiku 4.x — $1 / $5
   { model: "claude-haiku-4", settings_match_json: "{}", input: 1, output: 5, cache_write_5m: 1.25, cache_write_1h: 2, cache_read: 0.1 },
-  // DeepSeek chat — cache write priced same as input miss; cache read steeply discounted
-  { model: "deepseek", settings_match_json: "{}", input: 0.27, output: 1.1, cache_write_5m: 0.27, cache_write_1h: 0.27, cache_read: 0.07 },
-  // OpenAI gpt-5.x family — $1.25 / $10, cached input 0.1x
-  { model: "gpt-5", settings_match_json: "{}", input: 1.25, output: 10, cache_write_5m: 1.25, cache_write_1h: 1.25, cache_read: 0.125 },
-  // EXAMPLE settings-variant placeholder: a discounted "batch" service tier for gpt-5.
-  // Demonstrates the most-specific-match override path; numbers are placeholders.
-  { model: "gpt-5", settings_match_json: "{\"service_tier\":\"batch\"}", input: 0.625, output: 5, cache_write_5m: 0.625, cache_write_1h: 0.625, cache_read: 0.0625 },
+  // Anthropic batch tier — 50% off input/output (cache rates scale too)
+  { model: "claude-opus-4", settings_match_json: "{\"service_tier\":\"batch\"}", input: 2.5, output: 12.5, cache_write_5m: 3.125, cache_write_1h: 5, cache_read: 0.25 },
+
+  // OpenAI GPT-5.x (no cache-write charge; cache_read = discounted cached-input)
+  { model: "gpt-5.5-pro", settings_match_json: "{}", input: 30, output: 180, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0 },
+  { model: "gpt-5.5", settings_match_json: "{}", input: 5, output: 30, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.5 },
+  { model: "gpt-5.4-nano", settings_match_json: "{}", input: 0.2, output: 1.25, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.02 },
+  { model: "gpt-5.4-mini", settings_match_json: "{}", input: 0.75, output: 4.5, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.075 },
+  { model: "gpt-5.4", settings_match_json: "{}", input: 2.5, output: 15, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.25 },
+  { model: "gpt-5.3-codex", settings_match_json: "{}", input: 1.75, output: 14, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.175 },
+  // OpenAI batch/flex tier — ~50% off (example variant; applies to gpt-5.5)
+  { model: "gpt-5.5", settings_match_json: "{\"service_tier\":\"batch\"}", input: 2.5, output: 15, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.25 },
+
+  // DeepSeek v4-flash (deepseek-chat/-reasoner alias here; cache-miss input = input, cache-hit = cache_read)
+  { model: "deepseek", settings_match_json: "{}", input: 0.14, output: 0.28, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.0028 },
+
+  // Google Gemini (≤200k-token rate; doubles >200k — not modeled. No cache-write charge.)
+  { model: "gemini-3.1-pro", settings_match_json: "{}", input: 2, output: 12, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.2 },
+  { model: "gemini-3.5-flash", settings_match_json: "{}", input: 1.5, output: 9, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.15 },
+  { model: "gemini-2.5-pro", settings_match_json: "{}", input: 1.25, output: 10, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.125 },
+  { model: "gemini-2.5-flash", settings_match_json: "{}", input: 0.3, output: 2.5, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.03 },
 ];
 
-// PLACEHOLDER fallback when a model id matches nothing above (TODO: revisit).
+// Fallback when a model id matches no row above — mid-range Sonnet-like rate, so
+// an unknown model is costed conservatively rather than zeroed. rateForModel
+// flags these as known:false so the UI can surface "unknown model" pricing.
 export const FALLBACK_RATE: PricingRate = {
   input: 3,
   output: 15,
