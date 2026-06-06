@@ -89,6 +89,7 @@ export interface Profile {
   vendor: ProfileVendor;
   monthly_budget_usd: number | null;
   api_key: string | null;
+  account_id: number;
   created_at: string;
   updated_at: string;
 }
@@ -159,6 +160,7 @@ export type AlertType =
 
 export interface AlertSubscription {
   id: number;
+  account_id: number;
   profile: string;
   alert_type: AlertType;
   threshold: number | null;
@@ -170,6 +172,7 @@ export interface AlertSubscription {
 
 export interface AlertEvent {
   id: number;
+  account_id: number;
   subscription_id: number;
   profile: string;
   alert_type: AlertType;

@@ -12,6 +12,7 @@ import {
   upsertContextSession,
   sweepStaleContextSessions,
   resolveAccount,
+  localAccountId,
   DEFAULT_ACCOUNT_IDENTITY,
   type ContextSnapshotFields,
 } from "./store.js";
@@ -250,8 +251,8 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
       `Poll complete for ${profile.name}: 5h=${usage.fiveHourPct}%, 7d=${usage.sevenDayPct}%`
     );
 
-    // Check alerts after successful poll
-    const alertEvents = checkAlerts(profile.name, snapshot);
+    // Check alerts after successful poll (local daemon account).
+    const alertEvents = checkAlerts(localAccountId(), profile.name, snapshot);
     for (const evt of alertEvents) {
       const resetsAt = getResetsAt(evt, usage.fiveHourResetsAt, usage.sevenDayResetsAt);
       await pushChannelAlert(evt, profile.name, resetsAt);
@@ -297,7 +298,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
     );
 
     // Check alerts after failed poll (auth_failure detection)
-    const alertEvents = checkAlerts(profile.name, snapshot);
+    const alertEvents = checkAlerts(localAccountId(), profile.name, snapshot);
     for (const evt of alertEvents) {
       await pushChannelAlert(evt, profile.name, null);
     }
@@ -412,7 +413,7 @@ export async function pollContextOnce(): Promise<void> {
         };
         const snapshot = upsertContextOnLatestSnapshot(p.name, fields, accountId);
         // Evaluate ONLY context alerts on this fast loop — 5h/7d are handled by the slow loop.
-        const alertEvents = checkAlerts(p.name, snapshot, ["context_threshold"]);
+        const alertEvents = checkAlerts(accountId, p.name, snapshot, ["context_threshold"]);
         for (const evt of alertEvents) {
           await pushChannelAlert(evt, p.name, null);
         }

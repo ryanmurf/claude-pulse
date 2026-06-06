@@ -82,12 +82,13 @@ export function initDb(dbPath?: string): void {
       vendor TEXT NOT NULL DEFAULT 'anthropic-oauth',
       monthly_budget_usd REAL,
       api_key TEXT,
+      account_id INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
 
-  // Migrate older DBs that pre-date the vendor/budget/api_key columns.
+  // Migrate older DBs that pre-date the vendor/budget/api_key/account_id columns.
   const cols = (db
     .prepare("PRAGMA table_info(profiles)")
     .all() as { name: string }[]).map((c) => c.name);
@@ -99,6 +100,9 @@ export function initDb(dbPath?: string): void {
   }
   if (!cols.includes("api_key")) {
     db.exec("ALTER TABLE profiles ADD COLUMN api_key TEXT");
+  }
+  if (!cols.includes("account_id")) {
+    db.exec("ALTER TABLE profiles ADD COLUMN account_id INTEGER");
   }
 
   db.exec(`
@@ -163,6 +167,7 @@ export function initDb(dbPath?: string): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS alert_subscriptions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
       profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
       alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
       threshold REAL,
@@ -193,6 +198,7 @@ export function initDb(dbPath?: string): void {
         db.exec(`
           CREATE TABLE alert_subscriptions__new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
             profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
             alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
             threshold REAL,
@@ -202,7 +208,14 @@ export function initDb(dbPath?: string): void {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
           )
         `);
-        db.exec(`INSERT INTO alert_subscriptions__new SELECT * FROM alert_subscriptions`);
+        // Old table pre-dates account_id; copy explicit columns and leave
+        // account_id NULL (backfilled to the default account below).
+        db.exec(`
+          INSERT INTO alert_subscriptions__new
+            (id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at)
+          SELECT id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at
+          FROM alert_subscriptions
+        `);
         db.exec(`DROP TABLE alert_subscriptions`);
         db.exec(`ALTER TABLE alert_subscriptions__new RENAME TO alert_subscriptions`);
       }
@@ -213,9 +226,25 @@ export function initDb(dbPath?: string): void {
     process.stderr.write(`[claude-pulse] alert_subscriptions migration warning: ${(e as Error).message}\n`);
   }
 
+  // For DBs that already had context_threshold (so the rebuild above didn't run)
+  // but pre-date account_id, add the column directly.
+  const subCols = (db
+    .prepare("PRAGMA table_info(alert_subscriptions)")
+    .all() as { name: string }[]).map((c) => c.name);
+  if (subCols.length > 0 && !subCols.includes("account_id")) {
+    db.exec("ALTER TABLE alert_subscriptions ADD COLUMN account_id INTEGER");
+  }
+
+  // Subscriptions are unique per (account, profile, alert_type) — not globally.
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_subs_unique
+      ON alert_subscriptions(account_id, profile, alert_type)
+  `);
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS alert_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
       subscription_id INTEGER NOT NULL REFERENCES alert_subscriptions(id) ON DELETE CASCADE,
       profile TEXT NOT NULL,
       alert_type TEXT NOT NULL,
@@ -227,9 +256,21 @@ export function initDb(dbPath?: string): void {
     )
   `);
 
+  // Migrate older alert_events tables that pre-date account_id.
+  const aeCols = (db
+    .prepare("PRAGMA table_info(alert_events)")
+    .all() as { name: string }[]).map((c) => c.name);
+  if (aeCols.length > 0 && !aeCols.includes("account_id")) {
+    db.exec("ALTER TABLE alert_events ADD COLUMN account_id INTEGER");
+  }
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_alert_events_sub
       ON alert_events(subscription_id, triggered_at)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_alert_events_account
+      ON alert_events(account_id, triggered_at)
   `);
 
   db.exec(`
@@ -287,6 +328,19 @@ export function initDb(dbPath?: string): void {
     .get(DEFAULT_ACCOUNT_IDENTITY) as { id: number }).id;
   db.prepare(
     "UPDATE usage_snapshots SET account_id = ? WHERE account_id IS NULL"
+  ).run(defaultAccountId);
+
+  // Backfill account_id → the default/local account on the tables that gained
+  // an account_id column in the multi-tenant rework. Existing single-tenant
+  // rows all belong to the local daemon.
+  db.prepare(
+    "UPDATE profiles SET account_id = ? WHERE account_id IS NULL"
+  ).run(defaultAccountId);
+  db.prepare(
+    "UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL"
+  ).run(defaultAccountId);
+  db.prepare(
+    "UPDATE alert_events SET account_id = ? WHERE account_id IS NULL"
   ).run(defaultAccountId);
 
   db.exec(`
@@ -463,9 +517,15 @@ function defaultAccountId(): number {
   return resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
 }
 
-export function ensureDefaultProfiles(): void {
+/** Public accessor for the local/default daemon account id. */
+export function localAccountId(): number {
+  return defaultAccountId();
+}
+
+export function ensureDefaultProfiles(accountId?: number): void {
   const d = getDb();
   const homeDir = os.homedir();
+  const acct = accountId ?? defaultAccountId();
 
   const defaults = [
     { name: "claude-hd", config_dir: path.join(homeDir, ".claude-hd") },
@@ -473,28 +533,35 @@ export function ensureDefaultProfiles(): void {
   ];
 
   const stmt = d.prepare(
-    `INSERT INTO profiles (name, config_dir, poll_interval_minutes)
-     VALUES (?, ?, 5)
+    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, account_id)
+     VALUES (?, ?, 5, ?)
      ON CONFLICT(name) DO NOTHING`
   );
 
   for (const p of defaults) {
-    stmt.run(p.name, p.config_dir);
+    stmt.run(p.name, p.config_dir, acct);
   }
 }
 
-export function listProfiles(): Profile[] {
+/** List profiles for an account (defaults to the local daemon's account). */
+export function listProfiles(accountId?: number): Profile[] {
   const d = getDb();
-  return d.prepare("SELECT * FROM profiles ORDER BY name").all() as unknown as Profile[];
+  const acct = accountId ?? defaultAccountId();
+  return d.prepare(
+    "SELECT * FROM profiles WHERE account_id = ? ORDER BY name"
+  ).all(acct) as unknown as Profile[];
 }
 
 export function redactProfile(p: Profile): Omit<Profile, "api_key"> & { api_key: string | null } {
   return { ...p, api_key: p.api_key ? "***" : null };
 }
 
-export function getProfile(name: string): Profile | undefined {
+export function getProfile(name: string, accountId?: number): Profile | undefined {
   const d = getDb();
-  const row = d.prepare("SELECT * FROM profiles WHERE name = ?").get(name);
+  const acct = accountId ?? defaultAccountId();
+  const row = d.prepare(
+    "SELECT * FROM profiles WHERE name = ? AND account_id = ?"
+  ).get(name, acct);
   return row as unknown as Profile | undefined;
 }
 
@@ -504,14 +571,16 @@ export function addProfile(
   pollIntervalMinutes: number = 5,
   vendor: ProfileVendor = "anthropic-oauth",
   monthlyBudgetUsd: number | null = null,
-  apiKey: string | null = null
+  apiKey: string | null = null,
+  accountId?: number,
 ): Profile {
   const d = getDb();
+  const acct = accountId ?? defaultAccountId();
   d.prepare(
-    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(name, configDir, pollIntervalMinutes, vendor, monthlyBudgetUsd, apiKey);
-  return getProfile(name)!;
+    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key, account_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(name, configDir, pollIntervalMinutes, vendor, monthlyBudgetUsd, apiKey, acct);
+  return getProfile(name, acct)!;
 }
 
 export function updateProfileBudget(
@@ -771,6 +840,7 @@ export function getLatestGeminiQuota(): GeminiQuotaSnapshot[] {
 // --- Alert Subscription functions ---
 
 export function createAlertSubscription(
+  accountId: number,
   profile: string,
   alertType: AlertType,
   threshold: number | null,
@@ -779,47 +849,63 @@ export function createAlertSubscription(
 ): AlertSubscription {
   const d = getDb();
   const result = d.prepare(
-    `INSERT INTO alert_subscriptions (profile, alert_type, threshold, channel, cooldown_minutes)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(profile, alertType, threshold, channel, cooldownMinutes);
+    `INSERT INTO alert_subscriptions (account_id, profile, alert_type, threshold, channel, cooldown_minutes)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(accountId, profile, alertType, threshold, channel, cooldownMinutes);
   return d.prepare("SELECT * FROM alert_subscriptions WHERE id = ?")
     .get(result.lastInsertRowid) as unknown as AlertSubscription;
 }
 
-export function removeAlertSubscription(id: number): boolean {
+/**
+ * Remove a subscription by id, scoped to the owning account. Returns false when
+ * the row doesn't exist OR belongs to another account (closes the IDOR).
+ */
+export function removeAlertSubscription(accountId: number, id: number): boolean {
   const d = getDb();
-  const result = d.prepare("DELETE FROM alert_subscriptions WHERE id = ?").run(id);
+  const result = d.prepare(
+    "DELETE FROM alert_subscriptions WHERE id = ? AND account_id = ?"
+  ).run(id, accountId);
   return Number(result.changes) > 0;
 }
 
-export function listAlertSubscriptions(profile?: string): AlertSubscription[] {
+export function listAlertSubscriptions(accountId: number, profile?: string): AlertSubscription[] {
   const d = getDb();
   if (profile) {
     return d.prepare(
-      "SELECT * FROM alert_subscriptions WHERE profile = ? ORDER BY id"
-    ).all(profile) as unknown as AlertSubscription[];
+      "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? ORDER BY id"
+    ).all(accountId, profile) as unknown as AlertSubscription[];
   }
   return d.prepare(
-    "SELECT * FROM alert_subscriptions ORDER BY profile, id"
-  ).all() as unknown as AlertSubscription[];
+    "SELECT * FROM alert_subscriptions WHERE account_id = ? ORDER BY profile, id"
+  ).all(accountId) as unknown as AlertSubscription[];
 }
 
-export function getAlertSubscription(id: number): AlertSubscription | undefined {
+export function getAlertSubscription(id: number, accountId?: number): AlertSubscription | undefined {
   const d = getDb();
+  if (accountId !== undefined) {
+    return d.prepare(
+      "SELECT * FROM alert_subscriptions WHERE id = ? AND account_id = ?"
+    ).get(id, accountId) as unknown as AlertSubscription | undefined;
+  }
   const row = d.prepare("SELECT * FROM alert_subscriptions WHERE id = ?").get(id);
   return row as unknown as AlertSubscription | undefined;
 }
 
-export function getEnabledAlertSubscriptions(profile: string): AlertSubscription[] {
+/**
+ * Enabled subscriptions for a (account, profile) pair. The alert-firing path
+ * passes the owning account so a fired alert is attributed correctly.
+ */
+export function getEnabledAlertSubscriptions(accountId: number, profile: string): AlertSubscription[] {
   const d = getDb();
   return d.prepare(
-    "SELECT * FROM alert_subscriptions WHERE profile = ? AND enabled = 1 ORDER BY id"
-  ).all(profile) as unknown as AlertSubscription[];
+    "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? AND enabled = 1 ORDER BY id"
+  ).all(accountId, profile) as unknown as AlertSubscription[];
 }
 
 // --- Alert Event functions ---
 
 export function createAlertEvent(
+  accountId: number,
   subscriptionId: number,
   profile: string,
   alertType: AlertType,
@@ -829,22 +915,24 @@ export function createAlertEvent(
 ): AlertEvent {
   const d = getDb();
   const result = d.prepare(
-    `INSERT INTO alert_events (subscription_id, profile, alert_type, message, current_value, threshold)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(subscriptionId, profile, alertType, message, currentValue, threshold);
+    `INSERT INTO alert_events (account_id, subscription_id, profile, alert_type, message, current_value, threshold)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(accountId, subscriptionId, profile, alertType, message, currentValue, threshold);
   return d.prepare("SELECT * FROM alert_events WHERE id = ?")
     .get(result.lastInsertRowid) as unknown as AlertEvent;
 }
 
 export function getTriggeredAlerts(
+  accountId: number,
   profile?: string,
   sinceHours: number = 24,
   unacknowledgedOnly: boolean = false
 ): AlertEvent[] {
   const d = getDb();
   let sql = `SELECT * FROM alert_events
-     WHERE triggered_at >= datetime('now', '-' || ? || ' hours')`;
-  const params: (string | number)[] = [sinceHours];
+     WHERE account_id = ?
+       AND triggered_at >= datetime('now', '-' || ? || ' hours')`;
+  const params: (string | number)[] = [accountId, sinceHours];
 
   if (profile) {
     sql += " AND profile = ?";
@@ -858,25 +946,29 @@ export function getTriggeredAlerts(
   return d.prepare(sql).all(...params) as unknown as AlertEvent[];
 }
 
-export function acknowledgeAlert(eventId: number): boolean {
+/**
+ * Acknowledge one alert event by id, scoped to the owning account. Returns false
+ * when the row doesn't exist OR belongs to another account (closes the IDOR).
+ */
+export function acknowledgeAlert(accountId: number, eventId: number): boolean {
   const d = getDb();
   const result = d.prepare(
-    "UPDATE alert_events SET acknowledged = 1 WHERE id = ? AND acknowledged = 0"
-  ).run(eventId);
+    "UPDATE alert_events SET acknowledged = 1 WHERE id = ? AND account_id = ? AND acknowledged = 0"
+  ).run(eventId, accountId);
   return Number(result.changes) > 0;
 }
 
-export function acknowledgeAllAlerts(profile?: string): number {
+export function acknowledgeAllAlerts(accountId: number, profile?: string): number {
   const d = getDb();
   if (profile) {
     const result = d.prepare(
-      "UPDATE alert_events SET acknowledged = 1 WHERE profile = ? AND acknowledged = 0"
-    ).run(profile);
+      "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND profile = ? AND acknowledged = 0"
+    ).run(accountId, profile);
     return Number(result.changes);
   }
   const result = d.prepare(
-    "UPDATE alert_events SET acknowledged = 1 WHERE acknowledged = 0"
-  ).run();
+    "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND acknowledged = 0"
+  ).run(accountId);
   return Number(result.changes);
 }
 

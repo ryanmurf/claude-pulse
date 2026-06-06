@@ -25,6 +25,7 @@ import {
   getTriggeredAlerts,
   acknowledgeAlert,
   acknowledgeAllAlerts,
+  localAccountId,
 } from "./store.js";
 import {
   pollProfile,
@@ -692,6 +693,7 @@ server.tool(
     }
 
     const sub = createAlertSubscription(
+      localAccountId(),
       profile,
       alert_type,
       alert_type === "auth_failure" ? null : (threshold ?? null),
@@ -718,7 +720,7 @@ server.tool(
     id: z.number().describe("Alert subscription ID to remove"),
   },
   async ({ id }) => {
-    const removed = removeAlertSubscription(id);
+    const removed = removeAlertSubscription(localAccountId(), id);
     if (!removed) {
       return {
         content: [
@@ -751,7 +753,7 @@ server.tool(
       .describe("Profile name to filter by. Omit to list all."),
   },
   async ({ profile }) => {
-    const subs = listAlertSubscriptions(profile);
+    const subs = listAlertSubscriptions(localAccountId(), profile);
     if (subs.length === 0) {
       return {
         content: [
@@ -791,7 +793,7 @@ server.tool(
       .describe("Only return unacknowledged alerts (default false)"),
   },
   async ({ profile, hours, unacknowledged_only }) => {
-    const events = getTriggeredAlerts(profile, hours, unacknowledged_only);
+    const events = getTriggeredAlerts(localAccountId(), profile, hours, unacknowledged_only);
     if (events.length === 0) {
       return {
         content: [
@@ -826,7 +828,7 @@ server.tool(
   },
   async ({ id, profile }) => {
     if (id !== undefined) {
-      const acked = acknowledgeAlert(id);
+      const acked = acknowledgeAlert(localAccountId(), id);
       return {
         content: [
           {
@@ -839,7 +841,7 @@ server.tool(
       };
     }
 
-    const count = acknowledgeAllAlerts(profile);
+    const count = acknowledgeAllAlerts(localAccountId(), profile);
     const scope = profile ? `for profile "${profile}"` : "across all profiles";
     return {
       content: [
@@ -871,7 +873,7 @@ server.tool(
   async ({ alert_id, message }) => {
     let ackResult = "";
     if (alert_id !== undefined) {
-      const acked = acknowledgeAlert(alert_id);
+      const acked = acknowledgeAlert(localAccountId(), alert_id);
       ackResult = acked
         ? `Alert ${alert_id} acknowledged. `
         : `Alert ${alert_id} not found or already acknowledged. `;
