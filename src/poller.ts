@@ -1,3 +1,4 @@
+import os from "node:os";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PollResult, Profile, AlertEvent } from "./types.js";
 import {
@@ -6,16 +7,22 @@ import {
   getProfile,
   getLastSuccessfulSnapshot,
   upsertContextOnLatestSnapshot,
+  upsertTokenRollup,
   type ContextSnapshotFields,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
 import { fetchUsage } from "./usage.js";
 import { getContextForProfile, type ContextReadResult } from "./context.js";
+import { tallyProfileTokens } from "./tokens.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
 let contextTimer: ReturnType<typeof setInterval> | undefined;
+let tokenRollupTimer: ReturnType<typeof setInterval> | undefined;
 const CONTEXT_POLL_INTERVAL_MS = 30_000; // 30s — JSONL-scan is cheap (tail read)
+const TOKEN_ROLLUP_INTERVAL_MS = 60 * 60 * 1000; // 1h default
+// How many trailing days to recompute each run — catches late JSONL writes.
+const TOKEN_ROLLUP_LOOKBACK_DAYS = 2;
 
 let mcpServerInstance: McpServer | undefined;
 
@@ -371,6 +378,7 @@ export function stopAllPollers(): void {
   }
   cancelPendingResumes();
   stopContextPoller();
+  stopTokenRollup();
   log("All pollers stopped");
 }
 
@@ -421,5 +429,70 @@ export function stopContextPoller(): void {
     clearInterval(contextTimer);
     contextTimer = undefined;
     log("Context poller stopped");
+  }
+}
+
+// ── Token rollup loop ──────────────────────────────────────────────────────
+// On startup and every N hours, scan each profile's transcripts and upsert
+// per-(day, model) token rollups keyed by this machine's hostname. Recomputes
+// the trailing few days each run so late writes are captured.
+
+function lookbackSinceDay(days: number): string {
+  const ms = Date.now() - days * 24 * 60 * 60 * 1000;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * Compute + upsert local token rollups for all profiles. Guarded per-profile so
+ * one bad transcript can't abort the rest. `source='local'`, host=os.hostname().
+ */
+export async function runTokenRollupOnce(
+  lookbackDays: number = TOKEN_ROLLUP_LOOKBACK_DAYS,
+): Promise<void> {
+  const host = os.hostname();
+  const sinceDay = lookbackSinceDay(lookbackDays);
+  const profiles = listProfiles();
+  for (const p of profiles) {
+    try {
+      const rows = await tallyProfileTokens(p, sinceDay);
+      for (const row of rows) {
+        upsertTokenRollup({
+          profile: p.name,
+          host,
+          day: row.day,
+          model: row.model,
+          input_tokens: row.input_tokens,
+          output_tokens: row.output_tokens,
+          cache_creation_tokens: row.cache_creation_tokens,
+          cache_read_tokens: row.cache_read_tokens,
+          cost_usd: row.cost_usd,
+          source: "local",
+        });
+      }
+      if (rows.length > 0) {
+        log(`Token rollup: ${p.name} upserted ${rows.length} (day,model) row(s) for host ${host}`);
+      }
+    } catch (e) {
+      log(`Token rollup failed for ${p.name}: ${(e as Error).message}`);
+    }
+  }
+}
+
+export function startTokenRollup(intervalMs: number = TOKEN_ROLLUP_INTERVAL_MS): void {
+  stopTokenRollup();
+  // Run once on startup (don't block), then on interval.
+  runTokenRollupOnce().catch((e) => log(`Initial token rollup error: ${e}`));
+  tokenRollupTimer = setInterval(() => {
+    runTokenRollupOnce().catch((e) => log(`Token rollup error: ${e}`));
+  }, intervalMs);
+  tokenRollupTimer.unref();
+  log(`Token rollup loop started (every ${Math.round(intervalMs / 3_600_000)}h)`);
+}
+
+export function stopTokenRollup(): void {
+  if (tokenRollupTimer) {
+    clearInterval(tokenRollupTimer);
+    tokenRollupTimer = undefined;
+    log("Token rollup loop stopped");
   }
 }
