@@ -29,14 +29,17 @@ import {
   upsertTokenRollup,
   getTokenRollups,
   getTokenReport,
+  localAccountId,
 } from "../src/store.js";
 
 let tmpDir: string;
+let LA: number;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-test-"));
   const dbPath = path.join(tmpDir, "test.db");
   initDb(dbPath);
+  LA = localAccountId();
 });
 
 afterEach(() => {
@@ -267,6 +270,7 @@ describe("alert subscriptions", () => {
   it("creates and lists alert subscriptions", () => {
     addProfile("alert-prof", "/tmp/alert", 5);
     const sub = createAlertSubscription(
+      LA,
       "alert-prof",
       "five_hour_threshold",
       90,
@@ -281,7 +285,7 @@ describe("alert subscriptions", () => {
     expect(sub.cooldown_minutes).toBe(30);
     expect(sub.enabled).toBe(1);
 
-    const subs = listAlertSubscriptions("alert-prof");
+    const subs = listAlertSubscriptions(LA, "alert-prof");
     expect(subs).toHaveLength(1);
     expect(subs[0].id).toBe(sub.id);
   });
@@ -289,16 +293,17 @@ describe("alert subscriptions", () => {
   it("lists all subscriptions when no profile filter", () => {
     addProfile("p1", "/tmp/p1", 5);
     addProfile("p2", "/tmp/p2", 5);
-    createAlertSubscription("p1", "five_hour_threshold", 80, null, 30);
-    createAlertSubscription("p2", "seven_day_threshold", 70, null, 60);
+    createAlertSubscription(LA, "p1", "five_hour_threshold", 80, null, 30);
+    createAlertSubscription(LA, "p2", "seven_day_threshold", 70, null, 60);
 
-    const all = listAlertSubscriptions();
+    const all = listAlertSubscriptions(LA);
     expect(all).toHaveLength(2);
   });
 
   it("removes an alert subscription", () => {
     addProfile("rm-alert", "/tmp/rm", 5);
     const sub = createAlertSubscription(
+      LA,
       "rm-alert",
       "auth_failure",
       null,
@@ -306,15 +311,15 @@ describe("alert subscriptions", () => {
       15
     );
 
-    const removed = removeAlertSubscription(sub.id);
+    const removed = removeAlertSubscription(LA, sub.id);
     expect(removed).toBe(true);
 
-    const remaining = listAlertSubscriptions("rm-alert");
+    const remaining = listAlertSubscriptions(LA, "rm-alert");
     expect(remaining).toHaveLength(0);
   });
 
   it("returns false when removing non-existent subscription", () => {
-    const removed = removeAlertSubscription(9999);
+    const removed = removeAlertSubscription(LA, 9999);
     expect(removed).toBe(false);
   });
 });
@@ -323,6 +328,7 @@ describe("alert events", () => {
   it("creates and retrieves alert events", () => {
     addProfile("evt-prof", "/tmp/evt", 5);
     const sub = createAlertSubscription(
+      LA,
       "evt-prof",
       "five_hour_threshold",
       90,
@@ -331,6 +337,7 @@ describe("alert events", () => {
     );
 
     const event = createAlertEvent(
+      LA,
       sub.id,
       "evt-prof",
       "five_hour_threshold",
@@ -344,7 +351,7 @@ describe("alert events", () => {
     expect(event.profile).toBe("evt-prof");
     expect(event.acknowledged).toBe(0);
 
-    const triggered = getTriggeredAlerts("evt-prof", 24, false);
+    const triggered = getTriggeredAlerts(LA, "evt-prof", 24, false);
     expect(triggered).toHaveLength(1);
     expect(triggered[0].id).toBe(event.id);
   });
@@ -352,6 +359,7 @@ describe("alert events", () => {
   it("acknowledges a single alert", () => {
     addProfile("ack-prof", "/tmp/ack", 5);
     const sub = createAlertSubscription(
+      LA,
       "ack-prof",
       "five_hour_threshold",
       90,
@@ -359,6 +367,7 @@ describe("alert events", () => {
       30
     );
     const event = createAlertEvent(
+      LA,
       sub.id,
       "ack-prof",
       "five_hour_threshold",
@@ -367,63 +376,65 @@ describe("alert events", () => {
       90
     );
 
-    const acked = acknowledgeAlert(event.id);
+    const acked = acknowledgeAlert(LA, event.id);
     expect(acked).toBe(true);
 
     // Second ack should return false
-    const acked2 = acknowledgeAlert(event.id);
+    const acked2 = acknowledgeAlert(LA, event.id);
     expect(acked2).toBe(false);
 
-    const unacked = getTriggeredAlerts("ack-prof", 24, true);
+    const unacked = getTriggeredAlerts(LA, "ack-prof", 24, true);
     expect(unacked).toHaveLength(0);
   });
 
   it("acknowledges all alerts for a profile", () => {
     addProfile("ack-all", "/tmp/ackall", 5);
     const sub = createAlertSubscription(
+      LA,
       "ack-all",
       "five_hour_threshold",
       90,
       null,
       30
     );
-    createAlertEvent(sub.id, "ack-all", "five_hour_threshold", "A1", 91, 90);
-    createAlertEvent(sub.id, "ack-all", "five_hour_threshold", "A2", 93, 90);
+    createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A1", 91, 90);
+    createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A2", 93, 90);
 
-    const count = acknowledgeAllAlerts("ack-all");
+    const count = acknowledgeAllAlerts(LA, "ack-all");
     expect(count).toBe(2);
 
-    const unacked = getTriggeredAlerts("ack-all", 24, true);
+    const unacked = getTriggeredAlerts(LA, "ack-all", 24, true);
     expect(unacked).toHaveLength(0);
   });
 
   it("acknowledges all alerts across all profiles", () => {
     addProfile("aa1", "/tmp/aa1", 5);
     addProfile("aa2", "/tmp/aa2", 5);
-    const sub1 = createAlertSubscription("aa1", "five_hour_threshold", 90, null, 30);
-    const sub2 = createAlertSubscription("aa2", "seven_day_threshold", 80, null, 30);
-    createAlertEvent(sub1.id, "aa1", "five_hour_threshold", "X", 95, 90);
-    createAlertEvent(sub2.id, "aa2", "seven_day_threshold", "Y", 85, 80);
+    const sub1 = createAlertSubscription(LA, "aa1", "five_hour_threshold", 90, null, 30);
+    const sub2 = createAlertSubscription(LA, "aa2", "seven_day_threshold", 80, null, 30);
+    createAlertEvent(LA, sub1.id, "aa1", "five_hour_threshold", "X", 95, 90);
+    createAlertEvent(LA, sub2.id, "aa2", "seven_day_threshold", "Y", 85, 80);
 
-    const count = acknowledgeAllAlerts();
+    const count = acknowledgeAllAlerts(LA);
     expect(count).toBe(2);
   });
 
   it("filters triggered alerts by unacknowledged_only", () => {
     addProfile("filter-prof", "/tmp/filter", 5);
     const sub = createAlertSubscription(
+      LA,
       "filter-prof",
       "five_hour_threshold",
       90,
       null,
       30
     );
-    const e1 = createAlertEvent(sub.id, "filter-prof", "five_hour_threshold", "E1", 91, 90);
-    createAlertEvent(sub.id, "filter-prof", "five_hour_threshold", "E2", 95, 90);
+    const e1 = createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E1", 91, 90);
+    createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E2", 95, 90);
 
-    acknowledgeAlert(e1.id);
+    acknowledgeAlert(LA, e1.id);
 
-    const unacked = getTriggeredAlerts("filter-prof", 24, true);
+    const unacked = getTriggeredAlerts(LA, "filter-prof", 24, true);
     expect(unacked).toHaveLength(1);
     expect(unacked[0].message).toBe("E2");
   });

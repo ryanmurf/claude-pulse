@@ -8,16 +8,19 @@ import {
   addProfile,
   createAlertSubscription,
   createAlertEvent,
+  localAccountId,
 } from "../src/store.js";
 import { checkAlerts } from "../src/alerts.js";
 import type { UsageSnapshot } from "../src/types.js";
 
 let tmpDir: string;
+let acct: number;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-alerts-test-"));
   const dbPath = path.join(tmpDir, "test.db");
   initDb(dbPath);
+  acct = localAccountId();
   addProfile("test-profile", "/tmp/test", 5);
 });
 
@@ -42,10 +45,10 @@ function makeSnapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
 
 describe("checkAlerts", () => {
   it("fires when five_hour_threshold is crossed", () => {
-    createAlertSubscription("test-profile", "five_hour_threshold", 90, null, 30);
+    createAlertSubscription(acct, "test-profile", "five_hour_threshold", 90, null, 30);
 
     const snapshot = makeSnapshot({ five_hour_pct: 92.5 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(1);
     expect(events[0].alert_type).toBe("five_hour_threshold");
@@ -56,10 +59,10 @@ describe("checkAlerts", () => {
   });
 
   it("fires when seven_day_threshold is crossed", () => {
-    createAlertSubscription("test-profile", "seven_day_threshold", 80, null, 30);
+    createAlertSubscription(acct, "test-profile", "seven_day_threshold", 80, null, 30);
 
     const snapshot = makeSnapshot({ seven_day_pct: 85.0 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(1);
     expect(events[0].alert_type).toBe("seven_day_threshold");
@@ -69,13 +72,13 @@ describe("checkAlerts", () => {
   });
 
   it("fires on auth_failure when values are null", () => {
-    createAlertSubscription("test-profile", "auth_failure", null, null, 30);
+    createAlertSubscription(acct, "test-profile", "auth_failure", null, null, 30);
 
     const snapshot = makeSnapshot({
       five_hour_pct: null,
       seven_day_pct: null,
     });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(1);
     expect(events[0].alert_type).toBe("auth_failure");
@@ -84,6 +87,7 @@ describe("checkAlerts", () => {
 
   it("respects cooldown period", () => {
     const sub = createAlertSubscription(
+      acct,
       "test-profile",
       "five_hour_threshold",
       90,
@@ -93,6 +97,7 @@ describe("checkAlerts", () => {
 
     // Manually create a recent alert event to simulate a recently-fired alert
     createAlertEvent(
+      acct,
       sub.id,
       "test-profile",
       "five_hour_threshold",
@@ -102,29 +107,29 @@ describe("checkAlerts", () => {
     );
 
     const snapshot = makeSnapshot({ five_hour_pct: 95.0 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     // Should not fire because we're within cooldown
     expect(events).toHaveLength(0);
   });
 
   it("does not fire when below threshold", () => {
-    createAlertSubscription("test-profile", "five_hour_threshold", 90, null, 30);
+    createAlertSubscription(acct, "test-profile", "five_hour_threshold", 90, null, 30);
 
     const snapshot = makeSnapshot({ five_hour_pct: 50.0 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(0);
   });
 
   it("does not fire for auth_failure when values are present", () => {
-    createAlertSubscription("test-profile", "auth_failure", null, null, 30);
+    createAlertSubscription(acct, "test-profile", "auth_failure", null, null, 30);
 
     const snapshot = makeSnapshot({
       five_hour_pct: 50.0,
       seven_day_pct: 30.0,
     });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(0);
   });
@@ -138,26 +143,26 @@ describe("checkAlerts", () => {
     // the store function already filters by enabled=1.
 
     // Create a subscription and verify it fires
-    createAlertSubscription("test-profile", "five_hour_threshold", 90, null, 30);
+    createAlertSubscription(acct, "test-profile", "five_hour_threshold", 90, null, 30);
     const snapshot = makeSnapshot({ five_hour_pct: 95.0 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
     expect(events).toHaveLength(1);
 
     // Now test with no subscriptions for a different profile — should return empty
     addProfile("no-subs", "/tmp/nosubs", 5);
-    const events2 = checkAlerts("no-subs", makeSnapshot({ profile: "no-subs", five_hour_pct: 99.0 }));
+    const events2 = checkAlerts(acct, "no-subs", makeSnapshot({ profile: "no-subs", five_hour_pct: 99.0 }));
     expect(events2).toHaveLength(0);
   });
 
   it("fires multiple alerts when multiple thresholds are crossed", () => {
-    createAlertSubscription("test-profile", "five_hour_threshold", 80, null, 30);
-    createAlertSubscription("test-profile", "seven_day_threshold", 70, null, 30);
+    createAlertSubscription(acct, "test-profile", "five_hour_threshold", 80, null, 30);
+    createAlertSubscription(acct, "test-profile", "seven_day_threshold", 70, null, 30);
 
     const snapshot = makeSnapshot({
       five_hour_pct: 85.0,
       seven_day_pct: 75.0,
     });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(2);
     const types = events.map((e) => e.alert_type).sort();
@@ -165,10 +170,10 @@ describe("checkAlerts", () => {
   });
 
   it("fires at exact threshold value", () => {
-    createAlertSubscription("test-profile", "five_hour_threshold", 90, null, 30);
+    createAlertSubscription(acct, "test-profile", "five_hour_threshold", 90, null, 30);
 
     const snapshot = makeSnapshot({ five_hour_pct: 90.0 });
-    const events = checkAlerts("test-profile", snapshot);
+    const events = checkAlerts(acct, "test-profile", snapshot);
 
     expect(events).toHaveLength(1);
   });
