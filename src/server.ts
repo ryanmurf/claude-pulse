@@ -14,10 +14,12 @@ import {
   removeAlertSubscription,
   getProfile,
   getLatestGeminiQuota,
+  upsertTokenRollup,
+  getTokenReport,
 } from "./store.js";
 import { pollProfile, pollAllProfiles } from "./poller.js";
 import { formatGeminiQuotaSnapshots, pollGeminiQuota } from "./gemini.js";
-import type { AlertType } from "./types.js";
+import type { AlertType, TokenRollupInput } from "./types.js";
 
 let httpServer: http.Server | undefined;
 
@@ -29,13 +31,33 @@ function log(msg: string): void {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, maxBytes = Infinity): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error("PAYLOAD_TOO_LARGE"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
     req.on("error", reject);
   });
+}
+
+const INGEST_MAX_BYTES = 1024 * 1024; // 1MB cap on /api/ingest bodies
+
+function toFiniteInt(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+function toFiniteNum(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function sendJson(res: ServerResponse, data: unknown, status = 200): void {
@@ -278,6 +300,82 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
+    // GET /api/reports?granularity=daily|weekly&days=30
+    if (pathname === "/api/reports" && method === "GET") {
+      const granularityParam = url.searchParams.get("granularity");
+      const granularity = granularityParam === "weekly" ? "weekly" : "daily";
+      let days = parseInt(url.searchParams.get("days") || "30", 10);
+      if (!Number.isFinite(days) || days <= 0) days = 30;
+      days = Math.min(days, 365);
+      sendJson(res, getTokenReport({ granularity, days }));
+      return;
+    }
+
+    // POST /api/ingest — remote machines push their token rollups here.
+    if (pathname === "/api/ingest" && method === "POST") {
+      const token = process.env.CLAUDE_PULSE_INGEST_TOKEN;
+      if (!token) {
+        sendError(res, 503, "Ingest disabled (CLAUDE_PULSE_INGEST_TOKEN not set)");
+        return;
+      }
+      const auth = req.headers["authorization"];
+      if (auth !== `Bearer ${token}`) {
+        sendError(res, 401, "Unauthorized");
+        return;
+      }
+      let raw: string;
+      try {
+        raw = await readBody(req, INGEST_MAX_BYTES);
+      } catch (e) {
+        if ((e as Error).message === "PAYLOAD_TOO_LARGE") {
+          sendError(res, 413, "Payload too large (max 1MB)");
+          return;
+        }
+        throw e;
+      }
+      let body: any;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        sendError(res, 400, "Invalid JSON");
+        return;
+      }
+      const host = typeof body?.host === "string" ? body.host.trim() : "";
+      if (!host) {
+        sendError(res, 400, "Missing host");
+        return;
+      }
+      if (!Array.isArray(body?.rollups)) {
+        sendError(res, 400, "Missing rollups array");
+        return;
+      }
+      let upserted = 0;
+      for (const r of body.rollups) {
+        if (!r || typeof r !== "object") continue;
+        const profile = typeof r.profile === "string" ? r.profile : "";
+        const day = typeof r.day === "string" ? r.day : "";
+        const model = typeof r.model === "string" ? r.model : "";
+        // Require the natural-key fields; skip malformed rows rather than 400 the batch.
+        if (!profile || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !model) continue;
+        const rollup: TokenRollupInput = {
+          profile,
+          host,
+          day,
+          model,
+          input_tokens: toFiniteInt(r.input_tokens),
+          output_tokens: toFiniteInt(r.output_tokens),
+          cache_creation_tokens: toFiniteInt(r.cache_creation_tokens),
+          cache_read_tokens: toFiniteInt(r.cache_read_tokens),
+          cost_usd: toFiniteNum(r.cost_usd),
+          source: "ingest",
+        };
+        upsertTokenRollup(rollup);
+        upserted++;
+      }
+      sendJson(res, { ok: true, upserted });
+      return;
+    }
+
     // POST /api/poll
     if (pathname === "/api/poll" && method === "POST") {
       const raw = await readBody(req);
@@ -373,6 +471,23 @@ tr:last-child td{border-bottom:none}
 .form-row select,.form-row input{padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);font-size:.85rem;font-family:var(--font)}
 .form-row select:focus,.form-row input:focus{outline:none;border-color:var(--purple)}
 .empty{text-align:center;padding:24px;color:var(--muted);font-size:.88rem}
+
+.report-total{display:flex;flex-wrap:wrap;gap:16px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:16px}
+.report-total .rt-item{display:flex;flex-direction:column}
+.report-total .rt-item .rt-lbl{font-size:.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.report-total .rt-item .rt-val{font-family:var(--mono);font-weight:600;font-size:1rem}
+.report-total .rt-cost{color:var(--green)}
+.rpt-cost{font-family:var(--mono);color:var(--green);font-weight:600}
+.rpt-stats{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:.74rem;color:var(--muted);font-family:var(--mono);margin-bottom:12px}
+.rpt-stats b{color:var(--text);font-weight:600}
+.spark{display:flex;align-items:flex-end;gap:2px;height:40px;margin-bottom:10px}
+.spark .sbar{flex:1;background:var(--purple);border-radius:2px 2px 0 0;min-height:2px;opacity:.7}
+.spark .sbar:hover{opacity:1}
+.rpt-hosts{font-size:.74rem;color:var(--muted)}
+.rpt-hosts .rh-row{display:flex;justify-content:space-between;padding:2px 0;border-top:1px solid var(--border)}
+.rpt-hosts .rh-row:first-child{border-top:none}
+.rpt-hosts .rh-host{font-family:var(--mono);color:var(--text)}
+.report-total select,#rpt-granularity,#rpt-days{padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);font-size:.8rem;font-family:var(--font)}
 </style>
 </head>
 <body>
@@ -394,6 +509,26 @@ tr:last-child td{border-bottom:none}
   <div class="section">
     <div class="section-hdr"><h2>Gemini</h2></div>
     <div class="usage-grid" id="gemini-grid"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-hdr">
+      <h2>Token Reports</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="rpt-granularity" onchange="loadReports()">
+          <option value="daily">daily</option>
+          <option value="weekly">weekly</option>
+        </select>
+        <select id="rpt-days" onchange="loadReports()">
+          <option value="7">7d</option>
+          <option value="14">14d</option>
+          <option value="30" selected>30d</option>
+          <option value="90">90d</option>
+        </select>
+      </div>
+    </div>
+    <div id="report-total" class="report-total"></div>
+    <div class="usage-grid" id="report-grid"><div class="empty">Loading...</div></div>
   </div>
 
   <div class="section">
@@ -538,12 +673,57 @@ function toggleThreshold(){
   $('#sub-threshold').style.display=$('#sub-type').value==='auth_failure'?'none':'';
 }
 
+function fmtTokens(n){
+  if(n===null||n===undefined)return'\\u2014';
+  if(n>=1e9)return(n/1e9).toFixed(2)+'B';
+  if(n>=1e6)return(n/1e6).toFixed(2)+'M';
+  if(n>=1e3)return(n/1e3).toFixed(1)+'K';
+  return String(n);
+}
+function fmtCost(n){
+  if(n===null||n===undefined)return'\\u2014';
+  return '$'+(n>=100?n.toFixed(0):n.toFixed(2));
+}
+function renderReports(rep){
+  const tot=rep.total||{input_tokens:0,output_tokens:0,cache_creation_tokens:0,cache_read_tokens:0,total_tokens:0,cost_usd:0};
+  $('#report-total').innerHTML=
+    '<div class="rt-item"><span class="rt-lbl">period</span><span class="rt-val">'+rep.days+'d since '+rep.since_day+'</span></div>'+
+    '<div class="rt-item"><span class="rt-lbl">total tokens</span><span class="rt-val">'+fmtTokens(tot.total_tokens)+'</span></div>'+
+    '<div class="rt-item"><span class="rt-lbl">est. cost</span><span class="rt-val rt-cost">'+fmtCost(tot.cost_usd)+'</span></div>';
+  const g=$('#report-grid');
+  if(!rep.profiles||!rep.profiles.length){g.innerHTML='<div class="empty">No token data yet</div>';return}
+  const maxCost=Math.max(...rep.profiles.flatMap(p=>p.by_day.map(d=>d.cost_usd)),0.000001);
+  g.innerHTML=rep.profiles.map(p=>{
+    const spark=p.by_day.map(d=>{
+      const h=Math.max(2,Math.round((d.cost_usd/maxCost)*100));
+      return '<div class="sbar" style="height:'+h+'%" title="'+d.day+': '+fmtTokens(d.total_tokens)+' tok, '+fmtCost(d.cost_usd)+'"></div>';
+    }).join('');
+    const hosts=p.by_host.map(h=>
+      '<div class="rh-row"><span class="rh-host">'+h.host+'</span><span>'+fmtTokens(h.total_tokens)+' / '+fmtCost(h.cost_usd)+'</span></div>'
+    ).join('');
+    return '<div class="card">'+
+      '<div class="card-title">'+p.profile+'<span class="rpt-cost">'+fmtCost(p.cost_usd)+'</span></div>'+
+      '<div class="rpt-stats"><span>total <b>'+fmtTokens(p.total_tokens)+'</b></span><span>in <b>'+fmtTokens(p.input_tokens)+'</b></span><span>out <b>'+fmtTokens(p.output_tokens)+'</b></span><span>cache-w <b>'+fmtTokens(p.cache_creation_tokens)+'</b></span><span>cache-r <b>'+fmtTokens(p.cache_read_tokens)+'</b></span></div>'+
+      (spark?'<div class="spark">'+spark+'</div>':'')+
+      '<div class="rpt-hosts">'+hosts+'</div>'+
+    '</div>';
+  }).join('');
+}
+async function loadReports(){
+  try{
+    const gran=$('#rpt-granularity').value,days=$('#rpt-days').value;
+    const rep=await fj('/api/reports?granularity='+gran+'&days='+days);
+    renderReports(rep);
+  }catch(e){$('#report-grid').innerHTML='<div class="empty">error: '+e.message+'</div>'}
+}
+
 async function refresh(){
   try{
     const[usage,gemini,pace,alerts,subs,profiles,context]=await Promise.all([
       fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles'),fj('/api/context')
     ]);
     renderUsage(usage,pace,context);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
+    loadReports();
     $('#status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){$('#status').textContent='error: '+e.message}
 }
