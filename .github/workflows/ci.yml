@@ -29,6 +29,10 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      # The integration tests (agent-daemon, receiver-only) spawn the built
+      # `dist/index.js` as a child process, so the entrypoint must exist before
+      # vitest runs. Without this the Test job fails with MODULE_NOT_FOUND.
+      - run: npm run build
       - run: npm test
 
   lint:

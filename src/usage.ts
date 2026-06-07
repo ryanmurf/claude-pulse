@@ -339,6 +339,14 @@ export async function fetchUsage(configDirOrProfile: string | Profile): Promise<
     }
     case "openai-codex":
       return fetchCodexRateLimits(profile.config_dir);
+    case "antigravity":
+      // Antigravity exposes no 5h/7d rate-limit signal — it's a token-tally-only
+      // vendor (usage comes from the conversation .db tally, not a poll). Surface
+      // a clear, non-anthropic error so the poller records a null snapshot rather
+      // than mis-reading OAuth tokens from the config dir.
+      throw new Error(
+        `Profile "${profile.name}" is vendor=antigravity (token-tally only); no 5h/7d rate-limit usage to poll`,
+      );
     case "anthropic-oauth":
     default:
       return fetchAnthropicOAuth(profile.config_dir);
