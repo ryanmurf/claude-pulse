@@ -493,13 +493,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (pathname === "/api/context" && method === "GET") {
       const account = await accountForRequest(req);
       const sessions = await getActiveContextSessions(account.id);
-      // Group profile → machine → session[]
+      // Group profile → machine → session[]. getActiveContextSessions returns
+      // rows ordered last_active_at DESC within each machine, so capping at the
+      // first N keeps each machine's most-recently-active sessions, newest first.
+      const MAX_SESSIONS_PER_MACHINE = 3;
       const byProfile = new Map<string, Map<string, unknown[]>>();
       for (const s of sessions) {
         let machines = byProfile.get(s.profile);
         if (!machines) { machines = new Map(); byProfile.set(s.profile, machines); }
         let list = machines.get(s.machine);
         if (!list) { list = []; machines.set(s.machine, list); }
+        if ((list as unknown[]).length >= MAX_SESSIONS_PER_MACHINE) continue;
         (list as unknown[]).push({
           session_id: s.session_id,
           model: s.model,

@@ -30,12 +30,21 @@ function writeJsonl(file: string, lines: any[]): void {
 }
 
 describe("effectiveContextForModel", () => {
-  it("returns 1M for opus-4-7", async () => {
+  it("returns 1M for current-gen opus", async () => {
+    expect(effectiveContextForModel("claude-opus-4-8")).toBe(1_000_000);
     expect(effectiveContextForModel("claude-opus-4-7")).toBe(1_000_000);
     expect(effectiveContextForModel("claude-opus-4-7[1m]")).toBe(1_000_000);
+    expect(effectiveContextForModel("claude-opus-4-6")).toBe(1_000_000);
   });
-  it("returns 200K for sonnet", async () => {
-    expect(effectiveContextForModel("claude-sonnet-4-6")).toBe(200_000);
+  it("returns 1M for sonnet-4-6", async () => {
+    expect(effectiveContextForModel("claude-sonnet-4-6")).toBe(1_000_000);
+  });
+  it("returns 200K for older 4.x opus/sonnet", async () => {
+    expect(effectiveContextForModel("claude-opus-4-5")).toBe(200_000);
+    expect(effectiveContextForModel("claude-sonnet-4-5")).toBe(200_000);
+  });
+  it("resolves date-suffixed opus-4-8 to 1M via prefix match", async () => {
+    expect(effectiveContextForModel("claude-opus-4-8-20260601")).toBe(1_000_000);
   });
   it("returns 200K for haiku", async () => {
     expect(effectiveContextForModel("claude-haiku-4-5")).toBe(200_000);
@@ -120,8 +129,8 @@ describe("readJsonlContext", () => {
     const r = readJsonlContext(f);
     expect(r).not.toBeNull();
     expect(r!.context_tokens).toBe(10 + 1000 + 150000);
-    expect(r!.effective_context).toBe(200_000);
-    expect(r!.context_pct).toBeCloseTo((151010 / 200_000) * 100, 1);
+    expect(r!.effective_context).toBe(1_000_000);
+    expect(r!.context_pct).toBeCloseTo((151010 / 1_000_000) * 100, 1);
     expect(r!.model).toBe("claude-sonnet-4-6");
   });
 
