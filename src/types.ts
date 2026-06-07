@@ -1,4 +1,4 @@
-export type ProfileVendor = "anthropic-oauth" | "deepseek-balance" | "openai-codex";
+export type ProfileVendor = "anthropic-oauth" | "deepseek-balance" | "openai-codex" | "antigravity";
 
 // ── Multi-tenant: accounts, ingest tokens, machines ──────────────────────────
 
