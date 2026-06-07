@@ -59,20 +59,20 @@ async function req(
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-server-test-"));
-  initDb(path.join(tmpDir, "test.db"));
+  await initDb(path.join(tmpDir, "test.db"));
   port = await getFreePort();
   startHttpServer(port);
 });
 
-afterEach(() => {
+afterEach(async () => {
   stopHttpServer();
-  closeDb();
+  await closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe("GET /api/profiles", () => {
   it("redacts stored profile API keys", async () => {
-    addProfile("with-key", "/tmp/with-key", 5, "deepseek-balance", 10, "sk-secret");
+    await addProfile("with-key", "/tmp/with-key", 5, "deepseek-balance", 10, "sk-secret");
 
     const profiles = await fetchJson("/api/profiles");
 
@@ -103,8 +103,8 @@ describe("POST /api/ingest", () => {
   });
 
   it("validates the token, attributes rows to the token's (account, machine), ignores body host", async () => {
-    const acct = resolveAccount("ingest-user@example.com");
-    const { plaintext } = mintIngestToken(acct.id, "laptop-1");
+    const acct = await resolveAccount("ingest-user@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "laptop-1");
 
     const r = await req("POST", "/api/ingest", {
       headers: { Authorization: `Bearer ${plaintext}` },
@@ -156,8 +156,8 @@ describe("POST /api/ingest", () => {
   });
 
   it("rejects after the token is revoked", async () => {
-    const acct = resolveAccount("rev-user@example.com");
-    const { plaintext } = mintIngestToken(acct.id, "m1");
+    const acct = await resolveAccount("rev-user@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "m1");
     const revoke = (await fetchJson("/api/ingest-tokens", { "X-Auth-Request-Email": "rev-user@example.com" })) as any[];
     await req("DELETE", `/api/ingest-tokens/${revoke[0].id}`, { headers: { "X-Auth-Request-Email": "rev-user@example.com" } });
     const r = await req("POST", "/api/ingest", { headers: { Authorization: `Bearer ${plaintext}` }, body: { rollups: [] } });
@@ -167,10 +167,10 @@ describe("POST /api/ingest", () => {
 
 describe("account isolation over HTTP", () => {
   it("one account cannot read another's report rows", async () => {
-    const a = resolveAccount("iso-a@example.com");
-    const b = resolveAccount("iso-b@example.com");
-    const ta = mintIngestToken(a.id, "ma").plaintext;
-    const tb = mintIngestToken(b.id, "mb").plaintext;
+    const a = await resolveAccount("iso-a@example.com");
+    const b = await resolveAccount("iso-b@example.com");
+    const ta = (await mintIngestToken(a.id, "ma")).plaintext;
+    const tb = (await mintIngestToken(b.id, "mb")).plaintext;
 
     const mkBody = (model: string) => ({
       rollups: [{ profile: "claude-max", session_id: "s", day: "2026-06-01", model, tokens_in: 100, tokens_out: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0 }],

@@ -13,9 +13,9 @@ const FIXTURES = path.join(__dirname, "fixtures");
 let tmpDir: string;
 let cfgDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-cont-test-"));
-  initDb(path.join(tmpDir, "test.db"));
+  await initDb(path.join(tmpDir, "test.db"));
 
   // A profile whose transcripts produce real token rows.
   cfgDir = path.join(tmpDir, "cfg");
@@ -24,14 +24,14 @@ beforeEach(() => {
   fs.copyFileSync(path.join(FIXTURES, "claude-usage.jsonl"), dest);
 
   // Replace the default profiles with our single fixture-backed one.
-  for (const p of listProfiles()) removeProfile(p.name);
-  addProfile("fix", cfgDir, 5, "anthropic-oauth");
+  for (const p of await listProfiles()) await removeProfile(p.name);
+  await addProfile("fix", cfgDir, 5, "anthropic-oauth");
 
   _resetUploadBackoff();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
   vi.restoreAllMocks();
   vi.unstubAllGlobals();

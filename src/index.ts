@@ -149,11 +149,11 @@ server.tool(
 
     const profilesToCheck = profile
       ? [profile]
-      : listProfiles().map((p) => p.name);
+      : (await listProfiles()).map((p) => p.name);
 
     const lines: string[] = [];
     for (const name of profilesToCheck) {
-      const snap = getLatestSnapshot(name);
+      const snap = await getLatestSnapshot(name);
       if (!snap) continue;
       const fh = paceForWindow(snap.five_hour_pct, snap.five_hour_resets_at, "five_hour", `${name} 5h`);
       const sd = paceForWindow(snap.seven_day_pct, snap.seven_day_resets_at, "seven_day", `${name} 7d`);
@@ -184,7 +184,7 @@ server.tool(
   },
   async ({ profile }) => {
     if (profile) {
-      const p = getProfile(profile);
+      const p = await getProfile(profile);
       if (!p) {
         return {
           content: [
@@ -192,7 +192,7 @@ server.tool(
           ],
         };
       }
-      const snapshot = getLatestSnapshot(profile);
+      const snapshot = await getLatestSnapshot(profile);
       if (!snapshot) {
         return {
           content: [
@@ -203,7 +203,7 @@ server.tool(
           ],
         };
       }
-      const gemini = formatGeminiQuotaSnapshots(getLatestGeminiQuota());
+      const gemini = formatGeminiQuotaSnapshots(await getLatestGeminiQuota());
       return {
         content: [
           {
@@ -227,8 +227,8 @@ server.tool(
     }
 
     // All profiles
-    const snapshots = getLatestSnapshots();
-    const profiles = listProfiles();
+    const snapshots = await getLatestSnapshots();
+    const profiles = await listProfiles();
     const result = profiles.map((p) => {
       const snap = snapshots.find((s) => s.profile === p.name);
       return {
@@ -248,7 +248,7 @@ server.tool(
           text: JSON.stringify(
             {
               profiles: result,
-              gemini: formatGeminiQuotaSnapshots(getLatestGeminiQuota()),
+              gemini: formatGeminiQuotaSnapshots(await getLatestGeminiQuota()),
             },
             null,
             2
@@ -279,14 +279,15 @@ server.tool(
     if (live) {
       await pollContextOnce();
     }
+    const single = profile ? await getProfile(profile) : undefined;
     const profilesToShow = profile
-      ? (getProfile(profile) ? [getProfile(profile)!] : [])
-      : listProfiles();
+      ? (single ? [single] : [])
+      : await listProfiles();
     if (profile && profilesToShow.length === 0) {
       return { content: [{ type: "text", text: `Profile "${profile}" not found.` }] };
     }
-    const out = profilesToShow.map((p) => {
-      const snap = getLatestSnapshot(p.name);
+    const out = await Promise.all(profilesToShow.map(async (p) => {
+      const snap = await getLatestSnapshot(p.name);
       if (!snap || snap.context_pct === null) {
         // Attempt one direct read for profiles that have never been polled
         const direct = p.vendor === "anthropic-oauth" ? getContextForProfile(p.config_dir) : null;
@@ -319,7 +320,7 @@ server.tool(
         tokens_until_compact_recommended: Math.max(0, compactAt - tokens),
         polled_at: snap.polled_at,
       };
-    });
+    }));
     return {
       content: [{ type: "text", text: JSON.stringify(profile ? out[0] : { profiles: out }, null, 2) }],
     };
@@ -334,15 +335,16 @@ server.tool(
     profile: z.string().optional().describe("Profile name. Omit for all profiles."),
   },
   async ({ profile }) => {
+    const single = profile ? await getProfile(profile) : undefined;
     const profilesToShow = profile
-      ? (getProfile(profile) ? [getProfile(profile)!] : [])
-      : listProfiles();
+      ? (single ? [single] : [])
+      : await listProfiles();
     if (profile && profilesToShow.length === 0) {
       return { content: [{ type: "text", text: `Profile "${profile}" not found.` }] };
     }
     const lines: string[] = [];
     for (const p of profilesToShow) {
-      const snap = getLatestSnapshot(p.name);
+      const snap = await getLatestSnapshot(p.name);
       if (!snap || snap.context_pct === null) {
         lines.push(`${p.name} ctx: (no data)`);
         continue;
@@ -371,7 +373,7 @@ server.tool(
   "Get current/latest Gemini consumer-tier quota by model. Returns used_pct and reset_time per bucket.",
   {},
   async () => {
-    const quota = formatGeminiQuotaSnapshots(getLatestGeminiQuota());
+    const quota = formatGeminiQuotaSnapshots(await getLatestGeminiQuota());
     if (quota.length === 0) {
       return {
         content: [{ type: "text", text: "No Gemini quota data available yet." }],
@@ -401,7 +403,7 @@ server.tool(
       .describe("Maximum number of records to return (default 100)"),
   },
   async ({ profile, hours, limit }) => {
-    const p = getProfile(profile);
+    const p = await getProfile(profile);
     if (!p) {
       return {
         content: [
@@ -410,7 +412,7 @@ server.tool(
       };
     }
 
-    const history = getHistory(profile, hours, limit);
+    const history = await getHistory(profile, hours, limit);
     const result = history.map((s) => ({
       five_hour_pct: s.five_hour_pct,
       five_hour_resets_at: s.five_hour_resets_at,
@@ -446,7 +448,7 @@ server.tool(
       .describe("Polling interval in minutes (minimum 1)"),
   },
   async ({ profile, interval_minutes }) => {
-    const updated = updatePollInterval(profile, interval_minutes);
+    const updated = await updatePollInterval(profile, interval_minutes);
     if (!updated) {
       return {
         content: [
@@ -454,7 +456,7 @@ server.tool(
         ],
       };
     }
-    restartPoller(profile);
+    await restartPoller(profile);
     return {
       content: [
         {
@@ -472,7 +474,7 @@ server.tool(
   "List all configured profiles with their config dirs and poll intervals.",
   {},
   async () => {
-    const profiles = listProfiles().map(redactProfile);
+    const profiles = (await listProfiles()).map(redactProfile);
     return {
       content: [{ type: "text", text: JSON.stringify(profiles, null, 2) }],
     };
@@ -506,7 +508,7 @@ server.tool(
       .describe("API key for balance-vendor profiles (e.g. DeepSeek sk-...). Required for 'deepseek-balance'."),
   },
   async ({ name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key }) => {
-    const existing = getProfile(name);
+    const existing = await getProfile(name);
     if (existing) {
       return {
         content: [
@@ -524,7 +526,7 @@ server.tool(
       };
     }
 
-    const profile = addProfile(
+    const profile = await addProfile(
       name,
       config_dir,
       poll_interval_minutes,
@@ -532,7 +534,7 @@ server.tool(
       monthly_budget_usd ?? null,
       api_key ?? null
     );
-    restartPoller(name);
+    await restartPoller(name);
     return {
       content: [
         {
@@ -553,11 +555,11 @@ server.tool(
     monthly_budget_usd: z.number().nullable().optional().describe("Monthly budget in USD; null/omit to clear"),
   },
   async ({ name, monthly_budget_usd }) => {
-    const profile = getProfile(name);
+    const profile = await getProfile(name);
     if (!profile) {
       return { content: [{ type: "text", text: `Profile "${name}" not found.` }] };
     }
-    updateProfileBudget(name, monthly_budget_usd ?? null);
+    await updateProfileBudget(name, monthly_budget_usd ?? null);
     return {
       content: [
         {
@@ -578,11 +580,11 @@ server.tool(
     api_key: z.string().nullable().optional().describe("API key value; null/omit to clear"),
   },
   async ({ name, api_key }) => {
-    const profile = getProfile(name);
+    const profile = await getProfile(name);
     if (!profile) {
       return { content: [{ type: "text", text: `Profile "${name}" not found.` }] };
     }
-    updateProfileApiKey(name, api_key ?? null);
+    await updateProfileApiKey(name, api_key ?? null);
     return {
       content: [
         {
@@ -603,7 +605,7 @@ server.tool(
   },
   async ({ name }) => {
     stopPoller(name);
-    const removed = removeProfile(name);
+    const removed = await removeProfile(name);
     if (!removed) {
       return {
         content: [
@@ -673,7 +675,7 @@ server.tool(
       .describe("Minimum minutes between repeated alerts (default 30)"),
   },
   async ({ profile, alert_type, threshold, channel, cooldown_minutes }) => {
-    const p = getProfile(profile);
+    const p = await getProfile(profile);
     if (!p) {
       return {
         content: [
@@ -693,8 +695,8 @@ server.tool(
       };
     }
 
-    const sub = createAlertSubscription(
-      localAccountId(),
+    const sub = await createAlertSubscription(
+      await localAccountId(),
       profile,
       alert_type,
       alert_type === "auth_failure" ? null : (threshold ?? null),
@@ -721,7 +723,7 @@ server.tool(
     id: z.number().describe("Alert subscription ID to remove"),
   },
   async ({ id }) => {
-    const removed = removeAlertSubscription(localAccountId(), id);
+    const removed = await removeAlertSubscription(await localAccountId(), id);
     if (!removed) {
       return {
         content: [
@@ -754,7 +756,7 @@ server.tool(
       .describe("Profile name to filter by. Omit to list all."),
   },
   async ({ profile }) => {
-    const subs = listAlertSubscriptions(localAccountId(), profile);
+    const subs = await listAlertSubscriptions(await localAccountId(), profile);
     if (subs.length === 0) {
       return {
         content: [
@@ -794,7 +796,7 @@ server.tool(
       .describe("Only return unacknowledged alerts (default false)"),
   },
   async ({ profile, hours, unacknowledged_only }) => {
-    const events = getTriggeredAlerts(localAccountId(), profile, hours, unacknowledged_only);
+    const events = await getTriggeredAlerts(await localAccountId(), profile, hours, unacknowledged_only);
     if (events.length === 0) {
       return {
         content: [
@@ -829,7 +831,7 @@ server.tool(
   },
   async ({ id, profile }) => {
     if (id !== undefined) {
-      const acked = acknowledgeAlert(localAccountId(), id);
+      const acked = await acknowledgeAlert(await localAccountId(), id);
       return {
         content: [
           {
@@ -842,7 +844,7 @@ server.tool(
       };
     }
 
-    const count = acknowledgeAllAlerts(localAccountId(), profile);
+    const count = await acknowledgeAllAlerts(await localAccountId(), profile);
     const scope = profile ? `for profile "${profile}"` : "across all profiles";
     return {
       content: [
@@ -874,7 +876,7 @@ server.tool(
   async ({ alert_id, message }) => {
     let ackResult = "";
     if (alert_id !== undefined) {
-      const acked = acknowledgeAlert(localAccountId(), alert_id);
+      const acked = await acknowledgeAlert(await localAccountId(), alert_id);
       ackResult = acked
         ? `Alert ${alert_id} acknowledged. `
         : `Alert ${alert_id} not found or already acknowledged. `;
@@ -916,8 +918,8 @@ async function uploadOnce(opts?: { backfill?: boolean }): Promise<number> {
   }
   if (!cfg) return 1;
 
-  initDb();
-  ensureDefaultProfiles();
+  await initDb();
+  await ensureDefaultProfiles();
 
   const host = os.hostname();
   const backfill = opts?.backfill === true;
@@ -939,7 +941,7 @@ async function uploadOnce(opts?: { backfill?: boolean }): Promise<number> {
     log(`Upload mode: failed: ${(e as Error).message}`);
     return 1;
   } finally {
-    closeDb();
+    await closeDb();
   }
 }
 
@@ -969,8 +971,8 @@ async function main(): Promise<void> {
   log("Initializing claude-pulse channel plugin...");
 
   // Initialize DB and default profiles
-  initDb();
-  ensureDefaultProfiles();
+  await initDb();
+  await ensureDefaultProfiles();
   log("Database initialized with default profiles");
 
   const serverOnly = process.env.CLAUDE_PULSE_SERVER_ONLY === "1";
@@ -1001,7 +1003,7 @@ async function main(): Promise<void> {
   }
 
   // Start background pollers
-  startAllPollers();
+  await startAllPollers();
   startGeminiPoller();
   startContextPoller();
   startTokenRollup();
@@ -1026,13 +1028,17 @@ async function main(): Promise<void> {
     stopAllPollers();
     stopGeminiPoller();
     stopHttpServer();
-    closeDb();
-    process.exit(0);
+    void closeDb().finally(() => process.exit(0));
   };
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
+
+// One-time data migration entrypoint. Explicit only — never part of normal
+// startup. Copies the local SQLite usage.db into the Postgres target defined by
+// CLAUDE_PULSE_PG_URL / CLAUDE_PULSE_PG_*. See src/migrate-sqlite-to-pg.ts.
+const migrateMode = process.argv.includes("--migrate-sqlite-to-pg");
 
 const uploadMode =
   process.env.CLAUDE_PULSE_MODE === "upload" || process.argv.includes("--upload-once");
@@ -1042,7 +1048,22 @@ const uploadMode =
 const wantBackfill =
   process.env.CLAUDE_PULSE_UPLOAD_BACKFILL === "1" || process.argv.includes("--backfill");
 
-if (uploadMode) {
+if (migrateMode) {
+  // Lazy import so the migration module (and its pg use) only loads on demand.
+  import("./migrate-sqlite-to-pg.js")
+    .then(({ migrateSqliteToPg }) => migrateSqliteToPg())
+    .then((counts) => {
+      const total = Object.values(counts).reduce((a, b) => a + b, 0);
+      process.stdout.write(
+        `Migrated ${total} rows across ${Object.keys(counts).length} tables.\n`,
+      );
+      process.exit(0);
+    })
+    .catch((err) => {
+      process.stderr.write(`[claude-pulse] Migration fatal error: ${err?.message || err}\n`);
+      process.exit(1);
+    });
+} else if (uploadMode) {
   uploadOnce({ backfill: wantBackfill })
     .then((code) => process.exit(code))
     .catch((err) => {

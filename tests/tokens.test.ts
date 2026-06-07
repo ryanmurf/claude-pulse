@@ -16,11 +16,11 @@ const FIXTURES = path.join(__dirname, "fixtures");
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-tok-test-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {
@@ -41,29 +41,29 @@ function copyFixtureToSessions(fixture: string): void {
 }
 
 describe("rateForModel", () => {
-  it("exact-matches a base key", () => {
+  it("exact-matches a base key", async () => {
     expect(rateForModel("claude-opus-4").known).toBe(true);
   });
-  it("prefix-matches a dated model id", () => {
+  it("prefix-matches a dated model id", async () => {
     const r = rateForModel("claude-opus-4-8-20260115");
     expect(r.known).toBe(true);
     expect(r.rate).toEqual(MODEL_PRICING["claude-opus-4"]);
   });
-  it("prefers the longest matching prefix", () => {
+  it("prefers the longest matching prefix", async () => {
     expect(rateForModel("gpt-5.5").rate).toEqual(MODEL_PRICING["gpt-5"]);
   });
-  it("falls back + marks unknown for unrecognised models", () => {
+  it("falls back + marks unknown for unrecognised models", async () => {
     const r = rateForModel("some-future-model-2099");
     expect(r.known).toBe(false);
     expect(r.rate).toEqual(DEFAULT_RATE);
   });
-  it("handles null", () => {
+  it("handles null", async () => {
     expect(rateForModel(null).known).toBe(false);
   });
 });
 
 describe("costForTokens", () => {
-  it("computes opus cost across all four token classes", () => {
+  it("computes opus cost across all four token classes", async () => {
     // opus: input 5, output 25, cacheWrite 6.25, cacheRead 0.5 (per 1M)
     const cost = costForTokens(
       { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_creation_tokens: 1_000_000, cache_read_tokens: 1_000_000 },
@@ -71,7 +71,7 @@ describe("costForTokens", () => {
     );
     expect(cost).toBeCloseTo(5 + 25 + 6.25 + 0.5, 6);
   });
-  it("scales linearly with token volume", () => {
+  it("scales linearly with token volume", async () => {
     const cost = costForTokens(
       { input_tokens: 100_000, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0 },
       "claude-sonnet-4-6",

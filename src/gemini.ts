@@ -196,7 +196,7 @@ export async function pollGeminiQuota(): Promise<GeminiPollResult> {
       log("Gemini quota polling disabled");
       disabledLogged = true;
     }
-    return { success: true, skipped: true, reason: "disabled", snapshots: getLatestGeminiQuota() };
+    return { success: true, skipped: true, reason: "disabled", snapshots: await getLatestGeminiQuota() };
   }
 
   const now = Date.now();
@@ -205,13 +205,13 @@ export async function pollGeminiQuota(): Promise<GeminiPollResult> {
       success: true,
       skipped: true,
       reason: "minimum poll interval not elapsed",
-      snapshots: getLatestGeminiQuota(),
+      snapshots: await getLatestGeminiQuota(),
     };
   }
 
   const accessToken = await getAccessToken();
   if (!accessToken) {
-    return { success: true, skipped: true, reason: "missing credentials", snapshots: getLatestGeminiQuota() };
+    return { success: true, skipped: true, reason: "missing credentials", snapshots: await getLatestGeminiQuota() };
   }
 
   lastQuotaCallAt = now;
@@ -229,28 +229,28 @@ export async function pollGeminiQuota(): Promise<GeminiPollResult> {
     if (!response.ok) {
       const error = `Gemini quota API returned HTTP ${response.status}`;
       log(`${error}; skipping snapshot`);
-      return { success: false, error, snapshots: getLatestGeminiQuota() };
+      return { success: false, error, snapshots: await getLatestGeminiQuota() };
     }
 
     const data = (await response.json()) as { buckets?: unknown };
     if (!Array.isArray(data.buckets)) {
       log("Gemini quota response did not include a buckets array; skipping snapshot");
-      return { success: false, error: "Gemini quota response shape changed", snapshots: getLatestGeminiQuota() };
+      return { success: false, error: "Gemini quota response shape changed", snapshots: await getLatestGeminiQuota() };
     }
 
     const buckets = data.buckets.map(readBucket);
     if (buckets.some((bucket) => bucket === null)) {
       log("Gemini quota response contained an unexpected bucket shape; skipping snapshot");
-      return { success: false, error: "Gemini quota bucket shape changed", snapshots: getLatestGeminiQuota() };
+      return { success: false, error: "Gemini quota bucket shape changed", snapshots: await getLatestGeminiQuota() };
     }
 
-    const snapshots = insertGeminiQuotaSnapshots(buckets as GeminiQuotaBucket[]);
+    const snapshots = await insertGeminiQuotaSnapshots(buckets as GeminiQuotaBucket[]);
     log(`Gemini quota poll complete: ${snapshots.length} bucket(s)`);
     return { success: true, snapshots };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log(`Gemini quota poll failed: ${error}`);
-    return { success: false, error, snapshots: getLatestGeminiQuota() };
+    return { success: false, error, snapshots: await getLatestGeminiQuota() };
   }
 }
 

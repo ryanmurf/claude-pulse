@@ -3,6 +3,13 @@ import crypto from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import {
+  type Backend,
+  type Dialect,
+  createSqliteBackend,
+  createPgBackend,
+  pgConfigFromEnv,
+} from "./db.js";
 import type {
   Profile,
   ProfileVendor,
@@ -56,67 +63,165 @@ export function hashIngestToken(plaintext: string): string {
 /** Number of days after which a context_session is considered stale. */
 const CONTEXT_STALE_DAYS = 1;
 
-let db: DatabaseSync;
+let backend: Backend | undefined;
+
+/** The active dialect, for the few places that branch on it. */
+function dialect(): Dialect {
+  return getDb().dialect;
+}
 
 /**
- * Initialize the database. Optionally pass a custom dbPath for testing.
- * If no path is provided, uses ~/.claude-pulse/usage.db.
+ * Emit a "<column> >= now − N <unit>" comparison that works on both backends,
+ * binding N as a `?` parameter (the caller pushes the numeric N into its params
+ * in order).
+ *
+ * Timestamp columns are stored as TEXT on both backends (datetime('now') strings
+ * on SQLite; the same string format on Postgres). SQLite compares the TEXT
+ * lexicographically against `datetime('now', …)` (also TEXT) — correct because
+ * the format is sortable. Postgres has no implicit text↔timestamp comparison, so
+ * both sides are cast to `timestamptz`.
+ *
+ *   SQLite:   <col> >= datetime('now', '-' || ? || ' hours')
+ *   Postgres: <col>::timestamptz >= (now()::timestamptz - (? || ' hours')::interval)
  */
-export function initDb(dbPath?: string): void {
-  if (db) return;
+function tsGte(column: string, unit: "hours" | "days"): string {
+  if (dialect() === "postgres") {
+    return `${column}::timestamptz >= (now()::timestamptz - (? || ' ${unit}')::interval)`;
+  }
+  return `${column} >= datetime('now', '-' || ? || ' ${unit}')`;
+}
 
-  const resolvedPath = dbPath ?? DEFAULT_DB_PATH;
-  const resolvedDir = path.dirname(resolvedPath);
+/** "<column> < now − N <unit>" companion to tsGte (for the stale-sweep delete). */
+function tsLt(column: string, unit: "hours" | "days"): string {
+  if (dialect() === "postgres") {
+    return `${column}::timestamptz < (now()::timestamptz - (? || ' ${unit}')::interval)`;
+  }
+  return `${column} < datetime('now', '-' || ? || ' ${unit}')`;
+}
 
-  fs.mkdirSync(resolvedDir, { recursive: true });
-  db = new DatabaseSync(resolvedPath);
+/**
+ * Initialize the database. Optionally pass a custom dbPath (SQLite) for testing.
+ *
+ * Backend selection:
+ *   - Postgres when `CLAUDE_PULSE_PG_URL` (or the discrete `CLAUDE_PULSE_PG_*`
+ *     vars) is set. `dbPath` is ignored in that case.
+ *   - SQLite otherwise (default). Uses `dbPath` or `~/.claude-pulse/usage.db`.
+ *
+ * Tests can force a backend by passing an explicit `opts.backend`.
+ */
+export async function initDb(
+  dbPath?: string,
+  opts?: { backend?: Backend },
+): Promise<void> {
+  if (backend) return;
 
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA foreign_keys = ON");
+  if (opts?.backend) {
+    backend = opts.backend;
+  } else if (pgConfigFromEnv()) {
+    backend = await createPgBackend();
+  } else {
+    const resolvedPath = dbPath ?? DEFAULT_DB_PATH;
+    const resolvedDir = path.dirname(resolvedPath);
+    fs.mkdirSync(resolvedDir, { recursive: true });
+    const sqlite = new DatabaseSync(resolvedPath);
+    sqlite.exec("PRAGMA journal_mode = WAL");
+    sqlite.exec("PRAGMA foreign_keys = ON");
+    backend = createSqliteBackend(sqlite);
+  }
 
-  db.exec(`
+  await createSchema(backend);
+}
+
+function getDb(): Backend {
+  if (!backend) {
+    throw new Error("Database not initialized. Call initDb() first.");
+  }
+  return backend;
+}
+
+// ── Schema creation + migrations ─────────────────────────────────────────────
+
+/** Identity-column DDL fragment for the active dialect. */
+function idColumn(d: Dialect): string {
+  return d === "postgres"
+    ? "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
+    : "id INTEGER PRIMARY KEY AUTOINCREMENT";
+}
+
+/** `datetime('now')` default works on SQLite; Postgres uses now(). Both store TEXT. */
+function nowDefault(d: Dialect): string {
+  return d === "postgres" ? "now()" : "(datetime('now'))";
+}
+
+async function createSchema(db: Backend): Promise<void> {
+  const d = db.dialect;
+  const ID = idColumn(d);
+  const NOW = nowDefault(d);
+
+  // ── accounts FIRST ──────────────────────────────────────────────────────────
+  // Several tables carry `account_id INTEGER REFERENCES accounts(id)`. SQLite
+  // tolerates a forward FK reference at CREATE time; Postgres validates it
+  // immediately, so the parent table MUST exist before any child. Create + seed
+  // accounts up front; the per-table account_id backfill UPDATEs run at the end
+  // (after every table that has the column exists).
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      ${ID},
+      identity TEXT NOT NULL UNIQUE,
+      display_name TEXT,
+      created_at TEXT NOT NULL DEFAULT ${NOW}
+    )
+  `);
+  await db.run(
+    `INSERT INTO accounts (identity, display_name) VALUES (?, ?)
+     ON CONFLICT(identity) DO NOTHING`,
+    [DEFAULT_ACCOUNT_IDENTITY, DEFAULT_ACCOUNT_IDENTITY],
+  );
+
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS profiles (
       name TEXT PRIMARY KEY,
       config_dir TEXT NOT NULL,
       poll_interval_minutes INTEGER NOT NULL DEFAULT 5,
       vendor TEXT NOT NULL DEFAULT 'anthropic-oauth',
-      monthly_budget_usd REAL,
+      monthly_budget_usd ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       api_key TEXT,
       account_id INTEGER,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT ${NOW},
+      updated_at TEXT NOT NULL DEFAULT ${NOW}
     )
   `);
 
-  // Migrate older DBs that pre-date the vendor/budget/api_key/account_id columns.
-  const cols = (db
-    .prepare("PRAGMA table_info(profiles)")
-    .all() as { name: string }[]).map((c) => c.name);
-  if (!cols.includes("vendor")) {
-    db.exec("ALTER TABLE profiles ADD COLUMN vendor TEXT NOT NULL DEFAULT 'anthropic-oauth'");
-  }
-  if (!cols.includes("monthly_budget_usd")) {
-    db.exec("ALTER TABLE profiles ADD COLUMN monthly_budget_usd REAL");
-  }
-  if (!cols.includes("api_key")) {
-    db.exec("ALTER TABLE profiles ADD COLUMN api_key TEXT");
-  }
-  if (!cols.includes("account_id")) {
-    db.exec("ALTER TABLE profiles ADD COLUMN account_id INTEGER");
+  // Migrate older SQLite DBs that pre-date the vendor/budget/api_key/account_id
+  // columns. (Fresh Postgres DBs always have them, so this only runs on SQLite.)
+  if (d === "sqlite") {
+    const cols = (await db.all<{ name: string }>("PRAGMA table_info(profiles)")).map((c) => c.name);
+    if (!cols.includes("vendor")) {
+      await db.exec("ALTER TABLE profiles ADD COLUMN vendor TEXT NOT NULL DEFAULT 'anthropic-oauth'");
+    }
+    if (!cols.includes("monthly_budget_usd")) {
+      await db.exec("ALTER TABLE profiles ADD COLUMN monthly_budget_usd REAL");
+    }
+    if (!cols.includes("api_key")) {
+      await db.exec("ALTER TABLE profiles ADD COLUMN api_key TEXT");
+    }
+    if (!cols.includes("account_id")) {
+      await db.exec("ALTER TABLE profiles ADD COLUMN account_id INTEGER");
+    }
   }
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS usage_snapshots (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
-      five_hour_pct REAL,
+      five_hour_pct ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       five_hour_resets_at TEXT,
-      seven_day_pct REAL,
+      seven_day_pct ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       seven_day_resets_at TEXT,
       raw_response TEXT,
-      polled_at TEXT NOT NULL DEFAULT (datetime('now')),
+      polled_at TEXT NOT NULL DEFAULT ${NOW},
       context_tokens INTEGER,
-      context_pct REAL,
+      context_pct ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       context_session_id TEXT,
       context_model TEXT,
       context_effective_limit INTEGER,
@@ -124,165 +229,114 @@ export function initDb(dbPath?: string): void {
     )
   `);
 
-  // Migrate older snapshot rows that pre-date the context-* / account_id columns.
-  const snapCols = (db
-    .prepare("PRAGMA table_info(usage_snapshots)")
-    .all() as { name: string }[]).map((c) => c.name);
-  for (const c of [
-    "context_tokens INTEGER",
-    "context_pct REAL",
-    "context_session_id TEXT",
-    "context_model TEXT",
-    "context_effective_limit INTEGER",
-    "context_last_reset_at TEXT",
-    "account_id INTEGER",
-  ]) {
-    const colName = c.split(" ")[0];
-    if (!snapCols.includes(colName)) {
-      db.exec(`ALTER TABLE usage_snapshots ADD COLUMN ${c}`);
+  if (d === "sqlite") {
+    const snapCols = (await db.all<{ name: string }>("PRAGMA table_info(usage_snapshots)")).map((c) => c.name);
+    for (const c of [
+      "context_tokens INTEGER",
+      "context_pct REAL",
+      "context_session_id TEXT",
+      "context_model TEXT",
+      "context_effective_limit INTEGER",
+      "context_last_reset_at TEXT",
+      "account_id INTEGER",
+    ]) {
+      const colName = c.split(" ")[0];
+      if (!snapCols.includes(colName)) {
+        await db.exec(`ALTER TABLE usage_snapshots ADD COLUMN ${c}`);
+      }
     }
+  } else {
+    // Postgres fresh schema doesn't carry account_id in the CREATE above (kept
+    // identical to SQLite's historical shape); add it explicitly.
+    await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS account_id INTEGER");
   }
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_snapshots_profile_time
       ON usage_snapshots(profile, polled_at)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS gemini_quota (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      ${ID},
+      timestamp TEXT NOT NULL DEFAULT ${NOW},
       model_id TEXT NOT NULL,
-      remaining_fraction REAL NOT NULL,
+      remaining_fraction ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
       remaining_amount TEXT,
       reset_time TEXT
     )
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_gemini_quota_model_time
       ON gemini_quota(model_id, timestamp)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS alert_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
       profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
       alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
-      threshold REAL,
+      threshold ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       channel TEXT,
       cooldown_minutes INTEGER NOT NULL DEFAULT 30,
       enabled INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT ${NOW}
     )
   `);
 
-  // For existing DBs created with the old CHECK constraint, recreate the table
-  // without the constraint blocking 'context_threshold'. SQLite can't ALTER a
-  // CHECK constraint in place, so detect-and-rebuild only when needed.
-  // BEGIN IMMEDIATE acquires an exclusive write lock so concurrent claude-pulse
-  // processes don't race on the DROP/RENAME.
-  try {
-    const tableSql = (db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'")
-      .get() as { sql: string } | undefined)?.sql ?? "";
-    if (tableSql && !tableSql.includes("context_threshold")) {
-      db.exec("BEGIN IMMEDIATE");
-      // Re-check inside the transaction in case another process already migrated.
-      const recheckSql = (db
-        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'")
-        .get() as { sql: string } | undefined)?.sql ?? "";
-      if (!recheckSql.includes("context_threshold")) {
-        db.exec(`DROP TABLE IF EXISTS alert_subscriptions__new`);
-        db.exec(`
-          CREATE TABLE alert_subscriptions__new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
-            profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
-            alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
-            threshold REAL,
-            channel TEXT,
-            cooldown_minutes INTEGER NOT NULL DEFAULT 30,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-          )
-        `);
-        // Old table pre-dates account_id; copy explicit columns and leave
-        // account_id NULL (backfilled to the default account below).
-        db.exec(`
-          INSERT INTO alert_subscriptions__new
-            (id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at)
-          SELECT id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at
-          FROM alert_subscriptions
-        `);
-        db.exec(`DROP TABLE alert_subscriptions`);
-        db.exec(`ALTER TABLE alert_subscriptions__new RENAME TO alert_subscriptions`);
-      }
-      db.exec("COMMIT");
+  if (d === "sqlite") {
+    await migrateAlertSubscriptionsSqlite(db);
+    const subCols = (await db.all<{ name: string }>("PRAGMA table_info(alert_subscriptions)")).map((c) => c.name);
+    if (subCols.length > 0 && !subCols.includes("account_id")) {
+      await db.exec("ALTER TABLE alert_subscriptions ADD COLUMN account_id INTEGER");
     }
-  } catch (e) {
-    try { db.exec("ROLLBACK"); } catch { /* noop */ }
-    process.stderr.write(`[claude-pulse] alert_subscriptions migration warning: ${(e as Error).message}\n`);
   }
 
-  // For DBs that already had context_threshold (so the rebuild above didn't run)
-  // but pre-date account_id, add the column directly.
-  const subCols = (db
-    .prepare("PRAGMA table_info(alert_subscriptions)")
-    .all() as { name: string }[]).map((c) => c.name);
-  if (subCols.length > 0 && !subCols.includes("account_id")) {
-    db.exec("ALTER TABLE alert_subscriptions ADD COLUMN account_id INTEGER");
-  }
-
-  // Subscriptions are unique per (account, profile, alert_type, threshold) — not
-  // globally, and threshold IS part of the key so a profile can have several
-  // threshold alerts on the same window (e.g. 65% AND 90% five_hour). COALESCE
-  // folds NULL threshold (auth_failure) to a sentinel so those stay unique per
-  // (account, profile, alert_type). An earlier build created this index WITHOUT
-  // threshold, which made the account_id backfill collide on multi-threshold
-  // rows and crash startup — drop that older form first.
-  db.exec(`DROP INDEX IF EXISTS idx_alert_subs_unique`);
-  db.exec(`
+  // Subscriptions are unique per (account, profile, alert_type, threshold).
+  // COALESCE folds NULL threshold (auth_failure) to a sentinel. An earlier build
+  // created this WITHOUT threshold — drop that older form first.
+  await db.exec(`DROP INDEX IF EXISTS idx_alert_subs_unique`);
+  await db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_subs_unique
       ON alert_subscriptions(account_id, profile, alert_type, COALESCE(threshold, -1))
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS alert_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
       subscription_id INTEGER NOT NULL REFERENCES alert_subscriptions(id) ON DELETE CASCADE,
       profile TEXT NOT NULL,
       alert_type TEXT NOT NULL,
       message TEXT NOT NULL,
-      current_value REAL,
-      threshold REAL,
+      current_value ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
+      threshold ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       acknowledged INTEGER NOT NULL DEFAULT 0,
-      triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
+      triggered_at TEXT NOT NULL DEFAULT ${NOW}
     )
   `);
 
-  // Migrate older alert_events tables that pre-date account_id.
-  const aeCols = (db
-    .prepare("PRAGMA table_info(alert_events)")
-    .all() as { name: string }[]).map((c) => c.name);
-  if (aeCols.length > 0 && !aeCols.includes("account_id")) {
-    db.exec("ALTER TABLE alert_events ADD COLUMN account_id INTEGER");
+  if (d === "sqlite") {
+    const aeCols = (await db.all<{ name: string }>("PRAGMA table_info(alert_events)")).map((c) => c.name);
+    if (aeCols.length > 0 && !aeCols.includes("account_id")) {
+      await db.exec("ALTER TABLE alert_events ADD COLUMN account_id INTEGER");
+    }
   }
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_alert_events_sub
       ON alert_events(subscription_id, triggered_at)
   `);
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_alert_events_account
       ON alert_events(account_id, triggered_at)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS token_rollups (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       profile TEXT NOT NULL,
       host TEXT NOT NULL,
       day TEXT NOT NULL,
@@ -291,94 +345,56 @@ export function initDb(dbPath?: string): void {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-      cost_usd REAL NOT NULL DEFAULT 0,
+      cost_usd ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL DEFAULT 0,
       source TEXT NOT NULL DEFAULT 'local',
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT ${NOW},
       UNIQUE(profile, host, day, model)
     )
   `);
 
-  // Migration-safe guard: if an older DB has a token_rollups table missing the
-  // source column (mirrors the vendor-column pattern above), add it.
-  const trCols = (db
-    .prepare("PRAGMA table_info(token_rollups)")
-    .all() as { name: string }[]).map((c) => c.name);
-  if (trCols.length > 0 && !trCols.includes("source")) {
-    db.exec("ALTER TABLE token_rollups ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+  if (d === "sqlite") {
+    const trCols = (await db.all<{ name: string }>("PRAGMA table_info(token_rollups)")).map((c) => c.name);
+    if (trCols.length > 0 && !trCols.includes("source")) {
+      await db.exec("ALTER TABLE token_rollups ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+    }
   }
 
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_token_rollups_day
       ON token_rollups(day, profile)
   `);
 
-  // ── Multi-tenant tables ────────────────────────────────────────────────────
+  // ── Multi-tenant tables (accounts already created at the top) ───────────────
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS accounts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      identity TEXT NOT NULL UNIQUE,
-      display_name TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-  `);
-
-  // Seed the default/local account so single-tenant DBs + fallback always work.
-  db.prepare(
-    `INSERT INTO accounts (identity, display_name) VALUES (?, ?)
-     ON CONFLICT(identity) DO NOTHING`
-  ).run(DEFAULT_ACCOUNT_IDENTITY, DEFAULT_ACCOUNT_IDENTITY);
-
-  // Backfill account_id on any pre-existing snapshots → the default account.
-  const defaultAccountId = (db
-    .prepare("SELECT id FROM accounts WHERE identity = ?")
-    .get(DEFAULT_ACCOUNT_IDENTITY) as { id: number }).id;
-  db.prepare(
-    "UPDATE usage_snapshots SET account_id = ? WHERE account_id IS NULL"
-  ).run(defaultAccountId);
-
-  // Backfill account_id → the default/local account on the tables that gained
-  // an account_id column in the multi-tenant rework. Existing single-tenant
-  // rows all belong to the local daemon.
-  db.prepare(
-    "UPDATE profiles SET account_id = ? WHERE account_id IS NULL"
-  ).run(defaultAccountId);
-  db.prepare(
-    "UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL"
-  ).run(defaultAccountId);
-  db.prepare(
-    "UPDATE alert_events SET account_id = ? WHERE account_id IS NULL"
-  ).run(defaultAccountId);
-
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS ingest_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       machine TEXT NOT NULL,
       token_hash TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT ${NOW},
       last_used_at TEXT,
       revoked_at TEXT
     )
   `);
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_ingest_tokens_account
       ON ingest_tokens(account_id, machine)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS machines (
       account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       name TEXT NOT NULL,
-      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
-      last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      first_seen TEXT NOT NULL DEFAULT ${NOW},
+      last_seen TEXT NOT NULL DEFAULT ${NOW},
       UNIQUE(account_id, name)
     )
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS token_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ${ID},
       account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       profile TEXT NOT NULL,
       machine TEXT NOT NULL,
@@ -393,16 +409,16 @@ export function initDb(dbPath?: string): void {
       cache_write_1h INTEGER NOT NULL DEFAULT 0,
       cache_read INTEGER NOT NULL DEFAULT 0,
       source TEXT NOT NULL DEFAULT 'local',
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT ${NOW},
       UNIQUE(account_id, profile, machine, session_id, model, settings_hash, day)
     )
   `);
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_token_usage_report
       ON token_usage(account_id, day, profile)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS context_sessions (
       account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       profile TEXT NOT NULL,
@@ -411,27 +427,27 @@ export function initDb(dbPath?: string): void {
       model TEXT,
       settings_json TEXT NOT NULL DEFAULT '{}',
       context_tokens INTEGER,
-      context_pct REAL,
+      context_pct ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"},
       effective_limit INTEGER,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT ${NOW},
+      last_active_at TEXT NOT NULL DEFAULT ${NOW},
       UNIQUE(account_id, profile, machine, session_id)
     )
   `);
-  db.exec(`
+  await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_context_sessions_active
       ON context_sessions(account_id, last_active_at)
   `);
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS pricing_defaults (
       model TEXT NOT NULL,
       settings_match_json TEXT NOT NULL DEFAULT '{}',
-      input REAL NOT NULL,
-      output REAL NOT NULL,
-      cache_write_5m REAL NOT NULL,
-      cache_write_1h REAL NOT NULL,
-      cache_read REAL NOT NULL,
+      input ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      output ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_write_5m ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_write_1h ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_read ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
       source_url TEXT,
       as_of TEXT,
       UNIQUE(model, settings_match_json)
@@ -439,140 +455,183 @@ export function initDb(dbPath?: string): void {
   `);
 
   // Seed/refresh the placeholder default pricing rows (idempotent upsert).
-  const seedDefault = db.prepare(
-    `INSERT INTO pricing_defaults
-       (model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read, source_url, as_of)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(model, settings_match_json) DO NOTHING`
-  );
   for (const r of DEFAULT_PRICING) {
-    seedDefault.run(
-      r.model,
-      r.settings_match_json,
-      r.input,
-      r.output,
-      r.cache_write_5m,
-      r.cache_write_1h,
-      r.cache_read,
-      r.source_url ?? null,
-      r.as_of ?? null,
+    await db.run(
+      `INSERT INTO pricing_defaults
+         (model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read, source_url, as_of)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(model, settings_match_json) DO NOTHING`,
+      [
+        r.model,
+        r.settings_match_json,
+        r.input,
+        r.output,
+        r.cache_write_5m,
+        r.cache_write_1h,
+        r.cache_read,
+        r.source_url ?? null,
+        r.as_of ?? null,
+      ],
     );
   }
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS pricing_overrides (
       account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       model TEXT NOT NULL,
       settings_match_json TEXT NOT NULL DEFAULT '{}',
-      input REAL NOT NULL,
-      output REAL NOT NULL,
-      cache_write_5m REAL NOT NULL,
-      cache_write_1h REAL NOT NULL,
-      cache_read REAL NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      input ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      output ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_write_5m ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_write_1h ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      cache_read ${d === "postgres" ? "DOUBLE PRECISION" : "REAL"} NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT ${NOW},
       UNIQUE(account_id, model, settings_match_json)
     )
   `);
+
+  // Backfill account_id → the default/local account on the tables that gained an
+  // account_id column in the multi-tenant rework. Runs last, once every table
+  // exists. Existing single-tenant rows all belong to the local daemon.
+  const defaultAcct = (await db.get<{ id: number }>(
+    "SELECT id FROM accounts WHERE identity = ?",
+    [DEFAULT_ACCOUNT_IDENTITY],
+  ))!;
+  await db.run("UPDATE usage_snapshots SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE profiles SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE alert_events SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
 }
 
-function getDb(): DatabaseSync {
-  if (!db) {
-    throw new Error("Database not initialized. Call initDb() first.");
+/**
+ * SQLite-only: older DBs created alert_subscriptions with a CHECK constraint that
+ * blocked 'context_threshold'. SQLite can't ALTER a CHECK in place, so detect +
+ * rebuild only when needed, inside an exclusive transaction.
+ */
+async function migrateAlertSubscriptionsSqlite(db: Backend): Promise<void> {
+  try {
+    const tableSql = (await db.get<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'",
+    ))?.sql ?? "";
+    if (tableSql && !tableSql.includes("context_threshold")) {
+      await db.exec("BEGIN IMMEDIATE");
+      const recheckSql = (await db.get<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_subscriptions'",
+      ))?.sql ?? "";
+      if (!recheckSql.includes("context_threshold")) {
+        await db.exec(`DROP TABLE IF EXISTS alert_subscriptions__new`);
+        await db.exec(`
+          CREATE TABLE alert_subscriptions__new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+            profile TEXT NOT NULL REFERENCES profiles(name) ON DELETE CASCADE,
+            alert_type TEXT NOT NULL CHECK(alert_type IN ('five_hour_threshold', 'seven_day_threshold', 'auth_failure', 'context_threshold')),
+            threshold REAL,
+            channel TEXT,
+            cooldown_minutes INTEGER NOT NULL DEFAULT 30,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          )
+        `);
+        await db.exec(`
+          INSERT INTO alert_subscriptions__new
+            (id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at)
+          SELECT id, profile, alert_type, threshold, channel, cooldown_minutes, enabled, created_at
+          FROM alert_subscriptions
+        `);
+        await db.exec(`DROP TABLE alert_subscriptions`);
+        await db.exec(`ALTER TABLE alert_subscriptions__new RENAME TO alert_subscriptions`);
+      }
+      await db.exec("COMMIT");
+    }
+  } catch (e) {
+    try { await db.exec("ROLLBACK"); } catch { /* noop */ }
+    process.stderr.write(`[claude-pulse] alert_subscriptions migration warning: ${(e as Error).message}\n`);
   }
-  return db;
 }
 
 // ── Accounts ─────────────────────────────────────────────────────────────────
 
 /** Get an account by identity, or undefined. */
-export function getAccount(identity: string): Account | undefined {
+export async function getAccount(identity: string): Promise<Account | undefined> {
   const d = getDb();
-  return d.prepare("SELECT * FROM accounts WHERE identity = ?").get(identity) as
-    | unknown as Account
-    | undefined;
+  return d.get<Account>("SELECT * FROM accounts WHERE identity = ?", [identity]);
 }
 
-export function getAccountById(id: number): Account | undefined {
+export async function getAccountById(id: number): Promise<Account | undefined> {
   const d = getDb();
-  return d.prepare("SELECT * FROM accounts WHERE id = ?").get(id) as
-    | unknown as Account
-    | undefined;
+  return d.get<Account>("SELECT * FROM accounts WHERE id = ?", [id]);
 }
 
 /**
  * Resolve (auto-create on first sight) the account for an identity. Pass the
  * `X-Auth-Request-Email` value, or undefined/null to use the default account.
  */
-export function resolveAccount(identity?: string | null): Account {
+export async function resolveAccount(identity?: string | null): Promise<Account> {
   const d = getDb();
   const id = (identity && identity.trim()) || DEFAULT_ACCOUNT_IDENTITY;
-  const existing = getAccount(id);
+  const existing = await getAccount(id);
   if (existing) return existing;
-  d.prepare(
+  await d.run(
     `INSERT INTO accounts (identity, display_name) VALUES (?, ?)
-     ON CONFLICT(identity) DO NOTHING`
-  ).run(id, id);
-  return getAccount(id)!;
+     ON CONFLICT(identity) DO NOTHING`,
+    [id, id],
+  );
+  return (await getAccount(id))!;
 }
 
-export function listAccounts(): Account[] {
+export async function listAccounts(): Promise<Account[]> {
   const d = getDb();
-  return d.prepare("SELECT * FROM accounts ORDER BY id").all() as unknown as Account[];
+  return d.all<Account>("SELECT * FROM accounts ORDER BY id");
 }
 
-function defaultAccountId(): number {
-  return resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
+async function defaultAccountId(): Promise<number> {
+  return (await resolveAccount(DEFAULT_ACCOUNT_IDENTITY)).id;
 }
 
 /** Public accessor for the local/default daemon account id. */
-export function localAccountId(): number {
+export async function localAccountId(): Promise<number> {
   return defaultAccountId();
 }
 
-export function ensureDefaultProfiles(accountId?: number): void {
+export async function ensureDefaultProfiles(accountId?: number): Promise<void> {
   const d = getDb();
   const homeDir = os.homedir();
-  const acct = accountId ?? defaultAccountId();
+  const acct = accountId ?? (await defaultAccountId());
 
   const defaults = [
     { name: "claude-hd", config_dir: path.join(homeDir, ".claude-hd") },
     { name: "claude-max", config_dir: path.join(homeDir, ".claude-max") },
   ];
 
-  const stmt = d.prepare(
-    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, account_id)
-     VALUES (?, ?, 5, ?)
-     ON CONFLICT(name) DO NOTHING`
-  );
-
   for (const p of defaults) {
-    stmt.run(p.name, p.config_dir, acct);
+    await d.run(
+      `INSERT INTO profiles (name, config_dir, poll_interval_minutes, account_id)
+       VALUES (?, ?, 5, ?)
+       ON CONFLICT(name) DO NOTHING`,
+      [p.name, p.config_dir, acct],
+    );
   }
 }
 
 /** List profiles for an account (defaults to the local daemon's account). */
-export function listProfiles(accountId?: number): Profile[] {
+export async function listProfiles(accountId?: number): Promise<Profile[]> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  return d.prepare(
-    "SELECT * FROM profiles WHERE account_id = ? ORDER BY name"
-  ).all(acct) as unknown as Profile[];
+  const acct = accountId ?? (await defaultAccountId());
+  return d.all<Profile>("SELECT * FROM profiles WHERE account_id = ? ORDER BY name", [acct]);
 }
 
 export function redactProfile(p: Profile): Omit<Profile, "api_key"> & { api_key: string | null } {
   return { ...p, api_key: p.api_key ? "***" : null };
 }
 
-export function getProfile(name: string, accountId?: number): Profile | undefined {
+export async function getProfile(name: string, accountId?: number): Promise<Profile | undefined> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  const row = d.prepare(
-    "SELECT * FROM profiles WHERE name = ? AND account_id = ?"
-  ).get(name, acct);
-  return row as unknown as Profile | undefined;
+  const acct = accountId ?? (await defaultAccountId());
+  return d.get<Profile>("SELECT * FROM profiles WHERE name = ? AND account_id = ?", [name, acct]);
 }
 
-export function addProfile(
+export async function addProfile(
   name: string,
   configDir: string,
   pollIntervalMinutes: number = 5,
@@ -580,61 +639,65 @@ export function addProfile(
   monthlyBudgetUsd: number | null = null,
   apiKey: string | null = null,
   accountId?: number,
-): Profile {
+): Promise<Profile> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  await d.run(
     `INSERT INTO profiles (name, config_dir, poll_interval_minutes, vendor, monthly_budget_usd, api_key, account_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(name, configDir, pollIntervalMinutes, vendor, monthlyBudgetUsd, apiKey, acct);
-  return getProfile(name, acct)!;
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [name, configDir, pollIntervalMinutes, vendor, monthlyBudgetUsd, apiKey, acct],
+  );
+  return (await getProfile(name, acct))!;
 }
 
-export function updateProfileBudget(
+export async function updateProfileBudget(
   name: string,
-  monthlyBudgetUsd: number | null
-): boolean {
+  monthlyBudgetUsd: number | null,
+): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
+  const result = await d.run(
     `UPDATE profiles
      SET monthly_budget_usd = ?, updated_at = datetime('now')
-     WHERE name = ?`
-  ).run(monthlyBudgetUsd, name);
-  return Number(result.changes) > 0;
+     WHERE name = ?`,
+    [monthlyBudgetUsd, name],
+  );
+  return result.changes > 0;
 }
 
-export function updateProfileApiKey(
+export async function updateProfileApiKey(
   name: string,
-  apiKey: string | null
-): boolean {
+  apiKey: string | null,
+): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
+  const result = await d.run(
     `UPDATE profiles
      SET api_key = ?, updated_at = datetime('now')
-     WHERE name = ?`
-  ).run(apiKey, name);
-  return Number(result.changes) > 0;
+     WHERE name = ?`,
+    [apiKey, name],
+  );
+  return result.changes > 0;
 }
 
-export function removeProfile(name: string): boolean {
+export async function removeProfile(name: string): Promise<boolean> {
   const d = getDb();
   // Delete snapshots first (even though CASCADE should handle it)
-  d.prepare("DELETE FROM usage_snapshots WHERE profile = ?").run(name);
-  const result = d.prepare("DELETE FROM profiles WHERE name = ?").run(name);
-  return Number(result.changes) > 0;
+  await d.run("DELETE FROM usage_snapshots WHERE profile = ?", [name]);
+  const result = await d.run("DELETE FROM profiles WHERE name = ?", [name]);
+  return result.changes > 0;
 }
 
-export function updatePollInterval(
+export async function updatePollInterval(
   name: string,
-  intervalMinutes: number
-): boolean {
+  intervalMinutes: number,
+): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
+  const result = await d.run(
     `UPDATE profiles
      SET poll_interval_minutes = ?, updated_at = datetime('now')
-     WHERE name = ?`
-  ).run(intervalMinutes, name);
-  return Number(result.changes) > 0;
+     WHERE name = ?`,
+    [intervalMinutes, name],
+  );
+  return result.changes > 0;
 }
 
 export interface ContextSnapshotFields {
@@ -646,7 +709,7 @@ export interface ContextSnapshotFields {
   context_last_reset_at: string | null;
 }
 
-export function insertSnapshot(
+export async function insertSnapshot(
   profile: string,
   fiveHourPct: number | null,
   fiveHourResetsAt: string | null,
@@ -655,32 +718,32 @@ export function insertSnapshot(
   rawResponse: string | null,
   ctx?: ContextSnapshotFields | null,
   accountId?: number,
-): UsageSnapshot {
+): Promise<UsageSnapshot> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  const result = d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  const id = await d.insertReturningId(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
         context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    acct,
-    profile,
-    fiveHourPct,
-    fiveHourResetsAt,
-    sevenDayPct,
-    sevenDayResetsAt,
-    rawResponse,
-    ctx?.context_tokens ?? null,
-    ctx?.context_pct ?? null,
-    ctx?.context_session_id ?? null,
-    ctx?.context_model ?? null,
-    ctx?.context_effective_limit ?? null,
-    ctx?.context_last_reset_at ?? null,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      acct,
+      profile,
+      fiveHourPct,
+      fiveHourResetsAt,
+      sevenDayPct,
+      sevenDayResetsAt,
+      rawResponse,
+      ctx?.context_tokens ?? null,
+      ctx?.context_pct ?? null,
+      ctx?.context_session_id ?? null,
+      ctx?.context_model ?? null,
+      ctx?.context_effective_limit ?? null,
+      ctx?.context_last_reset_at ?? null,
+    ],
   );
 
-  return d.prepare("SELECT * FROM usage_snapshots WHERE id = ?")
-    .get(result.lastInsertRowid) as unknown as UsageSnapshot;
+  return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [id]))!;
 }
 
 /**
@@ -688,75 +751,76 @@ export function insertSnapshot(
  * or insert a synthetic snapshot if none exists. Used by the standalone
  * context poller which runs on its own cadence.
  */
-export function upsertContextOnLatestSnapshot(
+export async function upsertContextOnLatestSnapshot(
   profile: string,
   ctx: ContextSnapshotFields,
   accountId?: number,
-): UsageSnapshot {
+): Promise<UsageSnapshot> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  const latest = d.prepare(
-    `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? ORDER BY polled_at DESC LIMIT 1`
-  ).get(profile, acct) as unknown as UsageSnapshot | undefined;
+  const acct = accountId ?? (await defaultAccountId());
+  const latest = await d.get<UsageSnapshot>(
+    `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? ORDER BY polled_at DESC LIMIT 1`,
+    [profile, acct],
+  );
 
   if (latest) {
-    d.prepare(
+    await d.run(
       `UPDATE usage_snapshots
        SET context_tokens = ?, context_pct = ?, context_session_id = ?,
            context_model = ?, context_effective_limit = ?, context_last_reset_at = ?
-       WHERE id = ?`
-    ).run(
-      ctx.context_tokens,
-      ctx.context_pct,
-      ctx.context_session_id,
-      ctx.context_model,
-      ctx.context_effective_limit,
-      ctx.context_last_reset_at,
-      latest.id,
+       WHERE id = ?`,
+      [
+        ctx.context_tokens,
+        ctx.context_pct,
+        ctx.context_session_id,
+        ctx.context_model,
+        ctx.context_effective_limit,
+        ctx.context_last_reset_at,
+        latest.id,
+      ],
     );
-    return d.prepare("SELECT * FROM usage_snapshots WHERE id = ?")
-      .get(latest.id) as unknown as UsageSnapshot;
+    return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [latest.id]))!;
   }
 
   // No prior snapshot — insert a fresh row with only context fields populated.
   return insertSnapshot(profile, null, null, null, null, null, ctx, acct);
 }
 
-export function getLastSuccessfulSnapshot(
+export async function getLastSuccessfulSnapshot(
   profile: string,
   accountId?: number,
-): UsageSnapshot | undefined {
+): Promise<UsageSnapshot | undefined> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  const row = d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  return d.get<UsageSnapshot>(
     `SELECT * FROM usage_snapshots
      WHERE profile = ? AND account_id = ?
        AND (five_hour_resets_at IS NOT NULL OR seven_day_resets_at IS NOT NULL)
      ORDER BY polled_at DESC
-     LIMIT 1`
-  ).get(profile, acct);
-  return row as unknown as UsageSnapshot | undefined;
+     LIMIT 1`,
+    [profile, acct],
+  );
 }
 
-export function getLatestSnapshot(
+export async function getLatestSnapshot(
   profile: string,
   accountId?: number,
-): UsageSnapshot | undefined {
+): Promise<UsageSnapshot | undefined> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  const row = d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  return d.get<UsageSnapshot>(
     `SELECT * FROM usage_snapshots
      WHERE profile = ? AND account_id = ?
      ORDER BY polled_at DESC
-     LIMIT 1`
-  ).get(profile, acct);
-  return row as unknown as UsageSnapshot | undefined;
+     LIMIT 1`,
+    [profile, acct],
+  );
 }
 
-export function getLatestSnapshots(accountId?: number): UsageSnapshot[] {
+export async function getLatestSnapshots(accountId?: number): Promise<UsageSnapshot[]> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  return d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  return d.all<UsageSnapshot>(
     `SELECT s.*
      FROM usage_snapshots s
      INNER JOIN (
@@ -766,73 +830,62 @@ export function getLatestSnapshots(accountId?: number): UsageSnapshot[] {
        GROUP BY profile
      ) latest ON s.profile = latest.profile AND s.polled_at = latest.max_polled
      WHERE s.account_id = ?
-     ORDER BY s.profile`
-  ).all(acct, acct) as unknown as UsageSnapshot[];
+     ORDER BY s.profile`,
+    [acct, acct],
+  );
 }
 
-export function getHistory(
+export async function getHistory(
   profile: string,
   hours: number = 24,
   limit: number = 100,
   accountId?: number,
-): UsageSnapshot[] {
+): Promise<UsageSnapshot[]> {
   const d = getDb();
-  const acct = accountId ?? defaultAccountId();
-  return d.prepare(
+  const acct = accountId ?? (await defaultAccountId());
+  return d.all<UsageSnapshot>(
     `SELECT * FROM usage_snapshots
      WHERE profile = ? AND account_id = ?
-       AND polled_at >= datetime('now', '-' || ? || ' hours')
+       AND ${tsGte("polled_at", "hours")}
      ORDER BY polled_at DESC
-     LIMIT ?`
-  ).all(profile, acct, hours, limit) as unknown as UsageSnapshot[];
+     LIMIT ?`,
+    [profile, acct, hours, limit],
+  );
 }
 
 // --- Gemini quota functions ---
 
-export function insertGeminiQuotaSnapshots(
+export async function insertGeminiQuotaSnapshots(
   buckets: {
     modelId: string;
     remainingFraction: number;
     remainingAmount: string | null;
     resetTime: string | null;
-  }[]
-): GeminiQuotaSnapshot[] {
+  }[],
+): Promise<GeminiQuotaSnapshot[]> {
   if (buckets.length === 0) return [];
 
   const d = getDb();
-  const stmt = d.prepare(
-    `INSERT INTO gemini_quota
-       (model_id, remaining_fraction, remaining_amount, reset_time)
-     VALUES (?, ?, ?, ?)`
-  );
   const rows: GeminiQuotaSnapshot[] = [];
 
-  d.exec("BEGIN");
-  try {
+  await d.transaction(async (tx) => {
     for (const bucket of buckets) {
-      const result = stmt.run(
-        bucket.modelId,
-        bucket.remainingFraction,
-        bucket.remainingAmount,
-        bucket.resetTime
+      const id = await tx.insertReturningId(
+        `INSERT INTO gemini_quota
+           (model_id, remaining_fraction, remaining_amount, reset_time)
+         VALUES (?, ?, ?, ?)`,
+        [bucket.modelId, bucket.remainingFraction, bucket.remainingAmount, bucket.resetTime],
       );
-      rows.push(
-        d.prepare("SELECT * FROM gemini_quota WHERE id = ?")
-          .get(result.lastInsertRowid) as unknown as GeminiQuotaSnapshot
-      );
+      rows.push((await tx.get<GeminiQuotaSnapshot>("SELECT * FROM gemini_quota WHERE id = ?", [id]))!);
     }
-    d.exec("COMMIT");
-  } catch (err) {
-    d.exec("ROLLBACK");
-    throw err;
-  }
+  });
 
   return rows;
 }
 
-export function getLatestGeminiQuota(): GeminiQuotaSnapshot[] {
+export async function getLatestGeminiQuota(): Promise<GeminiQuotaSnapshot[]> {
   const d = getDb();
-  return d.prepare(
+  return d.all<GeminiQuotaSnapshot>(
     `SELECT *
      FROM gemini_quota
      WHERE id IN (
@@ -840,105 +893,109 @@ export function getLatestGeminiQuota(): GeminiQuotaSnapshot[] {
        FROM gemini_quota
        GROUP BY model_id
      )
-     ORDER BY model_id`
-  ).all() as unknown as GeminiQuotaSnapshot[];
+     ORDER BY model_id`,
+  );
 }
 
 // --- Alert Subscription functions ---
 
-export function createAlertSubscription(
+export async function createAlertSubscription(
   accountId: number,
   profile: string,
   alertType: AlertType,
   threshold: number | null,
   channel: string | null,
-  cooldownMinutes: number = 30
-): AlertSubscription {
+  cooldownMinutes: number = 30,
+): Promise<AlertSubscription> {
   const d = getDb();
-  const result = d.prepare(
+  const id = await d.insertReturningId(
     `INSERT INTO alert_subscriptions (account_id, profile, alert_type, threshold, channel, cooldown_minutes)
-     VALUES (?, ?, ?, ?, ?, ?)`
-  ).run(accountId, profile, alertType, threshold, channel, cooldownMinutes);
-  return d.prepare("SELECT * FROM alert_subscriptions WHERE id = ?")
-    .get(result.lastInsertRowid) as unknown as AlertSubscription;
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [accountId, profile, alertType, threshold, channel, cooldownMinutes],
+  );
+  return (await d.get<AlertSubscription>("SELECT * FROM alert_subscriptions WHERE id = ?", [id]))!;
 }
 
 /**
  * Remove a subscription by id, scoped to the owning account. Returns false when
  * the row doesn't exist OR belongs to another account (closes the IDOR).
  */
-export function removeAlertSubscription(accountId: number, id: number): boolean {
+export async function removeAlertSubscription(accountId: number, id: number): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
-    "DELETE FROM alert_subscriptions WHERE id = ? AND account_id = ?"
-  ).run(id, accountId);
-  return Number(result.changes) > 0;
+  const result = await d.run(
+    "DELETE FROM alert_subscriptions WHERE id = ? AND account_id = ?",
+    [id, accountId],
+  );
+  return result.changes > 0;
 }
 
-export function listAlertSubscriptions(accountId: number, profile?: string): AlertSubscription[] {
+export async function listAlertSubscriptions(accountId: number, profile?: string): Promise<AlertSubscription[]> {
   const d = getDb();
   if (profile) {
-    return d.prepare(
-      "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? ORDER BY id"
-    ).all(accountId, profile) as unknown as AlertSubscription[];
+    return d.all<AlertSubscription>(
+      "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? ORDER BY id",
+      [accountId, profile],
+    );
   }
-  return d.prepare(
-    "SELECT * FROM alert_subscriptions WHERE account_id = ? ORDER BY profile, id"
-  ).all(accountId) as unknown as AlertSubscription[];
+  return d.all<AlertSubscription>(
+    "SELECT * FROM alert_subscriptions WHERE account_id = ? ORDER BY profile, id",
+    [accountId],
+  );
 }
 
-export function getAlertSubscription(id: number, accountId?: number): AlertSubscription | undefined {
+export async function getAlertSubscription(id: number, accountId?: number): Promise<AlertSubscription | undefined> {
   const d = getDb();
   if (accountId !== undefined) {
-    return d.prepare(
-      "SELECT * FROM alert_subscriptions WHERE id = ? AND account_id = ?"
-    ).get(id, accountId) as unknown as AlertSubscription | undefined;
+    return d.get<AlertSubscription>(
+      "SELECT * FROM alert_subscriptions WHERE id = ? AND account_id = ?",
+      [id, accountId],
+    );
   }
-  const row = d.prepare("SELECT * FROM alert_subscriptions WHERE id = ?").get(id);
-  return row as unknown as AlertSubscription | undefined;
+  return d.get<AlertSubscription>("SELECT * FROM alert_subscriptions WHERE id = ?", [id]);
 }
 
 /**
  * Enabled subscriptions for a (account, profile) pair. The alert-firing path
  * passes the owning account so a fired alert is attributed correctly.
  */
-export function getEnabledAlertSubscriptions(accountId: number, profile: string): AlertSubscription[] {
+export async function getEnabledAlertSubscriptions(accountId: number, profile: string): Promise<AlertSubscription[]> {
   const d = getDb();
-  return d.prepare(
-    "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? AND enabled = 1 ORDER BY id"
-  ).all(accountId, profile) as unknown as AlertSubscription[];
+  return d.all<AlertSubscription>(
+    "SELECT * FROM alert_subscriptions WHERE account_id = ? AND profile = ? AND enabled = 1 ORDER BY id",
+    [accountId, profile],
+  );
 }
 
 // --- Alert Event functions ---
 
-export function createAlertEvent(
+export async function createAlertEvent(
   accountId: number,
   subscriptionId: number,
   profile: string,
   alertType: AlertType,
   message: string,
   currentValue: number | null,
-  threshold: number | null
-): AlertEvent {
+  threshold: number | null,
+): Promise<AlertEvent> {
   const d = getDb();
-  const result = d.prepare(
+  const id = await d.insertReturningId(
     `INSERT INTO alert_events (account_id, subscription_id, profile, alert_type, message, current_value, threshold)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(accountId, subscriptionId, profile, alertType, message, currentValue, threshold);
-  return d.prepare("SELECT * FROM alert_events WHERE id = ?")
-    .get(result.lastInsertRowid) as unknown as AlertEvent;
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [accountId, subscriptionId, profile, alertType, message, currentValue, threshold],
+  );
+  return (await d.get<AlertEvent>("SELECT * FROM alert_events WHERE id = ?", [id]))!;
 }
 
-export function getTriggeredAlerts(
+export async function getTriggeredAlerts(
   accountId: number,
   profile?: string,
   sinceHours: number = 24,
-  unacknowledgedOnly: boolean = false
-): AlertEvent[] {
+  unacknowledgedOnly: boolean = false,
+): Promise<AlertEvent[]> {
   const d = getDb();
   let sql = `SELECT * FROM alert_events
      WHERE account_id = ?
-       AND triggered_at >= datetime('now', '-' || ? || ' hours')`;
+       AND ${tsGte("triggered_at", "hours")}`;
   const params: (string | number)[] = [accountId, sinceHours];
 
   if (profile) {
@@ -950,44 +1007,47 @@ export function getTriggeredAlerts(
   }
   sql += " ORDER BY triggered_at DESC";
 
-  return d.prepare(sql).all(...params) as unknown as AlertEvent[];
+  return d.all<AlertEvent>(sql, params);
 }
 
 /**
  * Acknowledge one alert event by id, scoped to the owning account. Returns false
  * when the row doesn't exist OR belongs to another account (closes the IDOR).
  */
-export function acknowledgeAlert(accountId: number, eventId: number): boolean {
+export async function acknowledgeAlert(accountId: number, eventId: number): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
-    "UPDATE alert_events SET acknowledged = 1 WHERE id = ? AND account_id = ? AND acknowledged = 0"
-  ).run(eventId, accountId);
-  return Number(result.changes) > 0;
+  const result = await d.run(
+    "UPDATE alert_events SET acknowledged = 1 WHERE id = ? AND account_id = ? AND acknowledged = 0",
+    [eventId, accountId],
+  );
+  return result.changes > 0;
 }
 
-export function acknowledgeAllAlerts(accountId: number, profile?: string): number {
+export async function acknowledgeAllAlerts(accountId: number, profile?: string): Promise<number> {
   const d = getDb();
   if (profile) {
-    const result = d.prepare(
-      "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND profile = ? AND acknowledged = 0"
-    ).run(accountId, profile);
-    return Number(result.changes);
+    const result = await d.run(
+      "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND profile = ? AND acknowledged = 0",
+      [accountId, profile],
+    );
+    return result.changes;
   }
-  const result = d.prepare(
-    "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND acknowledged = 0"
-  ).run(accountId);
-  return Number(result.changes);
+  const result = await d.run(
+    "UPDATE alert_events SET acknowledged = 1 WHERE account_id = ? AND acknowledged = 0",
+    [accountId],
+  );
+  return result.changes;
 }
 
-export function getLastAlertEvent(subscriptionId: number): AlertEvent | undefined {
+export async function getLastAlertEvent(subscriptionId: number): Promise<AlertEvent | undefined> {
   const d = getDb();
-  const row = d.prepare(
+  return d.get<AlertEvent>(
     `SELECT * FROM alert_events
      WHERE subscription_id = ?
      ORDER BY triggered_at DESC
-     LIMIT 1`
-  ).get(subscriptionId);
-  return row as unknown as AlertEvent | undefined;
+     LIMIT 1`,
+    [subscriptionId],
+  );
 }
 
 // --- Token rollup functions ---
@@ -997,9 +1057,9 @@ export function getLastAlertEvent(subscriptionId: number): AlertEvent | undefine
  * REPLACED (not summed) — the caller computes complete per-day totals from the
  * transcripts each run, so the latest computation is authoritative.
  */
-export function upsertTokenRollup(row: TokenRollupInput): void {
+export async function upsertTokenRollup(row: TokenRollupInput): Promise<void> {
   const d = getDb();
-  d.prepare(
+  await d.run(
     `INSERT INTO token_rollups
        (profile, host, day, model, input_tokens, output_tokens,
         cache_creation_tokens, cache_read_tokens, cost_usd, source, updated_at)
@@ -1011,26 +1071,27 @@ export function upsertTokenRollup(row: TokenRollupInput): void {
        cache_read_tokens = excluded.cache_read_tokens,
        cost_usd = excluded.cost_usd,
        source = excluded.source,
-       updated_at = datetime('now')`
-  ).run(
-    row.profile,
-    row.host,
-    row.day,
-    row.model,
-    row.input_tokens,
-    row.output_tokens,
-    row.cache_creation_tokens,
-    row.cache_read_tokens,
-    row.cost_usd,
-    row.source,
+       updated_at = datetime('now')`,
+    [
+      row.profile,
+      row.host,
+      row.day,
+      row.model,
+      row.input_tokens,
+      row.output_tokens,
+      row.cache_creation_tokens,
+      row.cache_read_tokens,
+      row.cost_usd,
+      row.source,
+    ],
   );
 }
 
-export function getTokenRollups(opts: {
+export async function getTokenRollups(opts: {
   sinceDay?: string;
   profile?: string;
   host?: string;
-} = {}): TokenRollup[] {
+} = {}): Promise<TokenRollup[]> {
   const d = getDb();
   const clauses: string[] = [];
   const params: (string | number)[] = [];
@@ -1047,9 +1108,10 @@ export function getTokenRollups(opts: {
     params.push(opts.host);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  return d
-    .prepare(`SELECT * FROM token_rollups ${where} ORDER BY day DESC, profile, host, model`)
-    .all(...params) as unknown as TokenRollup[];
+  return d.all<TokenRollup>(
+    `SELECT * FROM token_rollups ${where} ORDER BY day DESC, profile, host, model`,
+    params,
+  );
 }
 
 function emptyReportTotals(): TokenReportTotals {
@@ -1089,16 +1151,16 @@ function weekBucket(day: string): string {
  * Aggregate rollups into a per-profile report with per-host breakdown, a
  * per-bucket (day or week) time series, and a combined grand total.
  */
-export function getTokenReport(opts: {
+export async function getTokenReport(opts: {
   granularity?: "daily" | "weekly";
   days?: number;
-}): TokenReport {
+}): Promise<TokenReport> {
   const granularity = opts.granularity ?? "daily";
   const days = opts.days ?? 30;
   const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
   const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
 
-  const rollups = getTokenRollups({ sinceDay });
+  const rollups = await getTokenRollups({ sinceDay });
 
   const profileMap = new Map<
     string,
@@ -1164,20 +1226,20 @@ export function getTokenReport(opts: {
  * Mint a new ingest token for (account, machine). Returns the plaintext (shown
  * ONCE to the caller) plus the stored row. Only the sha-256 hash is persisted.
  */
-export function mintIngestToken(
+export async function mintIngestToken(
   accountId: number,
   machine: string,
-): { plaintext: string; token: IngestToken } {
+): Promise<{ plaintext: string; token: IngestToken }> {
   const d = getDb();
   const plaintext = `cp_${crypto.randomBytes(24).toString("hex")}`;
   const hash = hashIngestToken(plaintext);
-  const result = d.prepare(
-    `INSERT INTO ingest_tokens (account_id, machine, token_hash) VALUES (?, ?, ?)`
-  ).run(accountId, machine, hash);
-  const token = d.prepare("SELECT * FROM ingest_tokens WHERE id = ?")
-    .get(result.lastInsertRowid) as unknown as IngestToken;
+  const id = await d.insertReturningId(
+    `INSERT INTO ingest_tokens (account_id, machine, token_hash) VALUES (?, ?, ?)`,
+    [accountId, machine, hash],
+  );
+  const token = (await d.get<IngestToken>("SELECT * FROM ingest_tokens WHERE id = ?", [id]))!;
   // Ensure a machines row exists for this (account, machine).
-  upsertMachine(accountId, machine);
+  await upsertMachine(accountId, machine);
   return { plaintext, token };
 }
 
@@ -1194,54 +1256,56 @@ function maskToken(t: IngestToken): IngestTokenMasked {
 }
 
 /** List an account's ingest tokens (masked — never exposes the hash plaintext). */
-export function listIngestTokens(accountId: number): IngestTokenMasked[] {
+export async function listIngestTokens(accountId: number): Promise<IngestTokenMasked[]> {
   const d = getDb();
-  const rows = d.prepare(
-    "SELECT * FROM ingest_tokens WHERE account_id = ? ORDER BY id DESC"
-  ).all(accountId) as unknown as IngestToken[];
+  const rows = await d.all<IngestToken>(
+    "SELECT * FROM ingest_tokens WHERE account_id = ? ORDER BY id DESC",
+    [accountId],
+  );
   return rows.map(maskToken);
 }
 
 /** Revoke one ingest token by id, scoped to the account. */
-export function revokeIngestToken(accountId: number, id: number): boolean {
+export async function revokeIngestToken(accountId: number, id: number): Promise<boolean> {
   const d = getDb();
-  const result = d.prepare(
+  const result = await d.run(
     `UPDATE ingest_tokens SET revoked_at = datetime('now')
-     WHERE id = ? AND account_id = ? AND revoked_at IS NULL`
-  ).run(id, accountId);
-  return Number(result.changes) > 0;
+     WHERE id = ? AND account_id = ? AND revoked_at IS NULL`,
+    [id, accountId],
+  );
+  return result.changes > 0;
 }
 
 /**
  * Validate a presented bearer plaintext by hash lookup. Returns the token row
  * (account + machine) when valid + not revoked, and stamps last_used_at.
  */
-export function validateIngestToken(plaintext: string): IngestToken | undefined {
+export async function validateIngestToken(plaintext: string): Promise<IngestToken | undefined> {
   const d = getDb();
   const hash = hashIngestToken(plaintext);
-  const row = d.prepare(
-    "SELECT * FROM ingest_tokens WHERE token_hash = ? AND revoked_at IS NULL"
-  ).get(hash) as unknown as IngestToken | undefined;
+  const row = await d.get<IngestToken>(
+    "SELECT * FROM ingest_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+    [hash],
+  );
   if (!row) return undefined;
-  d.prepare("UPDATE ingest_tokens SET last_used_at = datetime('now') WHERE id = ?").run(row.id);
+  await d.run("UPDATE ingest_tokens SET last_used_at = datetime('now') WHERE id = ?", [row.id]);
   return row;
 }
 
 // ── Machines ─────────────────────────────────────────────────────────────────
 
-export function upsertMachine(accountId: number, name: string): void {
+export async function upsertMachine(accountId: number, name: string): Promise<void> {
   const d = getDb();
-  d.prepare(
+  await d.run(
     `INSERT INTO machines (account_id, name) VALUES (?, ?)
-     ON CONFLICT(account_id, name) DO UPDATE SET last_seen = datetime('now')`
-  ).run(accountId, name);
+     ON CONFLICT(account_id, name) DO UPDATE SET last_seen = datetime('now')`,
+    [accountId, name],
+  );
 }
 
-export function listMachines(accountId: number): MachineRow[] {
+export async function listMachines(accountId: number): Promise<MachineRow[]> {
   const d = getDb();
-  return d.prepare(
-    "SELECT * FROM machines WHERE account_id = ? ORDER BY name"
-  ).all(accountId) as unknown as MachineRow[];
+  return d.all<MachineRow>("SELECT * FROM machines WHERE account_id = ? ORDER BY name", [accountId]);
 }
 
 // ── token_usage (fine grain) ─────────────────────────────────────────────────
@@ -1250,9 +1314,9 @@ export function listMachines(accountId: number): MachineRow[] {
  * Upsert one fine-grained token_usage row. On conflict the counts are REPLACED
  * (the caller recomputes complete totals per run), mirroring token_rollups.
  */
-export function upsertTokenUsage(row: TokenUsageInput): void {
+export async function upsertTokenUsage(row: TokenUsageInput): Promise<void> {
   const d = getDb();
-  d.prepare(
+  await d.run(
     `INSERT INTO token_usage
        (account_id, profile, machine, session_id, model, settings_hash, settings_json, day,
         tokens_in, tokens_out, cache_write_5m, cache_write_1h, cache_read, source, updated_at)
@@ -1265,32 +1329,33 @@ export function upsertTokenUsage(row: TokenUsageInput): void {
        cache_write_1h = excluded.cache_write_1h,
        cache_read = excluded.cache_read,
        source = excluded.source,
-       updated_at = datetime('now')`
-  ).run(
-    row.account_id,
-    row.profile,
-    row.machine,
-    row.session_id,
-    row.model,
-    row.settings_hash,
-    row.settings_json,
-    row.day,
-    row.tokens_in,
-    row.tokens_out,
-    row.cache_write_5m,
-    row.cache_write_1h,
-    row.cache_read,
-    row.source,
+       updated_at = datetime('now')`,
+    [
+      row.account_id,
+      row.profile,
+      row.machine,
+      row.session_id,
+      row.model,
+      row.settings_hash,
+      row.settings_json,
+      row.day,
+      row.tokens_in,
+      row.tokens_out,
+      row.cache_write_5m,
+      row.cache_write_1h,
+      row.cache_read,
+      row.source,
+    ],
   );
-  upsertMachine(row.account_id, row.machine);
+  await upsertMachine(row.account_id, row.machine);
 }
 
-export function getTokenUsage(opts: {
+export async function getTokenUsage(opts: {
   accountId: number;
   sinceDay?: string;
   profile?: string;
   machine?: string;
-}): TokenUsageRow[] {
+}): Promise<TokenUsageRow[]> {
   const d = getDb();
   const clauses: string[] = ["account_id = ?"];
   const params: (string | number)[] = [opts.accountId];
@@ -1306,19 +1371,18 @@ export function getTokenUsage(opts: {
     clauses.push("machine = ?");
     params.push(opts.machine);
   }
-  return d
-    .prepare(
-      `SELECT * FROM token_usage WHERE ${clauses.join(" AND ")}
-       ORDER BY day DESC, profile, machine, session_id, model`
-    )
-    .all(...params) as unknown as TokenUsageRow[];
+  return d.all<TokenUsageRow>(
+    `SELECT * FROM token_usage WHERE ${clauses.join(" AND ")}
+     ORDER BY day DESC, profile, machine, session_id, model`,
+    params,
+  );
 }
 
 // ── context_sessions ─────────────────────────────────────────────────────────
 
-export function upsertContextSession(row: ContextSessionInput): void {
+export async function upsertContextSession(row: ContextSessionInput): Promise<void> {
   const d = getDb();
-  d.prepare(
+  await d.run(
     `INSERT INTO context_sessions
        (account_id, profile, machine, session_id, model, settings_json,
         context_tokens, context_pct, effective_limit, updated_at, last_active_at)
@@ -1330,51 +1394,55 @@ export function upsertContextSession(row: ContextSessionInput): void {
        context_pct = excluded.context_pct,
        effective_limit = excluded.effective_limit,
        updated_at = datetime('now'),
-       last_active_at = excluded.last_active_at`
-  ).run(
-    row.account_id,
-    row.profile,
-    row.machine,
-    row.session_id,
-    row.model,
-    row.settings_json,
-    row.context_tokens,
-    row.context_pct,
-    row.effective_limit,
-    row.last_active_at,
+       last_active_at = excluded.last_active_at`,
+    [
+      row.account_id,
+      row.profile,
+      row.machine,
+      row.session_id,
+      row.model,
+      row.settings_json,
+      row.context_tokens,
+      row.context_pct,
+      row.effective_limit,
+      row.last_active_at,
+    ],
   );
-  upsertMachine(row.account_id, row.machine);
+  await upsertMachine(row.account_id, row.machine);
 }
 
 /** Live (non-stale) context sessions for an account, newest-active first. */
-export function getActiveContextSessions(accountId: number): ContextSessionRow[] {
+export async function getActiveContextSessions(accountId: number): Promise<ContextSessionRow[]> {
   const d = getDb();
-  return d.prepare(
+  return d.all<ContextSessionRow>(
     `SELECT * FROM context_sessions
      WHERE account_id = ?
-       AND last_active_at >= datetime('now', '-' || ? || ' days')
-     ORDER BY profile, machine, last_active_at DESC`
-  ).all(accountId, CONTEXT_STALE_DAYS) as unknown as ContextSessionRow[];
+       AND ${tsGte("last_active_at", "days")}
+     ORDER BY profile, machine, last_active_at DESC`,
+    [accountId, CONTEXT_STALE_DAYS],
+  );
 }
 
 /** Delete context sessions whose last_active_at is older than the stale window. */
-export function sweepStaleContextSessions(): number {
+export async function sweepStaleContextSessions(): Promise<number> {
   const d = getDb();
-  const result = d.prepare(
+  const result = await d.run(
     `DELETE FROM context_sessions
-     WHERE last_active_at < datetime('now', '-' || ? || ' days')`
-  ).run(CONTEXT_STALE_DAYS);
-  return Number(result.changes);
+     WHERE ${tsLt("last_active_at", "days")}`,
+    [CONTEXT_STALE_DAYS],
+  );
+  return result.changes;
 }
 
 // ── Per-account abuse / storage caps (count + existence helpers) ─────────────
 
 /** Total token_usage rows owned by an account (cheap COUNT on the account_id index). */
-export function countTokenUsageRows(accountId: number): number {
+export async function countTokenUsageRows(accountId: number): Promise<number> {
   const d = getDb();
-  const row = d.prepare(
-    "SELECT COUNT(*) AS n FROM token_usage WHERE account_id = ?"
-  ).get(accountId) as unknown as { n: number };
+  const row = await d.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM token_usage WHERE account_id = ?",
+    [accountId],
+  );
   return Number(row?.n ?? 0);
 }
 
@@ -1383,7 +1451,7 @@ export function countTokenUsageRows(accountId: number): number {
  * the per-account row cap to distinguish an UPDATE (always allowed) from an
  * INSERT of a brand-new key (blocked when the account is at its cap).
  */
-export function tokenUsageRowExists(row: {
+export async function tokenUsageRowExists(row: {
   account_id: number;
   profile: string;
   machine: string;
@@ -1391,76 +1459,81 @@ export function tokenUsageRowExists(row: {
   model: string;
   settings_hash: string;
   day: string;
-}): boolean {
+}): Promise<boolean> {
   const d = getDb();
-  const hit = d.prepare(
+  const hit = await d.get(
     `SELECT 1 FROM token_usage
      WHERE account_id = ? AND profile = ? AND machine = ? AND session_id = ?
-       AND model = ? AND settings_hash = ? AND day = ? LIMIT 1`
-  ).get(
-    row.account_id,
-    row.profile,
-    row.machine,
-    row.session_id,
-    row.model,
-    row.settings_hash,
-    row.day,
+       AND model = ? AND settings_hash = ? AND day = ? LIMIT 1`,
+    [
+      row.account_id,
+      row.profile,
+      row.machine,
+      row.session_id,
+      row.model,
+      row.settings_hash,
+      row.day,
+    ],
   );
   return hit !== undefined;
 }
 
 /** Total context_sessions rows owned by an account. */
-export function countContextSessions(accountId: number): number {
+export async function countContextSessions(accountId: number): Promise<number> {
   const d = getDb();
-  const row = d.prepare(
-    "SELECT COUNT(*) AS n FROM context_sessions WHERE account_id = ?"
-  ).get(accountId) as unknown as { n: number };
+  const row = await d.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM context_sessions WHERE account_id = ?",
+    [accountId],
+  );
   return Number(row?.n ?? 0);
 }
 
 /** Whether a context_sessions row already exists for this unique key (UPDATE vs INSERT). */
-export function contextSessionExists(row: {
+export async function contextSessionExists(row: {
   account_id: number;
   profile: string;
   machine: string;
   session_id: string;
-}): boolean {
+}): Promise<boolean> {
   const d = getDb();
-  const hit = d.prepare(
+  const hit = await d.get(
     `SELECT 1 FROM context_sessions
-     WHERE account_id = ? AND profile = ? AND machine = ? AND session_id = ? LIMIT 1`
-  ).get(row.account_id, row.profile, row.machine, row.session_id);
+     WHERE account_id = ? AND profile = ? AND machine = ? AND session_id = ? LIMIT 1`,
+    [row.account_id, row.profile, row.machine, row.session_id],
+  );
   return hit !== undefined;
 }
 
 /** Count of an account's non-revoked ingest tokens (the per-account machine/token cap). */
-export function countActiveIngestTokens(accountId: number): number {
+export async function countActiveIngestTokens(accountId: number): Promise<number> {
   const d = getDb();
-  const row = d.prepare(
-    "SELECT COUNT(*) AS n FROM ingest_tokens WHERE account_id = ? AND revoked_at IS NULL"
-  ).get(accountId) as unknown as { n: number };
+  const row = await d.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM ingest_tokens WHERE account_id = ? AND revoked_at IS NULL",
+    [accountId],
+  );
   return Number(row?.n ?? 0);
 }
 
 // ── Pricing ──────────────────────────────────────────────────────────────────
 
-export function getPricingDefaults(): PricingRow[] {
+export async function getPricingDefaults(): Promise<PricingRow[]> {
   const d = getDb();
-  return d.prepare(
-    "SELECT model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read, source_url, as_of FROM pricing_defaults"
-  ).all() as unknown as PricingRow[];
+  return d.all<PricingRow>(
+    "SELECT model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read, source_url, as_of FROM pricing_defaults",
+  );
 }
 
-export function getPricingOverrides(accountId: number): PricingOverrideRow[] {
+export async function getPricingOverrides(accountId: number): Promise<PricingOverrideRow[]> {
   const d = getDb();
-  return d.prepare(
-    "SELECT model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read FROM pricing_overrides WHERE account_id = ?"
-  ).all(accountId) as unknown as PricingOverrideRow[];
+  return d.all<PricingOverrideRow>(
+    "SELECT model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read FROM pricing_overrides WHERE account_id = ?",
+    [accountId],
+  );
 }
 
-export function upsertPricingOverride(accountId: number, row: PricingOverrideRow): void {
+export async function upsertPricingOverride(accountId: number, row: PricingOverrideRow): Promise<void> {
   const d = getDb();
-  d.prepare(
+  await d.run(
     `INSERT INTO pricing_overrides
        (account_id, model, settings_match_json, input, output, cache_write_5m, cache_write_1h, cache_read, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -1470,26 +1543,28 @@ export function upsertPricingOverride(accountId: number, row: PricingOverrideRow
        cache_write_5m = excluded.cache_write_5m,
        cache_write_1h = excluded.cache_write_1h,
        cache_read = excluded.cache_read,
-       updated_at = datetime('now')`
-  ).run(
-    accountId,
-    row.model,
-    row.settings_match_json,
-    row.input,
-    row.output,
-    row.cache_write_5m,
-    row.cache_write_1h,
-    row.cache_read,
+       updated_at = datetime('now')`,
+    [
+      accountId,
+      row.model,
+      row.settings_match_json,
+      row.input,
+      row.output,
+      row.cache_write_5m,
+      row.cache_write_1h,
+      row.cache_read,
+    ],
   );
 }
 
 /** Delete all overrides for a model (reset to default). Returns rows removed. */
-export function deletePricingOverride(accountId: number, model: string): number {
+export async function deletePricingOverride(accountId: number, model: string): Promise<number> {
   const d = getDb();
-  const result = d.prepare(
-    "DELETE FROM pricing_overrides WHERE account_id = ? AND model = ?"
-  ).run(accountId, model);
-  return Number(result.changes);
+  const result = await d.run(
+    "DELETE FROM pricing_overrides WHERE account_id = ? AND model = ?",
+    [accountId, model],
+  );
+  return result.changes;
 }
 
 // ── Fine-grained token report (token_usage) ──────────────────────────────────
@@ -1541,7 +1616,7 @@ function drillKeyFor(r: TokenUsageRow, drill: ReportDrill): string {
  * recomputed from token grains × the account's effective per-(model,settings)
  * rate so editing rates re-prices history.
  */
-export function getFineTokenReport(opts: {
+export async function getFineTokenReport(opts: {
   accountId: number;
   identity: string;
   granularity?: "daily" | "weekly";
@@ -1549,22 +1624,22 @@ export function getFineTokenReport(opts: {
   drill?: ReportDrill;
   profile?: string;
   machine?: string;
-}): FineTokenReport {
+}): Promise<FineTokenReport> {
   const granularity = opts.granularity ?? "daily";
   const days = opts.days ?? 30;
   const drill = opts.drill ?? "profile";
   const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
   const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
 
-  const rows = getTokenUsage({
+  const rows = await getTokenUsage({
     accountId: opts.accountId,
     sinceDay,
     profile: opts.profile,
     machine: opts.machine,
   });
 
-  const defaults = getPricingDefaults();
-  const overrides = getPricingOverrides(opts.accountId);
+  const defaults = await getPricingDefaults();
+  const overrides = await getPricingOverrides(opts.accountId);
 
   const profileMap = new Map<
     string,
@@ -1653,9 +1728,17 @@ export function getFineTokenReport(opts: {
   };
 }
 
-export function closeDb(): void {
-  if (db) {
-    db.close();
-    db = undefined!;
+export async function closeDb(): Promise<void> {
+  if (backend) {
+    await backend.close();
+    backend = undefined;
   }
+}
+
+/**
+ * Test/migration helper: the active Backend (or undefined). Lets the migration
+ * tool and parity tests reach the low-level adapter without re-deriving it.
+ */
+export function getBackend(): Backend | undefined {
+  return backend;
 }

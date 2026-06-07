@@ -10,10 +10,10 @@ const FIXTURES = path.join(__dirname, "fixtures");
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-fine-test-"));
 });
-afterEach(() => {
+afterEach(async () => {
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
@@ -29,7 +29,7 @@ function copyFixtureToSessions(fixture: string): void {
 }
 
 describe("splitCacheCreation", () => {
-  it("reads ephemeral 5m/1h sub-fields when present", () => {
+  it("reads ephemeral 5m/1h sub-fields when present", async () => {
     const { c5m, c1h } = splitCacheCreation({
       cache_creation: { ephemeral_5m_input_tokens: 1500, ephemeral_1h_input_tokens: 500 },
       cache_creation_input_tokens: 2000,
@@ -38,7 +38,7 @@ describe("splitCacheCreation", () => {
     expect(c1h).toBe(500);
   });
 
-  it("falls back to lumping the flat total into 5m when sub-fields absent", () => {
+  it("falls back to lumping the flat total into 5m when sub-fields absent", async () => {
     const { c5m, c1h } = splitCacheCreation({ cache_creation_input_tokens: 700 });
     expect(c5m).toBe(700);
     expect(c1h).toBe(0);

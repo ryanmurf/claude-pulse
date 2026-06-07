@@ -35,80 +35,80 @@ import {
 let tmpDir: string;
 let LA: number;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-test-"));
   const dbPath = path.join(tmpDir, "test.db");
-  initDb(dbPath);
-  LA = localAccountId();
+  await initDb(dbPath);
+  LA = await localAccountId();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe("initDb", () => {
-  it("creates tables without error", () => {
+  it("creates tables without error", async () => {
     // initDb already called in beforeEach — just verify a profile can be inserted
-    const profile = addProfile("test-profile", "/tmp/test", 5);
+    const profile = await addProfile("test-profile", "/tmp/test", 5);
     expect(profile).toBeDefined();
     expect(profile.name).toBe("test-profile");
   });
 });
 
 describe("ensureDefaultProfiles", () => {
-  it("creates claude-hd and claude-max profiles", () => {
-    ensureDefaultProfiles();
-    const profiles = listProfiles();
+  it("creates claude-hd and claude-max profiles", async () => {
+    await ensureDefaultProfiles();
+    const profiles = await listProfiles();
     const names = profiles.map((p) => p.name);
     expect(names).toContain("claude-hd");
     expect(names).toContain("claude-max");
   });
 
-  it("is idempotent — calling twice does not duplicate", () => {
-    ensureDefaultProfiles();
-    ensureDefaultProfiles();
-    const profiles = listProfiles();
+  it("is idempotent — calling twice does not duplicate", async () => {
+    await ensureDefaultProfiles();
+    await ensureDefaultProfiles();
+    const profiles = await listProfiles();
     const hdCount = profiles.filter((p) => p.name === "claude-hd").length;
     expect(hdCount).toBe(1);
   });
 });
 
 describe("addProfile / getProfile / removeProfile", () => {
-  it("adds and retrieves a profile", () => {
-    const profile = addProfile("my-profile", "/home/user/.claude-custom", 10);
+  it("adds and retrieves a profile", async () => {
+    const profile = await addProfile("my-profile", "/home/user/.claude-custom", 10);
     expect(profile.name).toBe("my-profile");
     expect(profile.config_dir).toBe("/home/user/.claude-custom");
     expect(profile.poll_interval_minutes).toBe(10);
 
-    const fetched = getProfile("my-profile");
+    const fetched = await getProfile("my-profile");
     expect(fetched).toBeDefined();
     expect(fetched!.name).toBe("my-profile");
   });
 
-  it("returns undefined for non-existent profile", () => {
-    const result = getProfile("does-not-exist");
+  it("returns undefined for non-existent profile", async () => {
+    const result = await getProfile("does-not-exist");
     expect(result).toBeUndefined();
   });
 
-  it("removes a profile", () => {
-    addProfile("to-remove", "/tmp/remove", 5);
-    const removed = removeProfile("to-remove");
+  it("removes a profile", async () => {
+    await addProfile("to-remove", "/tmp/remove", 5);
+    const removed = await removeProfile("to-remove");
     expect(removed).toBe(true);
 
-    const fetched = getProfile("to-remove");
+    const fetched = await getProfile("to-remove");
     expect(fetched).toBeUndefined();
   });
 
-  it("returns false when removing non-existent profile", () => {
-    const removed = removeProfile("ghost");
+  it("returns false when removing non-existent profile", async () => {
+    const removed = await removeProfile("ghost");
     expect(removed).toBe(false);
   });
 });
 
 describe("redactProfile", () => {
-  it("masks stored API keys and preserves null keys", () => {
-    const profileWithKey = addProfile(
+  it("masks stored API keys and preserves null keys", async () => {
+    const profileWithKey = await addProfile(
       "with-key",
       "/tmp/with-key",
       5,
@@ -116,7 +116,7 @@ describe("redactProfile", () => {
       10,
       "sk-secret"
     );
-    const profileWithoutKey = addProfile("without-key", "/tmp/without-key", 5);
+    const profileWithoutKey = await addProfile("without-key", "/tmp/without-key", 5);
 
     expect(redactProfile(profileWithKey).api_key).toBe("***");
     expect(redactProfile(profileWithoutKey).api_key).toBeNull();
@@ -124,9 +124,9 @@ describe("redactProfile", () => {
 });
 
 describe("insertSnapshot / getLatestSnapshot / getHistory", () => {
-  it("inserts and retrieves a snapshot", () => {
-    addProfile("snap-test", "/tmp/snap", 5);
-    const snapshot = insertSnapshot(
+  it("inserts and retrieves a snapshot", async () => {
+    await addProfile("snap-test", "/tmp/snap", 5);
+    const snapshot = await insertSnapshot(
       "snap-test",
       45.2,
       "2026-03-25T18:00:00Z",
@@ -141,31 +141,31 @@ describe("insertSnapshot / getLatestSnapshot / getHistory", () => {
     expect(snapshot.seven_day_pct).toBeCloseTo(30.1);
   });
 
-  it("getLatestSnapshot returns the most recent snapshot", () => {
-    addProfile("latest-test", "/tmp/latest", 5);
-    insertSnapshot("latest-test", 10.0, null, 20.0, null, null);
-    insertSnapshot("latest-test", 50.0, null, 60.0, null, null);
+  it("getLatestSnapshot returns the most recent snapshot", async () => {
+    await addProfile("latest-test", "/tmp/latest", 5);
+    await insertSnapshot("latest-test", 10.0, null, 20.0, null, null);
+    await insertSnapshot("latest-test", 50.0, null, 60.0, null, null);
 
-    const latest = getLatestSnapshot("latest-test");
+    const latest = await getLatestSnapshot("latest-test");
     expect(latest).toBeDefined();
     expect(latest!.five_hour_pct).toBeCloseTo(50.0);
     expect(latest!.seven_day_pct).toBeCloseTo(60.0);
   });
 
-  it("getLatestSnapshot returns undefined when no snapshots exist", () => {
-    addProfile("empty-profile", "/tmp/empty", 5);
-    const result = getLatestSnapshot("empty-profile");
+  it("getLatestSnapshot returns undefined when no snapshots exist", async () => {
+    await addProfile("empty-profile", "/tmp/empty", 5);
+    const result = await getLatestSnapshot("empty-profile");
     expect(result).toBeUndefined();
   });
 
-  it("getLatestSnapshots returns one per profile", () => {
-    addProfile("p1", "/tmp/p1", 5);
-    addProfile("p2", "/tmp/p2", 5);
-    insertSnapshot("p1", 10, null, 20, null, null);
-    insertSnapshot("p1", 30, null, 40, null, null);
-    insertSnapshot("p2", 50, null, 60, null, null);
+  it("getLatestSnapshots returns one per profile", async () => {
+    await addProfile("p1", "/tmp/p1", 5);
+    await addProfile("p2", "/tmp/p2", 5);
+    await insertSnapshot("p1", 10, null, 20, null, null);
+    await insertSnapshot("p1", 30, null, 40, null, null);
+    await insertSnapshot("p2", 50, null, 60, null, null);
 
-    const latest = getLatestSnapshots();
+    const latest = await getLatestSnapshots();
     // Each profile should have at most one entry
     const p1snaps = latest.filter((s) => s.profile === "p1");
     const p2snaps = latest.filter((s) => s.profile === "p2");
@@ -179,55 +179,55 @@ describe("insertSnapshot / getLatestSnapshot / getHistory", () => {
     expect(p2snaps[0].five_hour_pct).toBeCloseTo(50);
   });
 
-  it("getHistory returns snapshots within time window", () => {
-    addProfile("hist-test", "/tmp/hist", 5);
-    insertSnapshot("hist-test", 10, null, 20, null, null);
-    insertSnapshot("hist-test", 30, null, 40, null, null);
-    insertSnapshot("hist-test", 50, null, 60, null, null);
+  it("getHistory returns snapshots within time window", async () => {
+    await addProfile("hist-test", "/tmp/hist", 5);
+    await insertSnapshot("hist-test", 10, null, 20, null, null);
+    await insertSnapshot("hist-test", 30, null, 40, null, null);
+    await insertSnapshot("hist-test", 50, null, 60, null, null);
 
-    const history = getHistory("hist-test", 24, 100);
+    const history = await getHistory("hist-test", 24, 100);
     expect(history.length).toBe(3);
     // Should be ordered DESC by polled_at
     expect(history[0].five_hour_pct).toBeCloseTo(50);
   });
 
-  it("getHistory respects limit", () => {
-    addProfile("lim-test", "/tmp/lim", 5);
+  it("getHistory respects limit", async () => {
+    await addProfile("lim-test", "/tmp/lim", 5);
     for (let i = 0; i < 10; i++) {
-      insertSnapshot("lim-test", i * 10, null, i * 5, null, null);
+      await insertSnapshot("lim-test", i * 10, null, i * 5, null, null);
     }
 
-    const history = getHistory("lim-test", 24, 3);
+    const history = await getHistory("lim-test", 24, 3);
     expect(history).toHaveLength(3);
   });
 });
 
 describe("getLastSuccessfulSnapshot", () => {
-  it("returns the most recent snapshot with non-null resets_at", () => {
-    addProfile("resume-test", "/tmp/resume", 5);
-    insertSnapshot("resume-test", 45.0, "2026-03-25T18:00:00Z", 30.0, "2026-03-30T00:00:00Z", null);
+  it("returns the most recent snapshot with non-null resets_at", async () => {
+    await addProfile("resume-test", "/tmp/resume", 5);
+    await insertSnapshot("resume-test", 45.0, "2026-03-25T18:00:00Z", 30.0, "2026-03-30T00:00:00Z", null);
     // A later failed snapshot with null values
-    insertSnapshot("resume-test", null, null, null, null, '{"error":"rate limit"}');
+    await insertSnapshot("resume-test", null, null, null, null, '{"error":"rate limit"}');
 
-    const last = getLastSuccessfulSnapshot("resume-test");
+    const last = await getLastSuccessfulSnapshot("resume-test");
     expect(last).toBeDefined();
     expect(last!.five_hour_pct).toBeCloseTo(45.0);
     expect(last!.five_hour_resets_at).toBe("2026-03-25T18:00:00Z");
   });
 
-  it("returns undefined when no successful snapshots exist", () => {
-    addProfile("no-success", "/tmp/nosuccess", 5);
-    insertSnapshot("no-success", null, null, null, null, '{"error":"auth"}');
+  it("returns undefined when no successful snapshots exist", async () => {
+    await addProfile("no-success", "/tmp/nosuccess", 5);
+    await insertSnapshot("no-success", null, null, null, null, '{"error":"auth"}');
 
-    const last = getLastSuccessfulSnapshot("no-success");
+    const last = await getLastSuccessfulSnapshot("no-success");
     expect(last).toBeUndefined();
   });
 
-  it("returns snapshot with only one resets_at present", () => {
-    addProfile("partial-reset", "/tmp/partial", 5);
-    insertSnapshot("partial-reset", 60.0, "2026-03-25T20:00:00Z", null, null, null);
+  it("returns snapshot with only one resets_at present", async () => {
+    await addProfile("partial-reset", "/tmp/partial", 5);
+    await insertSnapshot("partial-reset", 60.0, "2026-03-25T20:00:00Z", null, null, null);
 
-    const last = getLastSuccessfulSnapshot("partial-reset");
+    const last = await getLastSuccessfulSnapshot("partial-reset");
     expect(last).toBeDefined();
     expect(last!.five_hour_resets_at).toBe("2026-03-25T20:00:00Z");
     expect(last!.seven_day_resets_at).toBeNull();
@@ -235,8 +235,8 @@ describe("getLastSuccessfulSnapshot", () => {
 });
 
 describe("gemini quota snapshots", () => {
-  it("inserts and returns latest Gemini quota per model", () => {
-    insertGeminiQuotaSnapshots([
+  it("inserts and returns latest Gemini quota per model", async () => {
+    await insertGeminiQuotaSnapshots([
       {
         modelId: "gemini-2.5-pro",
         remainingFraction: 0.73,
@@ -250,7 +250,7 @@ describe("gemini quota snapshots", () => {
         resetTime: "2026-05-04T07:00:00Z",
       },
     ]);
-    insertGeminiQuotaSnapshots([
+    await insertGeminiQuotaSnapshots([
       {
         modelId: "gemini-2.5-pro",
         remainingFraction: 0.2,
@@ -259,7 +259,7 @@ describe("gemini quota snapshots", () => {
       },
     ]);
 
-    const latest = getLatestGeminiQuota();
+    const latest = await getLatestGeminiQuota();
     expect(latest).toHaveLength(2);
     expect(latest.find((q) => q.model_id === "gemini-2.5-pro")!.remaining_fraction).toBeCloseTo(0.2);
     expect(latest.find((q) => q.model_id === "gemini-2.5-flash")!.remaining_fraction).toBeCloseTo(0.5);
@@ -267,9 +267,9 @@ describe("gemini quota snapshots", () => {
 });
 
 describe("alert subscriptions", () => {
-  it("creates and lists alert subscriptions", () => {
-    addProfile("alert-prof", "/tmp/alert", 5);
-    const sub = createAlertSubscription(
+  it("creates and lists alert subscriptions", async () => {
+    await addProfile("alert-prof", "/tmp/alert", 5);
+    const sub = await createAlertSubscription(
       LA,
       "alert-prof",
       "five_hour_threshold",
@@ -285,24 +285,24 @@ describe("alert subscriptions", () => {
     expect(sub.cooldown_minutes).toBe(30);
     expect(sub.enabled).toBe(1);
 
-    const subs = listAlertSubscriptions(LA, "alert-prof");
+    const subs = await listAlertSubscriptions(LA, "alert-prof");
     expect(subs).toHaveLength(1);
     expect(subs[0].id).toBe(sub.id);
   });
 
-  it("lists all subscriptions when no profile filter", () => {
-    addProfile("p1", "/tmp/p1", 5);
-    addProfile("p2", "/tmp/p2", 5);
-    createAlertSubscription(LA, "p1", "five_hour_threshold", 80, null, 30);
-    createAlertSubscription(LA, "p2", "seven_day_threshold", 70, null, 60);
+  it("lists all subscriptions when no profile filter", async () => {
+    await addProfile("p1", "/tmp/p1", 5);
+    await addProfile("p2", "/tmp/p2", 5);
+    await createAlertSubscription(LA, "p1", "five_hour_threshold", 80, null, 30);
+    await createAlertSubscription(LA, "p2", "seven_day_threshold", 70, null, 60);
 
-    const all = listAlertSubscriptions(LA);
+    const all = await listAlertSubscriptions(LA);
     expect(all).toHaveLength(2);
   });
 
-  it("removes an alert subscription", () => {
-    addProfile("rm-alert", "/tmp/rm", 5);
-    const sub = createAlertSubscription(
+  it("removes an alert subscription", async () => {
+    await addProfile("rm-alert", "/tmp/rm", 5);
+    const sub = await createAlertSubscription(
       LA,
       "rm-alert",
       "auth_failure",
@@ -311,23 +311,23 @@ describe("alert subscriptions", () => {
       15
     );
 
-    const removed = removeAlertSubscription(LA, sub.id);
+    const removed = await removeAlertSubscription(LA, sub.id);
     expect(removed).toBe(true);
 
-    const remaining = listAlertSubscriptions(LA, "rm-alert");
+    const remaining = await listAlertSubscriptions(LA, "rm-alert");
     expect(remaining).toHaveLength(0);
   });
 
-  it("returns false when removing non-existent subscription", () => {
-    const removed = removeAlertSubscription(LA, 9999);
+  it("returns false when removing non-existent subscription", async () => {
+    const removed = await removeAlertSubscription(LA, 9999);
     expect(removed).toBe(false);
   });
 });
 
 describe("alert events", () => {
-  it("creates and retrieves alert events", () => {
-    addProfile("evt-prof", "/tmp/evt", 5);
-    const sub = createAlertSubscription(
+  it("creates and retrieves alert events", async () => {
+    await addProfile("evt-prof", "/tmp/evt", 5);
+    const sub = await createAlertSubscription(
       LA,
       "evt-prof",
       "five_hour_threshold",
@@ -336,7 +336,7 @@ describe("alert events", () => {
       30
     );
 
-    const event = createAlertEvent(
+    const event = await createAlertEvent(
       LA,
       sub.id,
       "evt-prof",
@@ -351,14 +351,14 @@ describe("alert events", () => {
     expect(event.profile).toBe("evt-prof");
     expect(event.acknowledged).toBe(0);
 
-    const triggered = getTriggeredAlerts(LA, "evt-prof", 24, false);
+    const triggered = await getTriggeredAlerts(LA, "evt-prof", 24, false);
     expect(triggered).toHaveLength(1);
     expect(triggered[0].id).toBe(event.id);
   });
 
-  it("acknowledges a single alert", () => {
-    addProfile("ack-prof", "/tmp/ack", 5);
-    const sub = createAlertSubscription(
+  it("acknowledges a single alert", async () => {
+    await addProfile("ack-prof", "/tmp/ack", 5);
+    const sub = await createAlertSubscription(
       LA,
       "ack-prof",
       "five_hour_threshold",
@@ -366,7 +366,7 @@ describe("alert events", () => {
       null,
       30
     );
-    const event = createAlertEvent(
+    const event = await createAlertEvent(
       LA,
       sub.id,
       "ack-prof",
@@ -376,20 +376,20 @@ describe("alert events", () => {
       90
     );
 
-    const acked = acknowledgeAlert(LA, event.id);
+    const acked = await acknowledgeAlert(LA, event.id);
     expect(acked).toBe(true);
 
     // Second ack should return false
-    const acked2 = acknowledgeAlert(LA, event.id);
+    const acked2 = await acknowledgeAlert(LA, event.id);
     expect(acked2).toBe(false);
 
-    const unacked = getTriggeredAlerts(LA, "ack-prof", 24, true);
+    const unacked = await getTriggeredAlerts(LA, "ack-prof", 24, true);
     expect(unacked).toHaveLength(0);
   });
 
-  it("acknowledges all alerts for a profile", () => {
-    addProfile("ack-all", "/tmp/ackall", 5);
-    const sub = createAlertSubscription(
+  it("acknowledges all alerts for a profile", async () => {
+    await addProfile("ack-all", "/tmp/ackall", 5);
+    const sub = await createAlertSubscription(
       LA,
       "ack-all",
       "five_hour_threshold",
@@ -397,31 +397,31 @@ describe("alert events", () => {
       null,
       30
     );
-    createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A1", 91, 90);
-    createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A2", 93, 90);
+    await createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A1", 91, 90);
+    await createAlertEvent(LA, sub.id, "ack-all", "five_hour_threshold", "A2", 93, 90);
 
-    const count = acknowledgeAllAlerts(LA, "ack-all");
+    const count = await acknowledgeAllAlerts(LA, "ack-all");
     expect(count).toBe(2);
 
-    const unacked = getTriggeredAlerts(LA, "ack-all", 24, true);
+    const unacked = await getTriggeredAlerts(LA, "ack-all", 24, true);
     expect(unacked).toHaveLength(0);
   });
 
-  it("acknowledges all alerts across all profiles", () => {
-    addProfile("aa1", "/tmp/aa1", 5);
-    addProfile("aa2", "/tmp/aa2", 5);
-    const sub1 = createAlertSubscription(LA, "aa1", "five_hour_threshold", 90, null, 30);
-    const sub2 = createAlertSubscription(LA, "aa2", "seven_day_threshold", 80, null, 30);
-    createAlertEvent(LA, sub1.id, "aa1", "five_hour_threshold", "X", 95, 90);
-    createAlertEvent(LA, sub2.id, "aa2", "seven_day_threshold", "Y", 85, 80);
+  it("acknowledges all alerts across all profiles", async () => {
+    await addProfile("aa1", "/tmp/aa1", 5);
+    await addProfile("aa2", "/tmp/aa2", 5);
+    const sub1 = await createAlertSubscription(LA, "aa1", "five_hour_threshold", 90, null, 30);
+    const sub2 = await createAlertSubscription(LA, "aa2", "seven_day_threshold", 80, null, 30);
+    await createAlertEvent(LA, sub1.id, "aa1", "five_hour_threshold", "X", 95, 90);
+    await createAlertEvent(LA, sub2.id, "aa2", "seven_day_threshold", "Y", 85, 80);
 
-    const count = acknowledgeAllAlerts(LA);
+    const count = await acknowledgeAllAlerts(LA);
     expect(count).toBe(2);
   });
 
-  it("filters triggered alerts by unacknowledged_only", () => {
-    addProfile("filter-prof", "/tmp/filter", 5);
-    const sub = createAlertSubscription(
+  it("filters triggered alerts by unacknowledged_only", async () => {
+    await addProfile("filter-prof", "/tmp/filter", 5);
+    const sub = await createAlertSubscription(
       LA,
       "filter-prof",
       "five_hour_threshold",
@@ -429,29 +429,29 @@ describe("alert events", () => {
       null,
       30
     );
-    const e1 = createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E1", 91, 90);
-    createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E2", 95, 90);
+    const e1 = await createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E1", 91, 90);
+    await createAlertEvent(LA, sub.id, "filter-prof", "five_hour_threshold", "E2", 95, 90);
 
-    acknowledgeAlert(LA, e1.id);
+    await acknowledgeAlert(LA, e1.id);
 
-    const unacked = getTriggeredAlerts(LA, "filter-prof", 24, true);
+    const unacked = await getTriggeredAlerts(LA, "filter-prof", 24, true);
     expect(unacked).toHaveLength(1);
     expect(unacked[0].message).toBe("E2");
   });
 });
 
 describe("updatePollInterval", () => {
-  it("updates poll interval for existing profile", () => {
-    addProfile("interval-test", "/tmp/interval", 5);
-    const updated = updatePollInterval("interval-test", 15);
+  it("updates poll interval for existing profile", async () => {
+    await addProfile("interval-test", "/tmp/interval", 5);
+    const updated = await updatePollInterval("interval-test", 15);
     expect(updated).toBe(true);
 
-    const profile = getProfile("interval-test");
+    const profile = await getProfile("interval-test");
     expect(profile!.poll_interval_minutes).toBe(15);
   });
 
-  it("returns false for non-existent profile", () => {
-    const updated = updatePollInterval("no-such-profile", 10);
+  it("returns false for non-existent profile", async () => {
+    const updated = await updatePollInterval("no-such-profile", 10);
     expect(updated).toBe(false);
   });
 });
@@ -473,46 +473,46 @@ describe("token rollups", () => {
     };
   }
 
-  it("upserts and reads back a rollup", () => {
-    upsertTokenRollup(row());
-    const rows = getTokenRollups();
+  it("upserts and reads back a rollup", async () => {
+    await upsertTokenRollup(row());
+    const rows = await getTokenRollups();
     expect(rows.length).toBe(1);
     expect(rows[0].input_tokens).toBe(100);
     expect(rows[0].source).toBe("local");
   });
 
-  it("ON CONFLICT replaces counts for same (profile,host,day,model)", () => {
-    upsertTokenRollup(row({ input_tokens: 100 }));
-    upsertTokenRollup(row({ input_tokens: 999, cost_usd: 9 }));
-    const rows = getTokenRollups();
+  it("ON CONFLICT replaces counts for same (profile,host,day,model)", async () => {
+    await upsertTokenRollup(row({ input_tokens: 100 }));
+    await upsertTokenRollup(row({ input_tokens: 999, cost_usd: 9 }));
+    const rows = await getTokenRollups();
     expect(rows.length).toBe(1);
     expect(rows[0].input_tokens).toBe(999);
     expect(rows[0].cost_usd).toBe(9);
   });
 
-  it("keeps separate rows per host", () => {
-    upsertTokenRollup(row({ host: "tron" }));
-    upsertTokenRollup(row({ host: "laptop" }));
-    expect(getTokenRollups().length).toBe(2);
-    expect(getTokenRollups({ host: "laptop" }).length).toBe(1);
+  it("keeps separate rows per host", async () => {
+    await upsertTokenRollup(row({ host: "tron" }));
+    await upsertTokenRollup(row({ host: "laptop" }));
+    expect((await getTokenRollups()).length).toBe(2);
+    expect((await getTokenRollups({ host: "laptop" })).length).toBe(1);
   });
 
-  it("filters by sinceDay and profile", () => {
-    upsertTokenRollup(row({ day: "2026-05-01" }));
-    upsertTokenRollup(row({ day: "2026-06-05" }));
-    upsertTokenRollup(row({ profile: "claude-hd", day: "2026-06-05", model: "claude-sonnet-4-6" }));
-    expect(getTokenRollups({ sinceDay: "2026-06-01" }).length).toBe(2);
-    expect(getTokenRollups({ profile: "claude-hd" }).length).toBe(1);
+  it("filters by sinceDay and profile", async () => {
+    await upsertTokenRollup(row({ day: "2026-05-01" }));
+    await upsertTokenRollup(row({ day: "2026-06-05" }));
+    await upsertTokenRollup(row({ profile: "claude-hd", day: "2026-06-05", model: "claude-sonnet-4-6" }));
+    expect((await getTokenRollups({ sinceDay: "2026-06-01" })).length).toBe(2);
+    expect((await getTokenRollups({ profile: "claude-hd" })).length).toBe(1);
   });
 
-  it("getTokenReport aggregates per profile with host + day breakdown and grand total", () => {
+  it("getTokenReport aggregates per profile with host + day breakdown and grand total", async () => {
     const today = new Date().toISOString().slice(0, 10);
     const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
-    upsertTokenRollup(row({ host: "tron", day: today, input_tokens: 100, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 2 }));
-    upsertTokenRollup(row({ host: "laptop", day: today, input_tokens: 50, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 1 }));
-    upsertTokenRollup(row({ host: "tron", day: yesterday, input_tokens: 25, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 0.5 }));
+    await upsertTokenRollup(row({ host: "tron", day: today, input_tokens: 100, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 2 }));
+    await upsertTokenRollup(row({ host: "laptop", day: today, input_tokens: 50, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 1 }));
+    await upsertTokenRollup(row({ host: "tron", day: yesterday, input_tokens: 25, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: 0.5 }));
 
-    const report = getTokenReport({ granularity: "daily", days: 30 });
+    const report = await getTokenReport({ granularity: "daily", days: 30 });
     expect(report.profiles.length).toBe(1);
     const p = report.profiles[0];
     expect(p.profile).toBe("claude-max");
@@ -524,12 +524,12 @@ describe("token rollups", () => {
     expect(report.total.cost_usd).toBeCloseTo(3.5, 6);
   });
 
-  it("weekly granularity buckets days into ISO weeks", () => {
+  it("weekly granularity buckets days into ISO weeks", async () => {
     const today = new Date().toISOString().slice(0, 10);
     const sixDaysAgo = new Date(Date.now() - 6 * 86_400_000).toISOString().slice(0, 10);
-    upsertTokenRollup(row({ day: today, model: "m1" }));
-    upsertTokenRollup(row({ day: sixDaysAgo, model: "m2" }));
-    const report = getTokenReport({ granularity: "weekly", days: 30 });
+    await upsertTokenRollup(row({ day: today, model: "m1" }));
+    await upsertTokenRollup(row({ day: sixDaysAgo, model: "m2" }));
+    const report = await getTokenReport({ granularity: "weekly", days: 30 });
     // 7-day span may straddle 1 or 2 ISO weeks; just assert bucketing doesn't explode per-day.
     expect(report.profiles[0].by_day.length).toBeLessThanOrEqual(2);
     expect(report.granularity).toBe("weekly");

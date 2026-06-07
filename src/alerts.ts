@@ -17,13 +17,13 @@ function log(msg: string): void {
  * `onlyTypes` optionally restricts evaluation to a subset (e.g. ["context_threshold"]
  * when called from the fast context-only poller so we don't double-evaluate 5h/7d).
  */
-export function checkAlerts(
+export async function checkAlerts(
   accountId: number,
   profile: string,
   snapshot: UsageSnapshot,
   onlyTypes?: import("./types.js").AlertType[],
-): AlertEvent[] {
-  const subscriptions = getEnabledAlertSubscriptions(accountId, profile);
+): Promise<AlertEvent[]> {
+  const subscriptions = await getEnabledAlertSubscriptions(accountId, profile);
   const triggered: AlertEvent[] = [];
 
   for (const sub of subscriptions) {
@@ -86,7 +86,7 @@ export function checkAlerts(
     if (!shouldAlert) continue;
 
     // Check cooldown: skip if last alert for this subscription is within cooldown window
-    const lastEvent = getLastAlertEvent(sub.id);
+    const lastEvent = await getLastAlertEvent(sub.id);
     if (lastEvent) {
       const lastTriggered = new Date(lastEvent.triggered_at + "Z").getTime();
       const cooldownMs = sub.cooldown_minutes * 60 * 1000;
@@ -100,7 +100,7 @@ export function checkAlerts(
     }
 
     // Create the alert event (attributed to the owning account)
-    const event = createAlertEvent(
+    const event = await createAlertEvent(
       accountId,
       sub.id,
       profile,

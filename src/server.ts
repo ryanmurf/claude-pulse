@@ -182,15 +182,15 @@ interface CountCacheEntry { value: number; at: number; }
 const tokenRowCountCache = new Map<number, CountCacheEntry>();
 const contextRowCountCache = new Map<number, CountCacheEntry>();
 
-function cachedCount(
+async function cachedCount(
   cache: Map<number, CountCacheEntry>,
   accountId: number,
-  compute: () => number,
-): number {
+  compute: () => Promise<number>,
+): Promise<number> {
   const now = Date.now();
   const hit = cache.get(accountId);
   if (hit && now - hit.at < COUNT_CACHE_TTL_MS) return hit.value;
-  const value = compute();
+  const value = await compute();
   cache.set(accountId, { value, at: now });
   return value;
 }
@@ -206,7 +206,7 @@ export function _resetCapCaches(): void {
  * accounts (the local/DEFAULT account) report `exempt: true` and their caps as
  * null (effectively unlimited). Bypasses the count cache for an accurate read.
  */
-function accountLimits(account: Account): {
+async function accountLimits(account: Account): Promise<{
   exempt: boolean;
   token_rows: number;
   token_rows_cap: number | null;
@@ -215,15 +215,15 @@ function accountLimits(account: Account): {
   machines: number;
   machines_cap: number | null;
   max_rows_per_request: number;
-} {
+}> {
   const exempt = isExemptAccount(account);
   return {
     exempt,
-    token_rows: countTokenUsageRows(account.id),
+    token_rows: await countTokenUsageRows(account.id),
     token_rows_cap: exempt ? null : maxTokenRowsPerAccount(),
-    context_sessions: countContextSessions(account.id),
+    context_sessions: await countContextSessions(account.id),
     context_sessions_cap: exempt ? null : maxContextSessionsPerAccount(),
-    machines: countActiveIngestTokens(account.id),
+    machines: await countActiveIngestTokens(account.id),
     machines_cap: exempt ? null : maxTokensPerAccount(),
     max_rows_per_request: maxRowsPerRequest(),
   };
@@ -289,7 +289,7 @@ function header(req: IncomingMessage, name: string): string | undefined {
  *
  * A client-supplied email is NEVER honored except on the proxy-validated path.
  */
-function accountForRequest(req: IncomingMessage): Account {
+async function accountForRequest(req: IncomingMessage): Promise<Account> {
   const proxySecret = process.env.CLAUDE_PULSE_TRUSTED_PROXY_SECRET;
   const singleTenant = process.env.CLAUDE_PULSE_SINGLE_TENANT === "1";
 
@@ -345,14 +345,14 @@ function formatRemaining(ms: number): string {
   return rh > 0 ? `${days}d ${rh}h` : `${days}d`;
 }
 
-function computePace(accountId: number, profileFilter?: string): PaceInfo[] {
+async function computePace(accountId: number, profileFilter?: string): Promise<PaceInfo[]> {
   const results: PaceInfo[] = [];
   const names = profileFilter
     ? [profileFilter]
-    : listProfiles(accountId).map((p) => p.name);
+    : (await listProfiles(accountId)).map((p) => p.name);
 
   for (const name of names) {
-    const snap = getLatestSnapshot(name, accountId);
+    const snap = await getLatestSnapshot(name, accountId);
     if (!snap) continue;
 
     const windows = [
@@ -415,35 +415,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/profiles — only the requesting account's profiles (H2/L4)
     if (pathname === "/api/profiles" && method === "GET") {
-      const account = accountForRequest(req);
-      sendJson(res, listProfiles(account.id).map(redactProfile));
+      const account = await accountForRequest(req);
+      sendJson(res, (await listProfiles(account.id)).map(redactProfile));
       return;
     }
 
     // GET /api/me — account identity + this account's machines + cap usage
     if (pathname === "/api/me" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       sendJson(res, {
         account: account.identity,
         display_name: account.display_name,
-        machines: listMachines(account.id),
-        limits: accountLimits(account),
+        machines: await listMachines(account.id),
+        limits: await accountLimits(account),
       });
       return;
     }
 
     // GET /api/limits — current usage vs per-account caps (for the dashboard)
     if (pathname === "/api/limits" && method === "GET") {
-      const account = accountForRequest(req);
-      sendJson(res, accountLimits(account));
+      const account = await accountForRequest(req);
+      sendJson(res, await accountLimits(account));
       return;
     }
 
     // GET /api/usage — account-scoped 5h/7d per profile
     if (pathname === "/api/usage" && method === "GET") {
-      const account = accountForRequest(req);
-      const snapshots = getLatestSnapshots(account.id);
-      const profiles = listProfiles(account.id);
+      const account = await accountForRequest(req);
+      const snapshots = await getLatestSnapshots(account.id);
+      const profiles = await listProfiles(account.id);
       const result = profiles.map((p) => {
         const snap = snapshots.find((s) => s.profile === p.name);
         return {
@@ -461,34 +461,34 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/gemini-quota
     if (pathname === "/api/gemini-quota" && method === "GET") {
-      sendJson(res, formatGeminiQuotaSnapshots(getLatestGeminiQuota()));
+      sendJson(res, formatGeminiQuotaSnapshots(await getLatestGeminiQuota()));
       return;
     }
 
     // GET /api/history?profile=X&hours=24
     if (pathname === "/api/history" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const profile = url.searchParams.get("profile");
       if (!profile) { sendError(res, 400, "Missing profile parameter"); return; }
       const hours = parseInt(url.searchParams.get("hours") || "24", 10);
       const limit = parseInt(url.searchParams.get("limit") || "100", 10);
-      sendJson(res, getHistory(profile, hours, limit, account.id));
+      sendJson(res, await getHistory(profile, hours, limit, account.id));
       return;
     }
 
     // GET /api/pace
     if (pathname === "/api/pace" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
-      sendJson(res, computePace(account.id, profile));
+      sendJson(res, await computePace(account.id, profile));
       return;
     }
 
     // GET /api/context — live multi-machine context sessions grouped
     // profile → machine → session, excluding >1-day-stale.
     if (pathname === "/api/context" && method === "GET") {
-      const account = accountForRequest(req);
-      const sessions = getActiveContextSessions(account.id);
+      const account = await accountForRequest(req);
+      const sessions = await getActiveContextSessions(account.id);
       // Group profile → machine → session[]
       const byProfile = new Map<string, Map<string, unknown[]>>();
       for (const s of sessions) {
@@ -517,24 +517,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/alerts — scoped to the requesting account (H1/H3)
     if (pathname === "/api/alerts" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
       const hours = parseInt(url.searchParams.get("hours") || "24", 10);
       const unacked = url.searchParams.get("unacknowledged_only") === "true";
-      sendJson(res, getTriggeredAlerts(account.id, profile, hours, unacked));
+      sendJson(res, await getTriggeredAlerts(account.id, profile, hours, unacked));
       return;
     }
 
     // POST /api/alerts/acknowledge — by-id path verifies account ownership (IDOR fix)
     if (pathname === "/api/alerts/acknowledge" && method === "POST") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const body = JSON.parse(await readBody(req));
       if (body.id !== undefined) {
-        const ok = acknowledgeAlert(account.id, body.id);
+        const ok = await acknowledgeAlert(account.id, body.id);
         if (!ok) { sendError(res, 404, "Alert not found"); return; }
         sendJson(res, { success: true });
       } else {
-        const count = acknowledgeAllAlerts(account.id, body.profile || undefined);
+        const count = await acknowledgeAllAlerts(account.id, body.profile || undefined);
         sendJson(res, { success: true, count });
       }
       return;
@@ -542,15 +542,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/subscriptions — scoped to the requesting account (H1/H3)
     if (pathname === "/api/subscriptions" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const profile = url.searchParams.get("profile") || undefined;
-      sendJson(res, listAlertSubscriptions(account.id, profile));
+      sendJson(res, await listAlertSubscriptions(account.id, profile));
       return;
     }
 
     // POST /api/subscriptions
     if (pathname === "/api/subscriptions" && method === "POST") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const body = JSON.parse(await readBody(req));
       if (!body.profile || !body.alert_type) {
         sendError(res, 400, "Missing profile or alert_type");
@@ -558,7 +558,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       }
       // Profile lookup is scoped to the caller's account — can't subscribe to
       // another account's profile.
-      if (!getProfile(body.profile, account.id)) {
+      if (!(await getProfile(body.profile, account.id))) {
         sendError(res, 404, `Profile "${body.profile}" not found`);
         return;
       }
@@ -567,7 +567,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         sendError(res, 400, "Threshold required for threshold alerts");
         return;
       }
-      const sub = createAlertSubscription(
+      const sub = await createAlertSubscription(
         account.id,
         body.profile,
         body.alert_type as AlertType,
@@ -581,10 +581,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // DELETE /api/subscriptions/:id — verifies ownership (IDOR fix: 404 on mismatch)
     if (pathname.startsWith("/api/subscriptions/") && method === "DELETE") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const id = parseInt(pathname.split("/").pop()!, 10);
       if (isNaN(id)) { sendError(res, 400, "Invalid subscription ID"); return; }
-      const ok = removeAlertSubscription(account.id, id);
+      const ok = await removeAlertSubscription(account.id, id);
       if (!ok) { sendError(res, 404, "Subscription not found"); return; }
       sendJson(res, { success: true });
       return;
@@ -592,7 +592,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET /api/reports?granularity=daily|weekly&days=30&drill=...&profile=...&machine=...
     if (pathname === "/api/reports" && method === "GET") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const granularityParam = url.searchParams.get("granularity");
       const granularity = granularityParam === "weekly" ? "weekly" : "daily";
       let days = parseInt(url.searchParams.get("days") || "30", 10);
@@ -605,7 +605,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           : "profile";
       const profile = url.searchParams.get("profile") || undefined;
       const machine = url.searchParams.get("machine") || undefined;
-      sendJson(res, getFineTokenReport({
+      sendJson(res, await getFineTokenReport({
         accountId: account.id,
         identity: account.identity,
         granularity,
@@ -619,19 +619,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET/POST/DELETE /api/ingest-tokens — mint/list/revoke (behind oauth).
     if (pathname === "/api/ingest-tokens" && method === "GET") {
-      const account = accountForRequest(req);
-      sendJson(res, listIngestTokens(account.id));
+      const account = await accountForRequest(req);
+      sendJson(res, await listIngestTokens(account.id));
       return;
     }
     if (pathname === "/api/ingest-tokens" && method === "POST") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const body = JSON.parse((await readBody(req)) || "{}");
       const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
       if (!machine) { sendError(res, 400, "Missing machine name"); return; }
       // M2 — per-account machine/token cap. The local/DEFAULT account is exempt.
       if (!isExemptAccount(account)) {
         const tokenCap = maxTokensPerAccount();
-        if (countActiveIngestTokens(account.id) >= tokenCap) {
+        if ((await countActiveIngestTokens(account.id)) >= tokenCap) {
           sendError(
             res,
             409,
@@ -640,7 +640,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           return;
         }
       }
-      const { plaintext, token } = mintIngestToken(account.id, machine);
+      const { plaintext, token } = await mintIngestToken(account.id, machine);
       // Plaintext shown ONCE — never stored, never retrievable again.
       sendJson(res, {
         id: token.id,
@@ -653,10 +653,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
     if (pathname.startsWith("/api/ingest-tokens/") && method === "DELETE") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const id = parseInt(pathname.split("/").pop()!, 10);
       if (isNaN(id)) { sendError(res, 400, "Invalid token ID"); return; }
-      sendJson(res, { success: revokeIngestToken(account.id, id) });
+      sendJson(res, { success: await revokeIngestToken(account.id, id) });
       return;
     }
 
@@ -673,7 +673,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         ? auth.slice(7).trim()
         : "";
       if (!bearer) { sendError(res, 401, "Missing bearer token"); return; }
-      const tokenRow = validateIngestToken(bearer);
+      const tokenRow = await validateIngestToken(bearer);
       if (!tokenRow) { sendError(res, 401, "Unauthorized"); return; }
 
       // M1 — per-token AND per-IP throttle (~60 req/min each). 429 when exceeded.
@@ -687,7 +687,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // Authoritative (account, machine) come from the token, not the body.
       const accountId = tokenRow.account_id;
       const machine = tokenRow.machine;
-      upsertMachine(accountId, machine);
+      await upsertMachine(accountId, machine);
 
       let raw: string;
       try {
@@ -711,7 +711,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // batches before doing any DB work. Exempt the local/DEFAULT account
       // (tron's backfill pushes whole-history in big chunks). The token's
       // account is authoritative; resolve its identity to check exemption.
-      const ingestAccount = getAccountById(accountId);
+      const ingestAccount = await getAccountById(accountId);
       const accountExempt = ingestAccount ? isExemptAccount(ingestAccount) : false;
       const rollupCount = Array.isArray(body?.rollups) ? body.rollups.length : 0;
       const contextCount = Array.isArray(body?.context) ? body.context.length : 0;
@@ -729,10 +729,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // brand-new keys with 429 (only unbounded growth is blocked).
       const tokenRowCap = maxTokenRowsPerAccount();
       const tokenRowsAtCap = !accountExempt &&
-        cachedCount(tokenRowCountCache, accountId, () => countTokenUsageRows(accountId)) >= tokenRowCap;
+        (await cachedCount(tokenRowCountCache, accountId, () => countTokenUsageRows(accountId))) >= tokenRowCap;
       const contextCap = maxContextSessionsPerAccount();
       const contextAtCap = !accountExempt &&
-        cachedCount(contextRowCountCache, accountId, () => countContextSessions(accountId)) >= contextCap;
+        (await cachedCount(contextRowCountCache, accountId, () => countContextSessions(accountId))) >= contextCap;
 
       let upserted = 0;
       let tokenRowsRejected = 0;
@@ -747,10 +747,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           const settings = (r.settings && typeof r.settings === "object") ? r.settings : {};
           const settings_json = canonicalSettings(settings);
           // When at the cap, only allow rows that UPDATE an existing key.
-          if (tokenRowsAtCap && !tokenUsageRowExists({
+          if (tokenRowsAtCap && !(await tokenUsageRowExists({
             account_id: accountId, profile, machine, session_id,
             model, settings_hash: settings_json, day,
-          })) {
+          }))) {
             tokenRowsRejected++;
             continue;
           }
@@ -770,7 +770,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             cache_read: toFiniteInt(r.cache_read),
             source: "ingest",
           };
-          upsertTokenUsage(usageRow);
+          await upsertTokenUsage(usageRow);
           upserted++;
         }
       }
@@ -784,9 +784,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           const session_id = typeof c.session_id === "string" && c.session_id ? c.session_id : "";
           if (!profile || !session_id) continue;
           // When at the cap, only allow rows that UPDATE an existing session.
-          if (contextAtCap && !contextSessionExists({
+          if (contextAtCap && !(await contextSessionExists({
             account_id: accountId, profile, machine, session_id,
-          })) {
+          }))) {
             contextRowsRejected++;
             continue;
           }
@@ -805,7 +805,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
               ? c.last_active_at
               : new Date().toISOString(),
           };
-          upsertContextSession(ctxRow);
+          await upsertContextSession(ctxRow);
           contextUpserted++;
         }
       }
@@ -850,13 +850,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // GET/PUT /api/pricing · DELETE /api/pricing/:model
     if (pathname === "/api/pricing" && method === "GET") {
-      const account = accountForRequest(req);
-      const merged = mergePricing(getPricingDefaults(), getPricingOverrides(account.id));
+      const account = await accountForRequest(req);
+      const merged = mergePricing(await getPricingDefaults(), await getPricingOverrides(account.id));
       sendJson(res, { account: account.identity, rows: merged });
       return;
     }
     if (pathname === "/api/pricing" && method === "PUT") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const body = JSON.parse((await readBody(req)) || "{}");
       const rows = Array.isArray(body?.rows) ? body.rows : (body && typeof body === "object" ? [body] : []);
       let saved = 0;
@@ -874,18 +874,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           cache_write_1h: toFiniteNum(r.cache_write_1h),
           cache_read: toFiniteNum(r.cache_read),
         };
-        upsertPricingOverride(account.id, override);
+        await upsertPricingOverride(account.id, override);
         saved++;
       }
-      const merged = mergePricing(getPricingDefaults(), getPricingOverrides(account.id));
+      const merged = mergePricing(await getPricingDefaults(), await getPricingOverrides(account.id));
       sendJson(res, { ok: true, saved, rows: merged });
       return;
     }
     if (pathname.startsWith("/api/pricing/") && method === "DELETE") {
-      const account = accountForRequest(req);
+      const account = await accountForRequest(req);
       const model = decodeURIComponent(pathname.slice("/api/pricing/".length));
       if (!model) { sendError(res, 400, "Missing model"); return; }
-      const removed = deletePricingOverride(account.id, model);
+      const removed = await deletePricingOverride(account.id, model);
       sendJson(res, { ok: true, removed });
       return;
     }

@@ -6,11 +6,11 @@ import { fetchCodexRateLimits } from "../src/usage.js";
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-usage-test-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

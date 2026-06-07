@@ -17,15 +17,15 @@ const mockFetchUsage = fetchUsage as ReturnType<typeof vi.fn>;
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-poller-test-"));
   const dbPath = path.join(tmpDir, "test.db");
-  initDb(dbPath);
-  addProfile("test-profile", "/tmp/test-config", 5);
+  await initDb(dbPath);
+  await addProfile("test-profile", "/tmp/test-config", 5);
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  await closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
   vi.restoreAllMocks();
 });
@@ -134,7 +134,7 @@ describe("pollProfile", () => {
 });
 
 describe("isRateLimitError", () => {
-  it("detects rate limit in error message", () => {
+  it("detects rate limit in error message", async () => {
     expect(isRateLimitError(new Error("rate limit exceeded"))).toBe(true);
     expect(isRateLimitError(new Error("Rate Limit reached"))).toBe(true);
     expect(isRateLimitError(new Error("too many requests"))).toBe(true);
@@ -146,7 +146,7 @@ describe("isRateLimitError", () => {
     expect(isRateLimitError(new Error("HTTP 429 Too Many Requests"))).toBe(true);
   });
 
-  it("returns false for non-rate-limit errors", () => {
+  it("returns false for non-rate-limit errors", async () => {
     expect(isRateLimitError(new Error("No OAuth tokens found"))).toBe(false);
     expect(isRateLimitError(new Error("ENOENT"))).toBe(false);
     expect(isRateLimitError(new Error("authentication failed"))).toBe(false);
@@ -154,7 +154,7 @@ describe("isRateLimitError", () => {
 });
 
 describe("auto-resume scheduling", () => {
-  afterEach(() => {
+  afterEach(async () => {
     cancelPendingResumes();
   });
 
@@ -185,7 +185,7 @@ describe("auto-resume scheduling", () => {
     expect(result.error).toContain("No OAuth tokens");
   });
 
-  it("deduplicates resume scheduling for same profile + resetsAt", () => {
+  it("deduplicates resume scheduling for same profile + resetsAt", async () => {
     const futureReset = new Date(Date.now() + 3_600_000).toISOString();
     // Calling twice should not throw or create duplicate timers
     scheduleWindowResume("test-profile", futureReset);
@@ -193,7 +193,7 @@ describe("auto-resume scheduling", () => {
     // If we get here without error, dedup works
   });
 
-  it("cancelPendingResumes clears timers for a specific profile", () => {
+  it("cancelPendingResumes clears timers for a specific profile", async () => {
     const futureReset = new Date(Date.now() + 3_600_000).toISOString();
     scheduleWindowResume("profile-a", futureReset);
     scheduleWindowResume("profile-b", futureReset);

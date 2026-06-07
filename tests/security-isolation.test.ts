@@ -57,15 +57,15 @@ const emailHdr = (e: string) => ({ "X-Auth-Request-Email": e });
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-iso-test-"));
-  initDb(path.join(tmpDir, "test.db"));
+  await initDb(path.join(tmpDir, "test.db"));
   port = await getFreePort();
   startHttpServer(port);
   _resetIngestRateLimit();
 });
 
-afterEach(() => {
+afterEach(async () => {
   stopHttpServer();
-  closeDb();
+  await closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
   delete process.env.CLAUDE_PULSE_TRUSTED_PROXY_SECRET;
   delete process.env.CLAUDE_PULSE_SINGLE_TENANT;
@@ -75,26 +75,26 @@ afterEach(() => {
 
 describe("H1/H3 — subscription/alert isolation (IDOR)", () => {
   it("account B cannot delete account A's subscription (404, row survives)", async () => {
-    const a = resolveAccount("a@x.com");
-    const b = resolveAccount("b@x.com");
-    addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
-    const sub = createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
+    const a = await resolveAccount("a@x.com");
+    const b = await resolveAccount("b@x.com");
+    await addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
+    const sub = await createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
 
     // B attempts to delete A's subscription by id.
     const del = await req("DELETE", `/api/subscriptions/${sub.id}`, { headers: emailHdr("b@x.com") });
     expect(del.status).toBe(404);
 
     // A's subscription must still exist.
-    expect(listAlertSubscriptions(a.id).map((s) => s.id)).toContain(sub.id);
+    expect((await listAlertSubscriptions(a.id)).map((s) => s.id)).toContain(sub.id);
     // And B never had it.
     void b;
   });
 
   it("account B cannot read account A's subscriptions", async () => {
-    const a = resolveAccount("a@x.com");
-    resolveAccount("b@x.com");
-    addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
-    createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
+    const a = await resolveAccount("a@x.com");
+    await resolveAccount("b@x.com");
+    await addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
+    await createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
 
     const aView = await req("GET", "/api/subscriptions", { headers: emailHdr("a@x.com") });
     expect(aView.json.length).toBe(1);
@@ -103,27 +103,27 @@ describe("H1/H3 — subscription/alert isolation (IDOR)", () => {
   });
 
   it("account B cannot acknowledge account A's alert (404, stays unacked)", async () => {
-    const a = resolveAccount("a@x.com");
-    resolveAccount("b@x.com");
-    addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
-    const sub = createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
-    const evt = createAlertEvent(a.id, sub.id, "pa", "five_hour_threshold", "A's alert", 95, 90);
+    const a = await resolveAccount("a@x.com");
+    await resolveAccount("b@x.com");
+    await addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
+    const sub = await createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
+    const evt = await createAlertEvent(a.id, sub.id, "pa", "five_hour_threshold", "A's alert", 95, 90);
 
     // B tries to ack A's alert by id.
     const ack = await req("POST", "/api/alerts/acknowledge", { headers: emailHdr("b@x.com"), body: { id: evt.id } });
     expect(ack.status).toBe(404);
 
     // Still unacknowledged for A.
-    const stillUnacked = getTriggeredAlerts(a.id, "pa", 24, true);
+    const stillUnacked = await getTriggeredAlerts(a.id, "pa", 24, true);
     expect(stillUnacked.map((e) => e.id)).toContain(evt.id);
   });
 
   it("account B cannot read account A's alerts", async () => {
-    const a = resolveAccount("a@x.com");
-    resolveAccount("b@x.com");
-    addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
-    const sub = createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
-    createAlertEvent(a.id, sub.id, "pa", "five_hour_threshold", "secret", 95, 90);
+    const a = await resolveAccount("a@x.com");
+    await resolveAccount("b@x.com");
+    await addProfile("pa", "/tmp/pa", 5, "anthropic-oauth", null, null, a.id);
+    const sub = await createAlertSubscription(a.id, "pa", "five_hour_threshold", 90, null, 30);
+    await createAlertEvent(a.id, sub.id, "pa", "five_hour_threshold", "secret", 95, 90);
 
     const aView = await req("GET", "/api/alerts?hours=24", { headers: emailHdr("a@x.com") });
     expect(aView.json.length).toBe(1);
@@ -136,10 +136,10 @@ describe("H1/H3 — subscription/alert isolation (IDOR)", () => {
 
 describe("H2/L4 — profile/inventory isolation", () => {
   it("account B cannot see account A's profiles via /api/profiles", async () => {
-    const a = resolveAccount("a@x.com");
-    const b = resolveAccount("b@x.com");
-    addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
-    addProfile("b-only", "/tmp/b", 5, "anthropic-oauth", null, null, b.id);
+    const a = await resolveAccount("a@x.com");
+    const b = await resolveAccount("b@x.com");
+    await addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
+    await addProfile("b-only", "/tmp/b", 5, "anthropic-oauth", null, null, b.id);
 
     const aView = await req("GET", "/api/profiles", { headers: emailHdr("a@x.com") });
     expect(aView.json.map((p: any) => p.name)).toEqual(["a-only"]);
@@ -148,10 +148,10 @@ describe("H2/L4 — profile/inventory isolation", () => {
   });
 
   it("account B cannot see account A's profiles via /api/usage", async () => {
-    const a = resolveAccount("a@x.com");
-    const b = resolveAccount("b@x.com");
-    addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
-    addProfile("b-only", "/tmp/b", 5, "anthropic-oauth", null, null, b.id);
+    const a = await resolveAccount("a@x.com");
+    const b = await resolveAccount("b@x.com");
+    await addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
+    await addProfile("b-only", "/tmp/b", 5, "anthropic-oauth", null, null, b.id);
 
     const aUsage = await req("GET", "/api/usage", { headers: emailHdr("a@x.com") });
     expect(aUsage.json.map((u: any) => u.profile)).toEqual(["a-only"]);
@@ -171,8 +171,8 @@ describe("H4 — trusted-proxy header boundary", () => {
 
   it("with proxy secret + correct proxy header + email, scopes correctly", async () => {
     process.env.CLAUDE_PULSE_TRUSTED_PROXY_SECRET = "s3cret";
-    const a = resolveAccount("a@x.com");
-    addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
+    const a = await resolveAccount("a@x.com");
+    await addProfile("a-only", "/tmp/a", 5, "anthropic-oauth", null, null, a.id);
     const r = await req("GET", "/api/profiles", {
       headers: { "X-Pulse-Proxy-Auth": "s3cret", ...emailHdr("a@x.com") },
     });
@@ -221,8 +221,8 @@ describe("M2 — request body cap", () => {
 
 describe("M1 — ingest throttle", () => {
   it("returns 429 once the per-token rate limit is exceeded", async () => {
-    const a = resolveAccount("rl@x.com");
-    const { plaintext } = mintIngestToken(a.id, "m1");
+    const a = await resolveAccount("rl@x.com");
+    const { plaintext } = await mintIngestToken(a.id, "m1");
     const hdr = { Authorization: `Bearer ${plaintext}` };
 
     let saw429 = false;
@@ -238,12 +238,12 @@ describe("M1 — ingest throttle", () => {
 // ── N3 — esc() escaping ──────────────────────────────────────────────────────
 
 describe("N3 — esc() HTML escaping", () => {
-  it("escapes < > & \" and '", () => {
+  it("escapes < > & \" and '", async () => {
     expect(esc(`<script>alert("x")&'y'`)).toBe(
       "&lt;script&gt;alert(&quot;x&quot;)&amp;&#39;y&#39;",
     );
   });
-  it("renders null/undefined as empty string", () => {
+  it("renders null/undefined as empty string", async () => {
     expect(esc(null)).toBe("");
     expect(esc(undefined)).toBe("");
   });
