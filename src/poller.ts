@@ -222,7 +222,7 @@ function contextResultToFields(r: ContextReadResult | null): ContextSnapshotFiel
 }
 
 export async function pollProfile(profileName: string): Promise<PollResult> {
-  const profile = getProfile(profileName);
+  const profile = await getProfile(profileName);
   if (!profile) {
     return { profile: profileName, success: false, error: "Profile not found" };
   }
@@ -243,7 +243,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
       }
     }
 
-    const snapshot = insertSnapshot(
+    const snapshot = await insertSnapshot(
       profile.name,
       usage.fiveHourPct,
       usage.fiveHourResetsAt,
@@ -258,7 +258,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
     );
 
     // Check alerts after successful poll (local daemon account).
-    const alertEvents = checkAlerts(localAccountId(), profile.name, snapshot);
+    const alertEvents = await checkAlerts(await localAccountId(), profile.name, snapshot);
     for (const evt of alertEvents) {
       const resetsAt = getResetsAt(evt, usage.fiveHourResetsAt, usage.sevenDayResetsAt);
       await pushChannelAlert(evt, profile.name, resetsAt);
@@ -272,7 +272,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
     // If rate-limited, schedule a resume notification for when the window resets
     if (isRateLimitError(err)) {
       log(`Rate-limit detected for ${profile.name}, looking for reset time`);
-      const lastGood = getLastSuccessfulSnapshot(profile.name);
+      const lastGood = await getLastSuccessfulSnapshot(profile.name);
       const resetsAt = earliestFutureReset(
         lastGood?.five_hour_resets_at,
         lastGood?.seven_day_resets_at,
@@ -293,7 +293,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
         log(`Context read failed during error path for ${profile.name}: ${(e as Error).message}`);
       }
     }
-    const snapshot = insertSnapshot(
+    const snapshot = await insertSnapshot(
       profile.name,
       null,
       null,
@@ -304,7 +304,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
     );
 
     // Check alerts after failed poll (auth_failure detection)
-    const alertEvents = checkAlerts(localAccountId(), profile.name, snapshot);
+    const alertEvents = await checkAlerts(await localAccountId(), profile.name, snapshot);
     for (const evt of alertEvents) {
       await pushChannelAlert(evt, profile.name, null);
     }
@@ -319,7 +319,7 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
 }
 
 export async function pollAllProfiles(): Promise<PollResult[]> {
-  const profiles = listProfiles();
+  const profiles = await listProfiles();
   const results: PollResult[] = [];
   for (const p of profiles) {
     const result = await pollProfile(p.name);
@@ -364,16 +364,16 @@ function stopProfileTimer(name: string): void {
   }
 }
 
-export function startAllPollers(): void {
-  const profiles = listProfiles();
+export async function startAllPollers(): Promise<void> {
+  const profiles = await listProfiles();
   for (const p of profiles) {
     startProfileTimer(p);
   }
   log(`Started pollers for ${profiles.length} profile(s)`);
 }
 
-export function restartPoller(profileName: string): void {
-  const profile = getProfile(profileName);
+export async function restartPoller(profileName: string): Promise<void> {
+  const profile = await getProfile(profileName);
   if (profile) {
     startProfileTimer(profile);
   }
@@ -399,8 +399,8 @@ export function stopAllPollers(): void {
 // updates context_* fields on the latest snapshot. Cheap (tail read).
 
 export async function pollContextOnce(): Promise<void> {
-  const profiles = listProfiles();
-  const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
+  const profiles = await listProfiles();
+  const accountId = (await resolveAccount(DEFAULT_ACCOUNT_IDENTITY)).id;
   const machine = os.hostname();
   const upCfg = uploadConfig();
   const uploadContext: UploadContext[] = [];
@@ -419,9 +419,9 @@ export async function pollContextOnce(): Promise<void> {
           context_effective_limit: ctx.effective_context,
           context_last_reset_at: ctx.last_reset_at,
         };
-        const snapshot = upsertContextOnLatestSnapshot(p.name, fields, accountId);
+        const snapshot = await upsertContextOnLatestSnapshot(p.name, fields, accountId);
         // Evaluate ONLY context alerts on this fast loop — 5h/7d are handled by the slow loop.
-        const alertEvents = checkAlerts(accountId, p.name, snapshot, ["context_threshold"]);
+        const alertEvents = await checkAlerts(accountId, p.name, snapshot, ["context_threshold"]);
         for (const evt of alertEvents) {
           await pushChannelAlert(evt, p.name, null);
         }
@@ -431,7 +431,7 @@ export async function pollContextOnce(): Promise<void> {
       // this machine, tagged with hostname + last_active_at (the JSONL mtime).
       const sessions = getAllSessionContextsForProfile(p.config_dir);
       for (const s of sessions) {
-        upsertContextSession({
+        await upsertContextSession({
           account_id: accountId,
           profile: p.name,
           machine,
@@ -461,7 +461,7 @@ export async function pollContextOnce(): Promise<void> {
   }
   // Periodically drop sessions that have gone stale (>1 day inactive).
   try {
-    sweepStaleContextSessions();
+    await sweepStaleContextSessions();
   } catch (e) {
     log(`Context sweep failed: ${(e as Error).message}`);
   }
@@ -513,9 +513,9 @@ export async function runTokenRollupOnce(
   lookbackDays: number = TOKEN_ROLLUP_LOOKBACK_DAYS,
 ): Promise<void> {
   const host = os.hostname();
-  const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
+  const accountId = (await resolveAccount(DEFAULT_ACCOUNT_IDENTITY)).id;
   const sinceDay = lookbackSinceDay(lookbackDays);
-  const profiles = listProfiles();
+  const profiles = await listProfiles();
   // When central-reporting is configured, collect the just-computed fine-grained
   // rows to push AFTER the local upserts (local DB is always written first).
   const upCfg = uploadConfig();
@@ -525,7 +525,7 @@ export async function runTokenRollupOnce(
       // Legacy coarse (profile,host,day,model) rollup — kept for back-compat.
       const rows = await tallyProfileTokens(p, sinceDay);
       for (const row of rows) {
-        upsertTokenRollup({
+        await upsertTokenRollup({
           profile: p.name,
           host,
           day: row.day,
@@ -545,7 +545,7 @@ export async function runTokenRollupOnce(
       // Fine-grained token_usage for the local/default account.
       const fineRows = await tallyProfileFineGrained(p, sinceDay);
       for (const fr of fineRows) {
-        upsertTokenUsage({
+        await upsertTokenUsage({
           account_id: accountId,
           profile: p.name,
           machine: host,

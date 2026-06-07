@@ -35,8 +35,8 @@ export interface BackfillResult {
 
 export async function runLocalBackfill(): Promise<BackfillResult[]> {
   const host = os.hostname();
-  const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
-  const profiles = listProfiles();
+  const accountId = (await resolveAccount(DEFAULT_ACCOUNT_IDENTITY)).id;
+  const profiles = await listProfiles();
   const results: BackfillResult[] = [];
 
   log(`Backfill (local, full-history): starting for ${profiles.length} profile(s) on host ${host}`);
@@ -47,7 +47,7 @@ export async function runLocalBackfill(): Promise<BackfillResult[]> {
       // Coarse (profile,host,day,model) rollup — full history.
       const rows = await tallyProfileTokens(p, undefined, { sinceDays: null });
       for (const row of rows) {
-        upsertTokenRollup({
+        await upsertTokenRollup({
           profile: p.name,
           host,
           day: row.day,
@@ -65,7 +65,7 @@ export async function runLocalBackfill(): Promise<BackfillResult[]> {
       // Fine-grained token_usage — full history.
       const fineRows = await tallyProfileFineGrained(p, undefined, { sinceDays: null });
       for (const fr of fineRows) {
-        upsertTokenUsage({
+        await upsertTokenUsage({
           account_id: accountId,
           profile: p.name,
           machine: host,
@@ -87,7 +87,7 @@ export async function runLocalBackfill(): Promise<BackfillResult[]> {
       // Current context_sessions once (anthropic-oauth profiles only).
       if (p.vendor === "anthropic-oauth") {
         for (const s of getAllSessionContextsForProfile(p.config_dir)) {
-          upsertContextSession({
+          await upsertContextSession({
             account_id: accountId,
             profile: p.name,
             machine: host,

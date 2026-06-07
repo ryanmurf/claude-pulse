@@ -184,12 +184,13 @@ export async function pushToCentral(
 export async function computeUpload(
   sinceDay: string | undefined,
   opts?: TallyOptions,
-  profiles: Profile[] = listProfiles(),
+  profiles?: Profile[],
 ): Promise<{ rollups: UploadRollup[]; context: UploadContext[] }> {
   const rollups: UploadRollup[] = [];
   const context: UploadContext[] = [];
 
-  for (const p of profiles) {
+  const targetProfiles = profiles ?? (await listProfiles());
+  for (const p of targetProfiles) {
     try {
       const rows = await tallyProfileFineGrained(p, sinceDay, opts);
       for (const r of rows) {
