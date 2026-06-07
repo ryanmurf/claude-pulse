@@ -6,6 +6,8 @@ dist/
 
 # SQLite databases
 *.db
+# …except committed test fixtures (e.g. the Antigravity conversation .db).
+!tests/fixtures/*.db
 
 # Environment variables
 .env
