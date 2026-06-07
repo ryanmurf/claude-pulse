@@ -155,6 +155,35 @@ describe("POST /api/ingest", () => {
     expect(ctx[0].machines[0].machine).toBe("laptop-1");
   });
 
+  it("/api/context caps each machine at its 3 most-recently-active sessions, newest first", async () => {
+    const acct = await resolveAccount("cap-user@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "box-1");
+
+    // Five sessions on one machine, all within the 1-day stale window, with
+    // ascending last_active_at (s1 oldest … s5 newest).
+    const now = Date.now();
+    const context = [1, 2, 3, 4, 5].map((n) => ({
+      profile: "claude-max",
+      session_id: `s${n}`,
+      model: "claude-opus-4-8",
+      context_tokens: 1000,
+      context_pct: 0.6,
+      effective_limit: 1_000_000,
+      last_active_at: new Date(now - (6 - n) * 60_000).toISOString(),
+    }));
+    const r = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: { rollups: [], context },
+    });
+    expect(r.status).toBe(200);
+    expect(r.json.context_upserted).toBe(5);
+
+    const ctx = (await fetchJson("/api/context", { "X-Auth-Request-Email": "cap-user@example.com" })) as any;
+    const machine = ctx[0].machines.find((m: any) => m.machine === "box-1");
+    // Only the 3 newest survive the cap, and they come back last-active DESC.
+    expect(machine.sessions.map((s: any) => s.session_id)).toEqual(["s5", "s4", "s3"]);
+  });
+
   it("rejects after the token is revoked", async () => {
     const acct = await resolveAccount("rev-user@example.com");
     const { plaintext } = await mintIngestToken(acct.id, "m1");
