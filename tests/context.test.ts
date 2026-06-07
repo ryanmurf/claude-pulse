@@ -12,11 +12,11 @@ import {
 
 let tmpDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-ctx-test-"));
 });
 
-afterEach(() => {
+afterEach(async () => {
   try {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   } catch {
@@ -30,34 +30,34 @@ function writeJsonl(file: string, lines: any[]): void {
 }
 
 describe("effectiveContextForModel", () => {
-  it("returns 1M for opus-4-7", () => {
+  it("returns 1M for opus-4-7", async () => {
     expect(effectiveContextForModel("claude-opus-4-7")).toBe(1_000_000);
     expect(effectiveContextForModel("claude-opus-4-7[1m]")).toBe(1_000_000);
   });
-  it("returns 200K for sonnet", () => {
+  it("returns 200K for sonnet", async () => {
     expect(effectiveContextForModel("claude-sonnet-4-6")).toBe(200_000);
   });
-  it("returns 200K for haiku", () => {
+  it("returns 200K for haiku", async () => {
     expect(effectiveContextForModel("claude-haiku-4-5")).toBe(200_000);
   });
-  it("returns default for unknown model", () => {
+  it("returns default for unknown model", async () => {
     expect(effectiveContextForModel("some-unknown-model-2030")).toBe(DEFAULT_CONTEXT_LIMIT);
   });
-  it("handles null/undefined", () => {
+  it("handles null/undefined", async () => {
     expect(effectiveContextForModel(null)).toBe(DEFAULT_CONTEXT_LIMIT);
     expect(effectiveContextForModel(undefined)).toBe(DEFAULT_CONTEXT_LIMIT);
   });
-  it("matches by prefix for date-suffixed model ids", () => {
+  it("matches by prefix for date-suffixed model ids", async () => {
     expect(effectiveContextForModel("claude-haiku-4-5-20251001")).toBe(200_000);
   });
 });
 
 describe("findCurrentSessionJsonl", () => {
-  it("returns null when no projects dir", () => {
+  it("returns null when no projects dir", async () => {
     expect(findCurrentSessionJsonl(tmpDir)).toBeNull();
   });
 
-  it("picks the most-recently-modified jsonl across projects", () => {
+  it("picks the most-recently-modified jsonl across projects", async () => {
     const proj1 = path.join(tmpDir, "projects", "proj-a", "old.jsonl");
     const proj2 = path.join(tmpDir, "projects", "proj-b", "new.jsonl");
     writeJsonl(proj1, [{ a: 1 }]);
@@ -67,7 +67,7 @@ describe("findCurrentSessionJsonl", () => {
     expect(findCurrentSessionJsonl(tmpDir)).toBe(proj2);
   });
 
-  it("ignores subdirectories (e.g. subagents/)", () => {
+  it("ignores subdirectories (e.g. subagents/)", async () => {
     const subagent = path.join(tmpDir, "projects", "proj-a", "subagents", "sub.jsonl");
     const top = path.join(tmpDir, "projects", "proj-a", "main.jsonl");
     writeJsonl(subagent, [{ s: 1 }]);
@@ -77,13 +77,13 @@ describe("findCurrentSessionJsonl", () => {
 });
 
 describe("readJsonlContext", () => {
-  it("returns null for empty file", () => {
+  it("returns null for empty file", async () => {
     const f = path.join(tmpDir, "empty.jsonl");
     fs.writeFileSync(f, "");
     expect(readJsonlContext(f)).toBeNull();
   });
 
-  it("returns zero context when only header entries (no assistant turns)", () => {
+  it("returns zero context when only header entries (no assistant turns)", async () => {
     const f = path.join(tmpDir, "header.jsonl");
     writeJsonl(f, [
       { type: "last-prompt", sessionId: "abc" },
@@ -96,7 +96,7 @@ describe("readJsonlContext", () => {
     expect(r!.session_id).toBe("abc");
   });
 
-  it("sums input + cache_creation + cache_read on latest assistant turn", () => {
+  it("sums input + cache_creation + cache_read on latest assistant turn", async () => {
     const f = path.join(tmpDir, "session.jsonl");
     writeJsonl(f, [
       { type: "permission-mode", sessionId: "sess1" },
@@ -125,7 +125,7 @@ describe("readJsonlContext", () => {
     expect(r!.model).toBe("claude-sonnet-4-6");
   });
 
-  it("captures latest compact_boundary timestamp", () => {
+  it("captures latest compact_boundary timestamp", async () => {
     const f = path.join(tmpDir, "compact.jsonl");
     writeJsonl(f, [
       {
@@ -153,7 +153,7 @@ describe("readJsonlContext", () => {
     expect(r!.last_reset_at).toBe("2026-05-15T12:00:00Z");
   });
 
-  it("skips corrupted lines without crashing", () => {
+  it("skips corrupted lines without crashing", async () => {
     const f = path.join(tmpDir, "corrupt.jsonl");
     fs.writeFileSync(
       f,
@@ -176,7 +176,7 @@ describe("readJsonlContext", () => {
     expect(r!.context_tokens).toBe(6);
   });
 
-  it("handles tail-only reads on large files", () => {
+  it("handles tail-only reads on large files", async () => {
     const f = path.join(tmpDir, "big.jsonl");
     // Write 500KB of filler then a valid last assistant turn
     const filler = JSON.stringify({ type: "user", message: { role: "user", content: "x".repeat(2000) } });
@@ -199,7 +199,7 @@ describe("readJsonlContext", () => {
     expect(r!.context_tokens).toBe(31);
   });
 
-  it("user-role messages with usage do not override assistant usage", () => {
+  it("user-role messages with usage do not override assistant usage", async () => {
     const f = path.join(tmpDir, "userusage.jsonl");
     writeJsonl(f, [
       {
@@ -222,11 +222,11 @@ describe("readJsonlContext", () => {
 });
 
 describe("getContextForProfile", () => {
-  it("returns null when config dir has no sessions", () => {
+  it("returns null when config dir has no sessions", async () => {
     expect(getContextForProfile(tmpDir)).toBeNull();
   });
 
-  it("expands ~/ prefix", () => {
+  it("expands ~/ prefix", async () => {
     // Just smoke-test path expansion doesn't crash; if the user's home has no
     // ~/.no-such-claude-pulse-dir/, returns null.
     expect(getContextForProfile("~/.no-such-claude-pulse-dir-test")).toBeNull();

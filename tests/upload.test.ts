@@ -40,7 +40,7 @@ function makeContext(i: number): UploadContext {
   };
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   _resetUploadBackoff();
@@ -49,14 +49,14 @@ afterEach(() => {
 });
 
 describe("uploadConfig", () => {
-  it("returns null unless both env vars are set", () => {
+  it("returns null unless both env vars are set", async () => {
     expect(uploadConfig()).toBeNull();
     process.env.CLAUDE_PULSE_UPLOAD_TO = "https://x";
     expect(uploadConfig()).toBeNull();
     process.env.CLAUDE_PULSE_INGEST_TOKEN = "tok";
     expect(uploadConfig()).toEqual({ baseUrl: "https://x", ingestToken: "tok" });
   });
-  it("strips a trailing slash from the base URL", () => {
+  it("strips a trailing slash from the base URL", async () => {
     process.env.CLAUDE_PULSE_UPLOAD_TO = "https://x/";
     process.env.CLAUDE_PULSE_INGEST_TOKEN = "tok";
     expect(uploadConfig()!.baseUrl).toBe("https://x");
@@ -64,14 +64,14 @@ describe("uploadConfig", () => {
 });
 
 describe("chunkUpload", () => {
-  it("packs small rows into a single chunk", () => {
+  it("packs small rows into a single chunk", async () => {
     const rollups = Array.from({ length: 10 }, (_, i) => makeRollup(i));
     const chunks = chunkUpload(rollups, []);
     expect(chunks.length).toBe(1);
     expect(chunks[0].rollups.length).toBe(10);
   });
 
-  it("splits by row count past MAX_ROWS_PER_CHUNK", () => {
+  it("splits by row count past MAX_ROWS_PER_CHUNK", async () => {
     const rollups = Array.from({ length: MAX_ROWS_PER_CHUNK + 50 }, (_, i) => makeRollup(i));
     const chunks = chunkUpload(rollups, []);
     expect(chunks.length).toBeGreaterThan(1);
@@ -80,7 +80,7 @@ describe("chunkUpload", () => {
     expect(total).toBe(MAX_ROWS_PER_CHUNK + 50);
   });
 
-  it("splits a large batch into multiple chunks each under the byte cap", () => {
+  it("splits a large batch into multiple chunks each under the byte cap", async () => {
     // ~10KB padding per row × 200 rows ≈ 2MB → must split into several <1MB chunks.
     const rollups = Array.from({ length: 200 }, (_, i) => makeRollup(i, 10 * 1024));
     const chunks = chunkUpload(rollups, []);
@@ -94,7 +94,7 @@ describe("chunkUpload", () => {
     expect(total).toBe(200);
   });
 
-  it("carries context rows when there are no rollups", () => {
+  it("carries context rows when there are no rollups", async () => {
     const context = Array.from({ length: 5 }, (_, i) => makeContext(i));
     const chunks = chunkUpload([], context);
     expect(chunks.length).toBe(1);

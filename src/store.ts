@@ -71,21 +71,32 @@ function dialect(): Dialect {
 }
 
 /**
- * A `datetime('now', '-' || ? || ' hours')` SQLite expression has no direct
- * `?`-translatable Postgres equivalent (interval string concat). This helper
- * emits the right per-dialect SQL fragment for "now minus N <unit>", binding N
- * as a parameter on both backends.
+ * Emit a "<column> >= now − N <unit>" comparison that works on both backends,
+ * binding N as a `?` parameter (the caller pushes the numeric N into its params
+ * in order).
  *
- * SQLite:   datetime('now', '-' || ? || ' hours')
- * Postgres: (now()::timestamptz - ($n || ' hours')::interval)
+ * Timestamp columns are stored as TEXT on both backends (datetime('now') strings
+ * on SQLite; the same string format on Postgres). SQLite compares the TEXT
+ * lexicographically against `datetime('now', …)` (also TEXT) — correct because
+ * the format is sortable. Postgres has no implicit text↔timestamp comparison, so
+ * both sides are cast to `timestamptz`.
  *
- * The caller still pushes the numeric N into its params array in order.
+ *   SQLite:   <col> >= datetime('now', '-' || ? || ' hours')
+ *   Postgres: <col>::timestamptz >= (now()::timestamptz - (? || ' hours')::interval)
  */
-function nowMinus(unit: "hours" | "days"): string {
+function tsGte(column: string, unit: "hours" | "days"): string {
   if (dialect() === "postgres") {
-    return `(now()::timestamptz - (? || ' ${unit}')::interval)`;
+    return `${column}::timestamptz >= (now()::timestamptz - (? || ' ${unit}')::interval)`;
   }
-  return `datetime('now', '-' || ? || ' ${unit}')`;
+  return `${column} >= datetime('now', '-' || ? || ' ${unit}')`;
+}
+
+/** "<column> < now − N <unit>" companion to tsGte (for the stale-sweep delete). */
+function tsLt(column: string, unit: "hours" | "days"): string {
+  if (dialect() === "postgres") {
+    return `${column}::timestamptz < (now()::timestamptz - (? || ' ${unit}')::interval)`;
+  }
+  return `${column} < datetime('now', '-' || ? || ' ${unit}')`;
 }
 
 /**
@@ -146,6 +157,26 @@ async function createSchema(db: Backend): Promise<void> {
   const d = db.dialect;
   const ID = idColumn(d);
   const NOW = nowDefault(d);
+
+  // ── accounts FIRST ──────────────────────────────────────────────────────────
+  // Several tables carry `account_id INTEGER REFERENCES accounts(id)`. SQLite
+  // tolerates a forward FK reference at CREATE time; Postgres validates it
+  // immediately, so the parent table MUST exist before any child. Create + seed
+  // accounts up front; the per-table account_id backfill UPDATEs run at the end
+  // (after every table that has the column exists).
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      ${ID},
+      identity TEXT NOT NULL UNIQUE,
+      display_name TEXT,
+      created_at TEXT NOT NULL DEFAULT ${NOW}
+    )
+  `);
+  await db.run(
+    `INSERT INTO accounts (identity, display_name) VALUES (?, ?)
+     ON CONFLICT(identity) DO NOTHING`,
+    [DEFAULT_ACCOUNT_IDENTITY, DEFAULT_ACCOUNT_IDENTITY],
+  );
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS profiles (
@@ -333,34 +364,7 @@ async function createSchema(db: Backend): Promise<void> {
       ON token_rollups(day, profile)
   `);
 
-  // ── Multi-tenant tables ────────────────────────────────────────────────────
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS accounts (
-      ${ID},
-      identity TEXT NOT NULL UNIQUE,
-      display_name TEXT,
-      created_at TEXT NOT NULL DEFAULT ${NOW}
-    )
-  `);
-
-  // Seed the default/local account so single-tenant DBs + fallback always work.
-  await db.run(
-    `INSERT INTO accounts (identity, display_name) VALUES (?, ?)
-     ON CONFLICT(identity) DO NOTHING`,
-    [DEFAULT_ACCOUNT_IDENTITY, DEFAULT_ACCOUNT_IDENTITY],
-  );
-
-  const defaultAcct = (await db.get<{ id: number }>(
-    "SELECT id FROM accounts WHERE identity = ?",
-    [DEFAULT_ACCOUNT_IDENTITY],
-  ))!;
-
-  // Backfill account_id → the default/local account on tables that gained it.
-  await db.run("UPDATE usage_snapshots SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
-  await db.run("UPDATE profiles SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
-  await db.run("UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
-  await db.run("UPDATE alert_events SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  // ── Multi-tenant tables (accounts already created at the top) ───────────────
 
   await db.exec(`
     CREATE TABLE IF NOT EXISTS ingest_tokens (
@@ -485,6 +489,18 @@ async function createSchema(db: Backend): Promise<void> {
       UNIQUE(account_id, model, settings_match_json)
     )
   `);
+
+  // Backfill account_id → the default/local account on the tables that gained an
+  // account_id column in the multi-tenant rework. Runs last, once every table
+  // exists. Existing single-tenant rows all belong to the local daemon.
+  const defaultAcct = (await db.get<{ id: number }>(
+    "SELECT id FROM accounts WHERE identity = ?",
+    [DEFAULT_ACCOUNT_IDENTITY],
+  ))!;
+  await db.run("UPDATE usage_snapshots SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE profiles SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE alert_events SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
 }
 
 /**
@@ -830,7 +846,7 @@ export async function getHistory(
   return d.all<UsageSnapshot>(
     `SELECT * FROM usage_snapshots
      WHERE profile = ? AND account_id = ?
-       AND polled_at >= ${nowMinus("hours")}
+       AND ${tsGte("polled_at", "hours")}
      ORDER BY polled_at DESC
      LIMIT ?`,
     [profile, acct, hours, limit],
@@ -979,7 +995,7 @@ export async function getTriggeredAlerts(
   const d = getDb();
   let sql = `SELECT * FROM alert_events
      WHERE account_id = ?
-       AND triggered_at >= ${nowMinus("hours")}`;
+       AND ${tsGte("triggered_at", "hours")}`;
   const params: (string | number)[] = [accountId, sinceHours];
 
   if (profile) {
@@ -1401,7 +1417,7 @@ export async function getActiveContextSessions(accountId: number): Promise<Conte
   return d.all<ContextSessionRow>(
     `SELECT * FROM context_sessions
      WHERE account_id = ?
-       AND last_active_at >= ${nowMinus("days")}
+       AND ${tsGte("last_active_at", "days")}
      ORDER BY profile, machine, last_active_at DESC`,
     [accountId, CONTEXT_STALE_DAYS],
   );
@@ -1412,7 +1428,7 @@ export async function sweepStaleContextSessions(): Promise<number> {
   const d = getDb();
   const result = await d.run(
     `DELETE FROM context_sessions
-     WHERE last_active_at < ${nowMinus("days")}`,
+     WHERE ${tsLt("last_active_at", "days")}`,
     [CONTEXT_STALE_DAYS],
   );
   return result.changes;
