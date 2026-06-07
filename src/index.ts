@@ -1032,7 +1032,9 @@ function startAgentLoop(
   };
   run(); // immediate first pass
   const timer = setInterval(run, intervalMs);
-  timer.unref();
+  // NOTE: do NOT unref() — in agent daemon mode there is no HTTP server to keep
+  // the event loop alive, so an unref'd timer lets the process exit cleanly after
+  // the first pass. Keeping it ref'd is what makes the daemon stay running.
   log(`agent: ${name} loop every ${Math.round(intervalMs / 1000)}s`);
   return timer;
 }
