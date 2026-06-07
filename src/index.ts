@@ -39,9 +39,10 @@ import {
   pollContextOnce,
   startTokenRollup,
 } from "./poller.js";
-import { tallyProfileFineGrained } from "./tokens.js";
 import os from "node:os";
-import { getContextForProfile, getAllSessionContextsForProfile } from "./context.js";
+import { getContextForProfile } from "./context.js";
+import { computeUpload, pushToCentral, uploadConfig } from "./upload.js";
+import { runLocalBackfill } from "./backfill.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
   formatGeminiQuotaSnapshots,
@@ -892,122 +893,75 @@ server.tool(
 
 // --- Upload mode ---
 // Remote machines run this from cron: compute local rollups for all profiles
-// (last 2 days) and POST them to a central claude-pulse server's /api/ingest.
-// Does NOT start the HTTP server or pollers. Exits 0 on success, non-zero on failure.
+// and POST them to a central claude-pulse server's /api/ingest, chunked under the
+// server's 1MB cap. Does NOT start the HTTP server or pollers. Exits 0 on success.
+//
+//   - default            → last UPLOAD_LOOKBACK_DAYS days (incremental).
+//   - CLAUDE_PULSE_UPLOAD_BACKFILL=1 (or --backfill) → FULL-HISTORY one-shot.
 const UPLOAD_LOOKBACK_DAYS = 2;
 
-async function uploadOnce(): Promise<number> {
-  const target = process.env.CLAUDE_PULSE_UPLOAD_TO;
-  const ingestToken = process.env.CLAUDE_PULSE_INGEST_TOKEN;
-  if (!target) {
+function lookbackDay(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function uploadOnce(opts?: { backfill?: boolean }): Promise<number> {
+  const cfg = uploadConfig();
+  if (!process.env.CLAUDE_PULSE_UPLOAD_TO) {
     log("Upload mode: CLAUDE_PULSE_UPLOAD_TO is not set");
     return 1;
   }
-  if (!ingestToken) {
+  if (!process.env.CLAUDE_PULSE_INGEST_TOKEN) {
     log("Upload mode: CLAUDE_PULSE_INGEST_TOKEN is not set");
     return 1;
   }
+  if (!cfg) return 1;
 
   initDb();
   ensureDefaultProfiles();
 
   const host = os.hostname();
-  const sinceMs = Date.now() - UPLOAD_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-  const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+  const backfill = opts?.backfill === true;
+  // Full history (sinceDays:null) for backfill; otherwise the incremental window.
+  const sinceDay = backfill ? undefined : lookbackDay(UPLOAD_LOOKBACK_DAYS);
+  const tallyOpts = backfill ? { sinceDays: null } : undefined;
 
-  // Fine-grained token_usage rows (account + machine are inferred server-side
-  // from the ingest token — we never send them).
-  const rollups: Array<{
-    profile: string;
-    session_id: string;
-    day: string;
-    model: string;
-    settings: Record<string, unknown>;
-    tokens_in: number;
-    tokens_out: number;
-    cache_write_5m: number;
-    cache_write_1h: number;
-    cache_read: number;
-  }> = [];
-
-  // Current live context sessions for all local profiles.
-  const context: Array<{
-    profile: string;
-    session_id: string;
-    model: string | null;
-    context_tokens: number | null;
-    context_pct: number | null;
-    effective_limit: number | null;
-    last_active_at: string;
-  }> = [];
-
-  for (const p of listProfiles()) {
-    try {
-      const rows = await tallyProfileFineGrained(p, sinceDay);
-      for (const r of rows) {
-        rollups.push({
-          profile: p.name,
-          session_id: r.session_id,
-          day: r.day,
-          model: r.model,
-          settings: JSON.parse(r.settings_json || "{}"),
-          tokens_in: r.tokens_in,
-          tokens_out: r.tokens_out,
-          cache_write_5m: r.cache_write_5m,
-          cache_write_1h: r.cache_write_1h,
-          cache_read: r.cache_read,
-        });
-      }
-    } catch (e) {
-      log(`Upload mode: tally failed for ${p.name}: ${(e as Error).message}`);
-    }
-
-    // Live per-session context (anthropic-oauth profiles only).
-    if (p.vendor === "anthropic-oauth") {
-      try {
-        for (const s of getAllSessionContextsForProfile(p.config_dir)) {
-          context.push({
-            profile: p.name,
-            session_id: s.session_id,
-            model: s.model,
-            context_tokens: s.context_tokens,
-            context_pct: s.context_pct,
-            effective_limit: s.effective_context,
-            last_active_at: s.mtime,
-          });
-        }
-      } catch (e) {
-        log(`Upload mode: context read failed for ${p.name}: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  log(`Upload mode: computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${target}/api/ingest`);
-
-  const url = `${target.replace(/\/$/, "")}/api/ingest`;
   try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${ingestToken}`,
-      },
-      body: JSON.stringify({ rollups, context }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    const text = await resp.text();
-    if (!resp.ok) {
-      log(`Upload mode: ingest returned HTTP ${resp.status}: ${text.slice(0, 300)}`);
-      return 1;
-    }
-    log(`Upload mode: success — ${text.slice(0, 300)}`);
-    return 0;
+    const { rollups, context } = await computeUpload(sinceDay, tallyOpts);
+    log(
+      `Upload mode${backfill ? " (FULL-HISTORY backfill)" : ""}: computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+    );
+    const res = await pushToCentral(rollups, context, cfg);
+    log(
+      `Upload mode: ${res.ok}/${res.chunks} chunk(s) OK, ${res.failed} failed`,
+    );
+    return res.failed > 0 ? 1 : 0;
   } catch (e) {
-    log(`Upload mode: POST failed: ${(e as Error).message}`);
+    log(`Upload mode: failed: ${(e as Error).message}`);
     return 1;
   } finally {
     closeDb();
   }
+}
+
+/**
+ * Full-history upload backfill for long-running modes. Assumes DB is already
+ * initialized (the daemon has). Computes the full history once and pushes it to
+ * central in chunks; does NOT close the DB (the loops keep running). No-op when
+ * upload is unconfigured.
+ */
+async function runUploadBackfill(): Promise<void> {
+  const cfg = uploadConfig();
+  if (!cfg) {
+    log("Upload backfill: CLAUDE_PULSE_UPLOAD_TO / CLAUDE_PULSE_INGEST_TOKEN not set — skipping");
+    return;
+  }
+  const host = os.hostname();
+  const { rollups, context } = await computeUpload(undefined, { sinceDays: null });
+  log(
+    `Upload backfill (full-history): computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+  );
+  const res = await pushToCentral(rollups, context, cfg);
+  log(`Upload backfill: ${res.ok}/${res.chunks} chunk(s) OK, ${res.failed} failed`);
 }
 
 // --- Main ---
@@ -1020,6 +974,25 @@ async function main(): Promise<void> {
   log("Database initialized with default profiles");
 
   const serverOnly = process.env.CLAUDE_PULSE_SERVER_ONLY === "1";
+
+  // Optional full-history backfills (before the normal loops start).
+  // Local backfill: write every profile's full history into the local DB.
+  if (process.env.CLAUDE_PULSE_BACKFILL === "1") {
+    try {
+      await runLocalBackfill();
+    } catch (e) {
+      log(`Local backfill error: ${(e as Error).message}`);
+    }
+  }
+  // Upload backfill: compute full history + push to central (chunked), then the
+  // continuous loops below keep incremental reporting going.
+  if (process.env.CLAUDE_PULSE_UPLOAD_BACKFILL === "1" || process.argv.includes("--backfill")) {
+    try {
+      await runUploadBackfill();
+    } catch (e) {
+      log(`Upload backfill error: ${(e as Error).message}`);
+    }
+  }
 
   // Give the poller access to the MCP server for channel notifications
   // (skip in server-only mode — there is no MCP client / stdio transport)
@@ -1064,8 +1037,13 @@ async function main(): Promise<void> {
 const uploadMode =
   process.env.CLAUDE_PULSE_MODE === "upload" || process.argv.includes("--upload-once");
 
+// A backfill requested via env/flag. In one-shot upload mode this makes the
+// single push a FULL-HISTORY push, then exit.
+const wantBackfill =
+  process.env.CLAUDE_PULSE_UPLOAD_BACKFILL === "1" || process.argv.includes("--backfill");
+
 if (uploadMode) {
-  uploadOnce()
+  uploadOnce({ backfill: wantBackfill })
     .then((code) => process.exit(code))
     .catch((err) => {
       process.stderr.write(`[claude-pulse] Upload fatal error: ${err}\n`);

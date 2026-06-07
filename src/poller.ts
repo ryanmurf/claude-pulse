@@ -20,6 +20,12 @@ import { checkAlerts } from "./alerts.js";
 import { fetchUsage } from "./usage.js";
 import { getAllSessionContextsForProfile, getContextForProfile, type ContextReadResult } from "./context.js";
 import { tallyProfileTokens, tallyProfileFineGrained } from "./tokens.js";
+import {
+  reportToCentral,
+  uploadConfig,
+  type UploadRollup,
+  type UploadContext,
+} from "./upload.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
@@ -396,6 +402,8 @@ export async function pollContextOnce(): Promise<void> {
   const profiles = listProfiles();
   const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
   const machine = os.hostname();
+  const upCfg = uploadConfig();
+  const uploadContext: UploadContext[] = [];
   for (const p of profiles) {
     if (p.vendor !== "anthropic-oauth") continue;
     try {
@@ -435,6 +443,17 @@ export async function pollContextOnce(): Promise<void> {
           effective_limit: s.effective_context,
           last_active_at: s.mtime,
         });
+        if (upCfg) {
+          uploadContext.push({
+            profile: p.name,
+            session_id: s.session_id,
+            model: s.model,
+            context_tokens: s.context_tokens,
+            context_pct: s.context_pct,
+            effective_limit: s.effective_context,
+            last_active_at: s.mtime,
+          });
+        }
       }
     } catch (e) {
       log(`Context poll failed for ${p.name}: ${(e as Error).message}`);
@@ -445,6 +464,15 @@ export async function pollContextOnce(): Promise<void> {
     sweepStaleContextSessions();
   } catch (e) {
     log(`Context sweep failed: ${(e as Error).message}`);
+  }
+
+  // Continuous reporting: push current context to central after local upserts.
+  if (upCfg && uploadContext.length > 0) {
+    try {
+      await reportToCentral([], uploadContext, upCfg);
+    } catch (e) {
+      log(`Context poll: central report error: ${(e as Error).message}`);
+    }
   }
 }
 
@@ -488,6 +516,10 @@ export async function runTokenRollupOnce(
   const accountId = resolveAccount(DEFAULT_ACCOUNT_IDENTITY).id;
   const sinceDay = lookbackSinceDay(lookbackDays);
   const profiles = listProfiles();
+  // When central-reporting is configured, collect the just-computed fine-grained
+  // rows to push AFTER the local upserts (local DB is always written first).
+  const upCfg = uploadConfig();
+  const uploadRollups: UploadRollup[] = [];
   for (const p of profiles) {
     try {
       // Legacy coarse (profile,host,day,model) rollup — kept for back-compat.
@@ -533,9 +565,47 @@ export async function runTokenRollupOnce(
       if (fineRows.length > 0) {
         log(`Token usage(fine): ${p.name} upserted ${fineRows.length} grain row(s) for machine ${host}`);
       }
+
+      // Stage just-computed rows for central reporting (pushed after local writes).
+      if (upCfg) {
+        for (const fr of fineRows) {
+          uploadRollups.push({
+            profile: p.name,
+            session_id: fr.session_id,
+            day: fr.day,
+            model: fr.model,
+            settings: safeParseSettings(fr.settings_json),
+            tokens_in: fr.tokens_in,
+            tokens_out: fr.tokens_out,
+            cache_write_5m: fr.cache_write_5m,
+            cache_write_1h: fr.cache_write_1h,
+            cache_read: fr.cache_read,
+          });
+        }
+      }
     } catch (e) {
       log(`Token rollup failed for ${p.name}: ${(e as Error).message}`);
     }
+  }
+
+  // Continuous reporting: push the just-computed rollups to central (no-op unless
+  // CLAUDE_PULSE_UPLOAD_TO + CLAUDE_PULSE_INGEST_TOKEN are set). Local writes above
+  // already happened; a push failure only logs + backs off, never crashes.
+  if (upCfg && uploadRollups.length > 0) {
+    try {
+      await reportToCentral(uploadRollups, [], upCfg);
+    } catch (e) {
+      log(`Token rollup: central report error: ${(e as Error).message}`);
+    }
+  }
+}
+
+function safeParseSettings(json: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(json || "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
   }
 }
 

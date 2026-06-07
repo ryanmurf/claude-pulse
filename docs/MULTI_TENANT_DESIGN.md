@@ -79,6 +79,47 @@ session_id + model + settings + cache-window split), POST to `${UPLOAD_TO}/api/i
 log, exit. No server/pollers in this mode. The central pod also ingests *itself* locally
 (it already reads tron's transcripts), so tron needs no uploader.
 
+## Continuous reporting from the long-running daemon (opt-in)
+The same two env vars (`CLAUDE_PULSE_UPLOAD_TO` + `CLAUDE_PULSE_INGEST_TOKEN`) ALSO make the
+LONG-RUNNING process (normal MCP stdio mode AND `CLAUDE_PULSE_SERVER_ONLY=1`) push to central:
+after **each token-rollup pass** and **each context poll**, the daemon writes locally first,
+then POSTs the just-computed rollups / current context to `${UPLOAD_TO}/api/ingest`
+(`Authorization: Bearer …`, body `{rollups:[…],context:[…]}`). The shared `pushToCentral`
+helper (`src/upload.ts`) **chunks the body** so every POST stays under the server's 1MB
+`/api/ingest` cap (see below). Push failures only log + back off (exponential, 30s→15m cap) —
+they never crash the daemon, and local DB writes are unaffected. When the two env vars are
+unset, behavior is unchanged (e.g. the central pod, which ingests its own data locally, sets
+neither and so never uploads to itself).
+
+### Body chunking (how batch size is decided)
+`chunkUpload` greedily packs rows into chunks bounded by **both**:
+- a row-count ceiling (`MAX_ROWS_PER_CHUNK = 500`), and
+- a serialized-byte ceiling (`INGEST_SAFE_BYTES = 900KB`, comfortably under the 1MB server cap).
+
+Before adding a row it measures `JSON.stringify({rollups,context})` of the prospective chunk;
+if either ceiling would be exceeded it flushes the current chunk and starts a new one. Each
+chunk is one POST. Context rows ride along in the same chunks (and a trailing chunk carries
+any leftover context).
+
+## Env-var contract (reporting + backfill)
+| Env var | Meaning |
+|---|---|
+| `CLAUDE_PULSE_UPLOAD_TO` | Central claude-pulse base URL (e.g. `https://pulse.example`). Enables uploading. |
+| `CLAUDE_PULSE_INGEST_TOKEN` | This machine's bearer token (minted in the dashboard, per (account, machine)). Required alongside `UPLOAD_TO`. |
+| `CLAUDE_PULSE_BACKFILL=1` | On startup, run ONE full-history tally for every **local** profile and upsert into the **local** `token_usage` (host=hostname, account=DEFAULT). For the central/tron pod. Idempotent. |
+| `CLAUDE_PULSE_UPLOAD_BACKFILL=1` | Full-history tally **pushed to central** in chunks (requires `UPLOAD_TO`+`INGEST_TOKEN`). In one-shot `CLAUDE_PULSE_MODE=upload` it makes the single push full-history then exits; in a long-running mode it backfills once then continues incremental reporting. `--backfill` is the CLI-flag equivalent. |
+
+Both backfills also record/push the current `context_sessions` once. Full-history scans still
+stream transcripts line-by-line, so memory stays bounded across thousands of files.
+
+### Quickstart — report a machine to a central server
+1. In the dashboard (Settings → Machines & Tokens) **mint an ingest token** for this machine.
+2. Set the two env vars on the machine's daemon: `CLAUDE_PULSE_UPLOAD_TO=<central-url>` and
+   `CLAUDE_PULSE_INGEST_TOKEN=<minted-token>`.
+3. Restart the daemon — it now pushes rollups + context continuously (in addition to its local DB).
+4. (Optional, one-time) seed full history: run once with `CLAUDE_PULSE_UPLOAD_BACKFILL=1` (or
+   `--backfill`), or `CLAUDE_PULSE_MODE=upload CLAUDE_PULSE_UPLOAD_BACKFILL=1` for a one-shot.
+
 ## Out of scope here / decisions deferred
 - **Who may sign up** (open the herodevs realm vs a dedicated public realm vs an allow-list)
   is a deliberate auth-posture decision — the app is built fully multi-tenant + isolated,
