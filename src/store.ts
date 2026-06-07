@@ -1367,6 +1367,81 @@ export function sweepStaleContextSessions(): number {
   return Number(result.changes);
 }
 
+// ── Per-account abuse / storage caps (count + existence helpers) ─────────────
+
+/** Total token_usage rows owned by an account (cheap COUNT on the account_id index). */
+export function countTokenUsageRows(accountId: number): number {
+  const d = getDb();
+  const row = d.prepare(
+    "SELECT COUNT(*) AS n FROM token_usage WHERE account_id = ?"
+  ).get(accountId) as unknown as { n: number };
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * Whether a token_usage row already exists for this exact unique key. Used by
+ * the per-account row cap to distinguish an UPDATE (always allowed) from an
+ * INSERT of a brand-new key (blocked when the account is at its cap).
+ */
+export function tokenUsageRowExists(row: {
+  account_id: number;
+  profile: string;
+  machine: string;
+  session_id: string;
+  model: string;
+  settings_hash: string;
+  day: string;
+}): boolean {
+  const d = getDb();
+  const hit = d.prepare(
+    `SELECT 1 FROM token_usage
+     WHERE account_id = ? AND profile = ? AND machine = ? AND session_id = ?
+       AND model = ? AND settings_hash = ? AND day = ? LIMIT 1`
+  ).get(
+    row.account_id,
+    row.profile,
+    row.machine,
+    row.session_id,
+    row.model,
+    row.settings_hash,
+    row.day,
+  );
+  return hit !== undefined;
+}
+
+/** Total context_sessions rows owned by an account. */
+export function countContextSessions(accountId: number): number {
+  const d = getDb();
+  const row = d.prepare(
+    "SELECT COUNT(*) AS n FROM context_sessions WHERE account_id = ?"
+  ).get(accountId) as unknown as { n: number };
+  return Number(row?.n ?? 0);
+}
+
+/** Whether a context_sessions row already exists for this unique key (UPDATE vs INSERT). */
+export function contextSessionExists(row: {
+  account_id: number;
+  profile: string;
+  machine: string;
+  session_id: string;
+}): boolean {
+  const d = getDb();
+  const hit = d.prepare(
+    `SELECT 1 FROM context_sessions
+     WHERE account_id = ? AND profile = ? AND machine = ? AND session_id = ? LIMIT 1`
+  ).get(row.account_id, row.profile, row.machine, row.session_id);
+  return hit !== undefined;
+}
+
+/** Count of an account's non-revoked ingest tokens (the per-account machine/token cap). */
+export function countActiveIngestTokens(accountId: number): number {
+  const d = getDb();
+  const row = d.prepare(
+    "SELECT COUNT(*) AS n FROM ingest_tokens WHERE account_id = ? AND revoked_at IS NULL"
+  ).get(accountId) as unknown as { n: number };
+  return Number(row?.n ?? 0);
+}
+
 // ── Pricing ──────────────────────────────────────────────────────────────────
 
 export function getPricingDefaults(): PricingRow[] {

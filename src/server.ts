@@ -29,6 +29,13 @@ import {
   getPricingOverrides,
   upsertPricingOverride,
   deletePricingOverride,
+  countTokenUsageRows,
+  tokenUsageRowExists,
+  countContextSessions,
+  contextSessionExists,
+  countActiveIngestTokens,
+  getAccountById,
+  DEFAULT_ACCOUNT_IDENTITY,
 } from "./store.js";
 import { pollProfile, pollAllProfiles } from "./poller.js";
 import { formatGeminiQuotaSnapshots, pollGeminiQuota } from "./gemini.js";
@@ -127,6 +134,99 @@ function rateLimitAllow(key: string): boolean {
 /** Test/maintenance hook: clear all rate-limit buckets. */
 export function _resetIngestRateLimit(): void {
   ingestBuckets.clear();
+}
+
+// ── Per-account abuse / storage caps (M2) ────────────────────────────────────
+// Open public signup means any account can mint tokens and push rows into the
+// shared usage.db on a finite disk. These bounded, env-configurable caps stop a
+// single account from exhausting storage. All caps are enforced in the ingest +
+// mint paths and return clean HTTP errors (never crash). The local/DEFAULT
+// account is exempt so tron's own backfill/rollups are never blocked.
+
+/** Read a positive-integer env var, falling back to a default. */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback;
+}
+
+/** Max distinct token_usage rows a single account may accumulate. */
+function maxTokenRowsPerAccount(): number {
+  return envInt("CLAUDE_PULSE_MAX_TOKEN_ROWS_PER_ACCOUNT", 200_000);
+}
+/** Max distinct context_sessions rows a single account may accumulate. */
+function maxContextSessionsPerAccount(): number {
+  return envInt("CLAUDE_PULSE_MAX_CONTEXT_SESSIONS_PER_ACCOUNT", 5_000);
+}
+/** Max non-revoked ingest tokens (machines) a single account may hold. */
+function maxTokensPerAccount(): number {
+  return envInt("CLAUDE_PULSE_MAX_TOKENS_PER_ACCOUNT", 25);
+}
+/** Max rows accepted in a single /api/ingest call (rollups + context combined). */
+function maxRowsPerRequest(): number {
+  return envInt("CLAUDE_PULSE_MAX_ROWS_PER_REQUEST", 5_000);
+}
+
+/** The local/DEFAULT account legitimately accumulates history — exempt it. */
+function isExemptAccount(account: Account): boolean {
+  return account.identity === DEFAULT_ACCOUNT_IDENTITY;
+}
+
+// COUNT(*) on a growing table runs on every ingest; cache the per-account row
+// counts briefly so steady-state pushes stay cheap. Short TTL keeps the cap
+// accurate enough (it only gates NEW keys, and we re-check exactly at the
+// boundary). Invalidated implicitly by TTL expiry.
+const COUNT_CACHE_TTL_MS = 5_000;
+interface CountCacheEntry { value: number; at: number; }
+const tokenRowCountCache = new Map<number, CountCacheEntry>();
+const contextRowCountCache = new Map<number, CountCacheEntry>();
+
+function cachedCount(
+  cache: Map<number, CountCacheEntry>,
+  accountId: number,
+  compute: () => number,
+): number {
+  const now = Date.now();
+  const hit = cache.get(accountId);
+  if (hit && now - hit.at < COUNT_CACHE_TTL_MS) return hit.value;
+  const value = compute();
+  cache.set(accountId, { value, at: now });
+  return value;
+}
+
+/** Test hook: clear the cap count caches so per-test state doesn't leak. */
+export function _resetCapCaches(): void {
+  tokenRowCountCache.clear();
+  contextRowCountCache.clear();
+}
+
+/**
+ * Current per-account usage vs caps, for /api/me and /api/limits. `exempt`
+ * accounts (the local/DEFAULT account) report `exempt: true` and their caps as
+ * null (effectively unlimited). Bypasses the count cache for an accurate read.
+ */
+function accountLimits(account: Account): {
+  exempt: boolean;
+  token_rows: number;
+  token_rows_cap: number | null;
+  context_sessions: number;
+  context_sessions_cap: number | null;
+  machines: number;
+  machines_cap: number | null;
+  max_rows_per_request: number;
+} {
+  const exempt = isExemptAccount(account);
+  return {
+    exempt,
+    token_rows: countTokenUsageRows(account.id),
+    token_rows_cap: exempt ? null : maxTokenRowsPerAccount(),
+    context_sessions: countContextSessions(account.id),
+    context_sessions_cap: exempt ? null : maxContextSessionsPerAccount(),
+    machines: countActiveIngestTokens(account.id),
+    machines_cap: exempt ? null : maxTokensPerAccount(),
+    max_rows_per_request: maxRowsPerRequest(),
+  };
 }
 
 function toFiniteInt(v: unknown): number {
@@ -320,14 +420,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/me — account identity + this account's machines
+    // GET /api/me — account identity + this account's machines + cap usage
     if (pathname === "/api/me" && method === "GET") {
       const account = accountForRequest(req);
       sendJson(res, {
         account: account.identity,
         display_name: account.display_name,
         machines: listMachines(account.id),
+        limits: accountLimits(account),
       });
+      return;
+    }
+
+    // GET /api/limits — current usage vs per-account caps (for the dashboard)
+    if (pathname === "/api/limits" && method === "GET") {
+      const account = accountForRequest(req);
+      sendJson(res, accountLimits(account));
       return;
     }
 
@@ -520,6 +628,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const body = JSON.parse((await readBody(req)) || "{}");
       const machine = typeof body?.machine === "string" ? body.machine.trim() : "";
       if (!machine) { sendError(res, 400, "Missing machine name"); return; }
+      // M2 — per-account machine/token cap. The local/DEFAULT account is exempt.
+      if (!isExemptAccount(account)) {
+        const tokenCap = maxTokensPerAccount();
+        if (countActiveIngestTokens(account.id) >= tokenCap) {
+          sendError(
+            res,
+            409,
+            `Token limit reached (max ${tokenCap} active tokens per account); revoke an unused token first`,
+          );
+          return;
+        }
+      }
       const { plaintext, token } = mintIngestToken(account.id, machine);
       // Plaintext shown ONCE — never stored, never retrievable again.
       sendJson(res, {
@@ -587,7 +707,35 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
 
+      // M2 — row-count belt on top of the 1MB byte cap: reject oversized
+      // batches before doing any DB work. Exempt the local/DEFAULT account
+      // (tron's backfill pushes whole-history in big chunks). The token's
+      // account is authoritative; resolve its identity to check exemption.
+      const ingestAccount = getAccountById(accountId);
+      const accountExempt = ingestAccount ? isExemptAccount(ingestAccount) : false;
+      const rollupCount = Array.isArray(body?.rollups) ? body.rollups.length : 0;
+      const contextCount = Array.isArray(body?.context) ? body.context.length : 0;
+      if (!accountExempt && rollupCount + contextCount > maxRowsPerRequest()) {
+        sendError(
+          res,
+          413,
+          `Too many rows in one request (max ${maxRowsPerRequest()}); split the batch`,
+        );
+        return;
+      }
+
+      // Per-account row caps: when at/over the cap, allow upserts that UPDATE an
+      // existing key (steady-state reporting keeps working) but reject INSERTs of
+      // brand-new keys with 429 (only unbounded growth is blocked).
+      const tokenRowCap = maxTokenRowsPerAccount();
+      const tokenRowsAtCap = !accountExempt &&
+        cachedCount(tokenRowCountCache, accountId, () => countTokenUsageRows(accountId)) >= tokenRowCap;
+      const contextCap = maxContextSessionsPerAccount();
+      const contextAtCap = !accountExempt &&
+        cachedCount(contextRowCountCache, accountId, () => countContextSessions(accountId)) >= contextCap;
+
       let upserted = 0;
+      let tokenRowsRejected = 0;
       if (Array.isArray(body?.rollups)) {
         for (const r of body.rollups) {
           if (!r || typeof r !== "object") continue;
@@ -598,6 +746,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           if (!profile || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !model || !session_id) continue;
           const settings = (r.settings && typeof r.settings === "object") ? r.settings : {};
           const settings_json = canonicalSettings(settings);
+          // When at the cap, only allow rows that UPDATE an existing key.
+          if (tokenRowsAtCap && !tokenUsageRowExists({
+            account_id: accountId, profile, machine, session_id,
+            model, settings_hash: settings_json, day,
+          })) {
+            tokenRowsRejected++;
+            continue;
+          }
           const usageRow: TokenUsageInput = {
             account_id: accountId,
             profile,
@@ -620,12 +776,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       }
 
       let contextUpserted = 0;
+      let contextRowsRejected = 0;
       if (Array.isArray(body?.context)) {
         for (const c of body.context) {
           if (!c || typeof c !== "object") continue;
           const profile = typeof c.profile === "string" ? c.profile : "";
           const session_id = typeof c.session_id === "string" && c.session_id ? c.session_id : "";
           if (!profile || !session_id) continue;
+          // When at the cap, only allow rows that UPDATE an existing session.
+          if (contextAtCap && !contextSessionExists({
+            account_id: accountId, profile, machine, session_id,
+          })) {
+            contextRowsRejected++;
+            continue;
+          }
           const settings = (c.settings && typeof c.settings === "object") ? c.settings : {};
           const ctxRow: ContextSessionInput = {
             account_id: accountId,
@@ -646,7 +810,41 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       }
 
-      sendJson(res, { ok: true, upserted, context_upserted: contextUpserted });
+      // New inserts changed the row counts — drop the cached counts so the next
+      // request re-reads an accurate total (cheap; only on accounts near the cap).
+      if (!accountExempt && (upserted > 0 || contextUpserted > 0)) {
+        tokenRowCountCache.delete(accountId);
+        contextRowCountCache.delete(accountId);
+      }
+
+      const rejected = tokenRowsRejected + contextRowsRejected;
+      // If the request did nothing but bounce new keys off the cap, surface 429
+      // so the client backs off; partial success still returns 200 with counts.
+      if (rejected > 0 && upserted === 0 && contextUpserted === 0) {
+        res.setHeader("Retry-After", "60");
+        sendJson(res, {
+          error: "Account row cap reached; new rows rejected (existing rows still update)",
+          upserted,
+          context_upserted: contextUpserted,
+          rejected,
+          token_rows_rejected: tokenRowsRejected,
+          context_rows_rejected: contextRowsRejected,
+        }, 429);
+        return;
+      }
+
+      sendJson(res, {
+        ok: true,
+        upserted,
+        context_upserted: contextUpserted,
+        ...(rejected > 0
+          ? {
+              rejected,
+              token_rows_rejected: tokenRowsRejected,
+              context_rows_rejected: contextRowsRejected,
+            }
+          : {}),
+      });
       return;
     }
 
@@ -869,6 +1067,7 @@ tr:last-child td{border-bottom:none}
   <div class="section">
     <div class="section-hdr">
       <h2>Settings · Machines &amp; Tokens</h2>
+      <span id="limits-line" class="status" style="font-size:.72rem"></span>
     </div>
     <div class="tbl-wrap">
       <table><thead><tr><th>ID</th><th>Machine</th><th>Token</th><th>Last used</th><th>Status</th><th></th></tr></thead>
@@ -1125,7 +1324,18 @@ async function mintToken(){
   else{$('#mint-result').textContent='error: '+(r.error||'failed')}
   await loadTokens();
 }
-async function revokeToken(id){await fetch('/api/ingest-tokens/'+id,{method:'DELETE'});await loadTokens()}
+async function revokeToken(id){await fetch('/api/ingest-tokens/'+id,{method:'DELETE'});await loadTokens();await loadLimits()}
+async function loadLimits(){
+  try{
+    const l=await fj('/api/limits');
+    const el=$('#limits-line');if(!el)return;
+    if(l.exempt){el.textContent='account exempt (unlimited)';return}
+    const cap=(n,c)=>c==null?n:n+' / '+c;
+    el.textContent='machines '+cap(l.machines,l.machines_cap)+
+      ' · token rows '+cap(l.token_rows,l.token_rows_cap)+
+      ' · sessions '+cap(l.context_sessions,l.context_sessions_cap);
+  }catch(e){/* limits are advisory */}
+}
 
 let pricingRows=[];
 function renderPricing(data){
@@ -1162,7 +1372,7 @@ async function refresh(){
       fj('/api/usage'),fj('/api/gemini-quota'),fj('/api/pace'),fj('/api/alerts?hours=24'),fj('/api/subscriptions'),fj('/api/profiles')
     ]);
     renderUsage(usage,pace);renderGemini(gemini);renderAlerts(alerts);renderSubs(subs);fillProfiles(profiles);
-    loadReports();loadContext();loadTokens();loadPricing();
+    loadReports();loadContext();loadTokens();loadPricing();loadLimits();
     $('#status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){$('#status').textContent='error: '+e.message}
 }
