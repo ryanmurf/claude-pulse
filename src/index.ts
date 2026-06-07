@@ -485,7 +485,7 @@ server.tool(
 // --- add_profile ---
 server.tool(
   "add_profile",
-  "Add a new profile. Vendor controls how usage is polled: 'anthropic-oauth' (default) reads OAuth tokens from config_dir; 'deepseek-balance' polls the DeepSeek balance API and computes % from monthly_budget_usd; 'openai-codex' reads the Codex CLI session rate_limits from config_dir (e.g. ~/.codex).",
+  "Add a new profile. Vendor controls how usage is polled: 'anthropic-oauth' (default) reads OAuth tokens from config_dir; 'deepseek-balance' polls the DeepSeek balance API and computes % from monthly_budget_usd; 'openai-codex' reads the Codex CLI session rate_limits from config_dir (e.g. ~/.codex); 'antigravity' tallies token usage from the Antigravity CLI conversation .db files under config_dir/conversations (e.g. ~/.gemini/antigravity-cli) — token tally only, no 5h/7d rate-limit polling.",
   {
     name: z.string().describe("Profile name (unique identifier)"),
     config_dir: z.string().describe("Path to CLAUDE_CONFIG_DIR for this profile"),
@@ -495,7 +495,7 @@ server.tool(
       .default(5)
       .describe("Polling interval in minutes (default 5)"),
     vendor: z
-      .enum(["anthropic-oauth", "deepseek-balance", "openai-codex"])
+      .enum(["anthropic-oauth", "deepseek-balance", "openai-codex", "antigravity"])
       .optional()
       .default("anthropic-oauth")
       .describe("Usage data source. Default 'anthropic-oauth'."),

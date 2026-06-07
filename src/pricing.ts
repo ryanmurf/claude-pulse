@@ -96,6 +96,19 @@ export const DEFAULT_PRICING: PricingRow[] = [
   { model: "gemini-3.5-flash", settings_match_json: "{}", input: 1.5, output: 9, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.15 },
   { model: "gemini-2.5-pro", settings_match_json: "{}", input: 1.25, output: 10, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.125 },
   { model: "gemini-2.5-flash", settings_match_json: "{}", input: 0.3, output: 2.5, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.03 },
+  // gemini-3-flash-* internal codenames (e.g. "gemini-3-flash-a" seen in
+  // Antigravity gen_metadata) don't longest-prefix-match "gemini-3.5-flash";
+  // give the 3.x flash line its own row so those calls don't fall to FALLBACK.
+  { model: "gemini-3-flash", settings_match_json: "{}", input: 1.5, output: 9, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.15 },
+
+  // Antigravity (`agy` CLI). The CLI routes to a backend model (commonly a
+  // Gemini variant, sometimes Claude/gpt-oss); we resolve the conversation-level
+  // model from gen_metadata when possible, so a real "gemini-*"/"claude-*" id
+  // prices via the rows above. When the model can't be resolved we attribute to
+  // "antigravity-unknown" — priced at a conservative mid (Gemini-Pro-ish) rate
+  // here so unknowns aren't zeroed. rateForModel/resolveRate flag it via the
+  // base-row presence; revisit if Antigravity exposes per-call model ids.
+  { model: "antigravity-unknown", settings_match_json: "{}", input: 2, output: 12, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.2 },
 ];
 
 // Fallback when a model id matches no row above — mid-range Sonnet-like rate, so
