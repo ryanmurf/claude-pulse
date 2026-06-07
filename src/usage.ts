@@ -4,7 +4,7 @@ import os from "node:os";
 import type { Dirent } from "node:fs";
 import { getOAuthTokens, hasProfileScope, hasInferenceScope } from "./auth.js";
 import type { OAuthTokens } from "./auth.js";
-import type { Profile } from "./types.js";
+import type { Profile, ProfileVendor } from "./types.js";
 
 function log(msg: string): void {
   process.stderr.write(`[claude-pulse] ${new Date().toISOString()} ${msg}\n`);
@@ -324,6 +324,17 @@ export async function fetchCodexRateLimits(configDir: string): Promise<UsageData
 }
 
 // ── Public: fetch usage for a profile (vendor-aware) ───────────────────────
+
+/**
+ * Whether a vendor exposes a 5h/7d rate-limit snapshot the poller can read.
+ * Token-tally-only vendors (antigravity) have none — their usage comes from the
+ * conversation .db tally, not a poll — so callers skip them quietly instead of
+ * calling `fetchUsage` and logging the resulting "no rate-limit usage" throw as
+ * a per-loop failure.
+ */
+export function vendorPollsRateLimitSnapshot(vendor: ProfileVendor): boolean {
+  return vendor !== "antigravity";
+}
 
 export async function fetchUsage(configDirOrProfile: string | Profile): Promise<UsageData> {
   if (typeof configDirOrProfile === "string") {

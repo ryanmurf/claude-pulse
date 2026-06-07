@@ -2,7 +2,7 @@ import type { Profile } from "./types.js";
 import { listProfiles } from "./store.js";
 import { tallyProfileFineGrained, type TallyOptions } from "./tokens.js";
 import { getAllSessionContextsForProfile, getContextForProfile } from "./context.js";
-import { fetchUsage } from "./usage.js";
+import { fetchUsage, vendorPollsRateLimitSnapshot } from "./usage.js";
 import { computeGeminiQuotaBuckets } from "./gemini.js";
 
 /**
@@ -297,8 +297,10 @@ export async function computeUpload(
       }
     }
 
-    // Current 5h/7d usage snapshot (account-level per profile).
-    if (include?.snapshots) {
+    // Current 5h/7d usage snapshot (account-level per profile). Token-tally-only
+    // vendors (antigravity) have no such snapshot — skip them quietly rather than
+    // calling fetchUsage and logging the "no rate-limit usage" throw each cycle.
+    if (include?.snapshots && vendorPollsRateLimitSnapshot(p.vendor)) {
       try {
         const usage = await fetchUsage(p);
         const ctx =

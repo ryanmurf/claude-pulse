@@ -5,8 +5,12 @@ import path from "node:path";
 import { initDb, closeDb, addProfile } from "../src/store.js";
 
 // Mock the usage module — this replaces the HTTP calls to Anthropic's API
-vi.mock("../src/usage.js", () => {
-  return { fetchUsage: vi.fn() };
+vi.mock("../src/usage.js", async (importOriginal) => {
+  // Keep the real vendorPollsRateLimitSnapshot (anthropic-oauth → true,
+  // antigravity → false) so the skip path is exercised with real logic; only
+  // fetchUsage is stubbed.
+  const actual = await importOriginal<typeof import("../src/usage.js")>();
+  return { ...actual, fetchUsage: vi.fn() };
 });
 
 import { pollProfile, isRateLimitError, scheduleWindowResume, cancelPendingResumes } from "../src/poller.js";
@@ -130,6 +134,19 @@ describe("pollProfile", () => {
         vendor: "anthropic-oauth",
       })
     );
+  });
+
+  it("skips the snapshot poll for token-tally-only vendors (antigravity)", async () => {
+    await addProfile("agy", "/tmp/agy-config", 5, "antigravity");
+    mockFetchUsage.mockClear();
+
+    const result = await pollProfile("agy");
+
+    // Quietly skipped: success, no snapshot, and fetchUsage never called.
+    expect(result.success).toBe(true);
+    expect(result.profile).toBe("agy");
+    expect(result.snapshot).toBeUndefined();
+    expect(mockFetchUsage).not.toHaveBeenCalled();
   });
 });
 

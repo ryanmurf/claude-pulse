@@ -17,7 +17,7 @@ import {
   type ContextSnapshotFields,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
-import { fetchUsage } from "./usage.js";
+import { fetchUsage, vendorPollsRateLimitSnapshot } from "./usage.js";
 import { getAllSessionContextsForProfile, getContextForProfile, type ContextReadResult } from "./context.js";
 import { tallyProfileTokens, tallyProfileFineGrained } from "./tokens.js";
 import {
@@ -225,6 +225,14 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
   const profile = await getProfile(profileName);
   if (!profile) {
     return { profile: profileName, success: false, error: "Profile not found" };
+  }
+
+  // Token-tally-only vendors (antigravity) expose no 5h/7d rate-limit snapshot —
+  // their usage comes from the conversation .db tally, not this poll. Skip them
+  // quietly instead of attempting a poll that always throws (and logged a noisy
+  // "Poll failed" line every cycle).
+  if (!vendorPollsRateLimitSnapshot(profile.vendor)) {
+    return { profile: profile.name, success: true };
   }
 
   try {
