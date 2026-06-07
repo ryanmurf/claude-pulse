@@ -156,6 +156,9 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Content-Length": Buffer.byteLength(html),
+    // The dashboard markup ships inline and changes with every deploy; without
+    // this browsers cache the old page and miss new sections (e.g. Settings).
+    "Cache-Control": "no-cache, must-revalidate",
   });
   res.end(html);
 }
@@ -296,6 +299,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   const method = req.method || "GET";
 
   try {
+    // Health probe — unauthenticated, exempt from the proxy-secret/account gate
+    // so k8s liveness/readiness work even when CLAUDE_PULSE_TRUSTED_PROXY_SECRET
+    // is set (which makes the account-scoped routes 401 without the proxy header).
+    if (pathname === "/healthz" && method === "GET") {
+      sendJson(res, { ok: true });
+      return;
+    }
+
     // Dashboard
     if (pathname === "/" && method === "GET") {
       sendHtml(res, DASHBOARD_HTML);
