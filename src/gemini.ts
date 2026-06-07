@@ -33,7 +33,9 @@ interface GeminiOAuthCreds {
   access_token?: string;
   refresh_token?: string;
   token_uri?: string;
+  // The gemini CLI writes `expiry_date` (epoch ms); older callers used `expiry`.
   expiry?: string | number;
+  expiry_date?: string | number;
 }
 
 interface GeminiQuotaBucket {
@@ -157,7 +159,7 @@ async function getAccessToken(): Promise<string | null> {
   const creds = await readCredentials();
   if (!creds) return null;
 
-  const fileExpiresAt = parseExpiryMs(creds.expiry);
+  const fileExpiresAt = parseExpiryMs(creds.expiry_date ?? creds.expiry);
   if (creds.access_token && (fileExpiresAt === 0 || fileExpiresAt > Date.now() + 60_000)) {
     return creds.access_token;
   }
