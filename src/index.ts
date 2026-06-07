@@ -38,10 +38,11 @@ import {
   startContextPoller,
   pollContextOnce,
   startTokenRollup,
+  runTokenRollupOnce,
 } from "./poller.js";
 import os from "node:os";
 import { getContextForProfile } from "./context.js";
-import { computeUpload, pushToCentral, uploadConfig } from "./upload.js";
+import { computeUpload, pushToCentral, reportToCentral, uploadConfig } from "./upload.js";
 import { runLocalBackfill } from "./backfill.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
@@ -928,11 +929,16 @@ async function uploadOnce(opts?: { backfill?: boolean }): Promise<number> {
   const tallyOpts = backfill ? { sinceDays: null } : undefined;
 
   try {
-    const { rollups, context } = await computeUpload(sinceDay, tallyOpts);
-    log(
-      `Upload mode${backfill ? " (FULL-HISTORY backfill)" : ""}: computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+    const { rollups, context, snapshots, gemini } = await computeUpload(
+      sinceDay,
+      tallyOpts,
+      undefined,
+      { snapshots: true, gemini: true },
     );
-    const res = await pushToCentral(rollups, context, cfg);
+    log(
+      `Upload mode${backfill ? " (FULL-HISTORY backfill)" : ""}: computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) + ${snapshots.length} snapshot(s) + ${gemini.length} gemini bucket(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+    );
+    const res = await pushToCentral(rollups, context, cfg, { snapshots, gemini });
     log(
       `Upload mode: ${res.ok}/${res.chunks} chunk(s) OK, ${res.failed} failed`,
     );
@@ -958,12 +964,128 @@ async function runUploadBackfill(): Promise<void> {
     return;
   }
   const host = os.hostname();
-  const { rollups, context } = await computeUpload(undefined, { sinceDays: null });
-  log(
-    `Upload backfill (full-history): computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+  const { rollups, context, snapshots, gemini } = await computeUpload(
+    undefined,
+    { sinceDays: null },
+    undefined,
+    { snapshots: true, gemini: true },
   );
-  const res = await pushToCentral(rollups, context, cfg);
+  log(
+    `Upload backfill (full-history): computed ${rollups.length} token_usage row(s) + ${context.length} context session(s) + ${snapshots.length} snapshot(s) + ${gemini.length} gemini bucket(s) for host ${host}; POSTing to ${cfg.baseUrl}/api/ingest`,
+  );
+  const res = await pushToCentral(rollups, context, cfg, { snapshots, gemini });
   log(`Upload backfill: ${res.ok}/${res.chunks} chunk(s) OK, ${res.failed} failed`);
+}
+
+// --- Agent daemon mode ---
+// A long-lived local collector. Given CLAUDE_PULSE_UPLOAD_TO + INGEST_TOKEN, it
+// polls each signal LOCALLY on its own fast cadence, writes its own local store
+// (the working set), then PUSHES to the central server's /api/ingest. Every
+// signal loop is fail-soft: a failing signal/HTTP error logs + backs off but
+// never kills the daemon or the other loops.
+const AGENT_DEFAULTS = {
+  context: 30_000, // 30s
+  usage: 180_000, // 180s
+  tokens: 180_000, // 180s
+  gemini: 300_000, // 300s
+};
+
+function envInterval(name: string, fallbackMs: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallbackMs;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallbackMs;
+}
+
+/** Compute current 5h/7d snapshots locally, write them locally, and push to central. */
+async function agentPushSnapshots(): Promise<void> {
+  // Local write (per-profile snapshot rows on this machine's local store).
+  await pollAllProfiles();
+  // Compute the upload shape + push (account-level, latest-wins on the server).
+  const cfg = uploadConfig();
+  if (!cfg) return;
+  const { snapshots } = await computeUpload(undefined, undefined, undefined, { snapshots: true });
+  if (snapshots.length > 0) {
+    await reportToCentral([], [], cfg, { snapshots });
+  }
+}
+
+/** Fetch gemini quota once, store locally, and push to central. */
+async function agentPushGemini(): Promise<void> {
+  const cfg = uploadConfig();
+  if (!cfg) return;
+  // Local store write (default/local account) + compute upload buckets.
+  await pollGeminiQuota();
+  const { gemini } = await computeUpload(undefined, undefined, [], { gemini: true });
+  if (gemini.length > 0) {
+    await reportToCentral([], [], cfg, { gemini });
+  }
+}
+
+function startAgentLoop(
+  name: string,
+  intervalMs: number,
+  fn: () => Promise<void>,
+): ReturnType<typeof setInterval> {
+  const run = (): void => {
+    fn().catch((e) => log(`agent ${name}: ${(e as Error).message}`));
+  };
+  run(); // immediate first pass
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  log(`agent: ${name} loop every ${Math.round(intervalMs / 1000)}s`);
+  return timer;
+}
+
+async function agentDaemon(): Promise<void> {
+  const cfg = uploadConfig();
+  if (!cfg) {
+    log("Agent mode requires CLAUDE_PULSE_UPLOAD_TO + CLAUDE_PULSE_INGEST_TOKEN");
+    process.exit(1);
+    return;
+  }
+
+  log(`Initializing claude-pulse agent (pushing to ${cfg.baseUrl})...`);
+  await initDb();
+  await ensureDefaultProfiles();
+
+  // Optional one-time full-history backfill before the incremental loops start.
+  if (process.env.CLAUDE_PULSE_UPLOAD_BACKFILL === "1" || process.argv.includes("--backfill")) {
+    try {
+      await runUploadBackfill();
+    } catch (e) {
+      log(`Agent backfill error: ${(e as Error).message}`);
+    }
+  }
+
+  const intervals = {
+    context: envInterval("CLAUDE_PULSE_PUSH_CONTEXT_INTERVAL", AGENT_DEFAULTS.context),
+    usage: envInterval("CLAUDE_PULSE_PUSH_USAGE_INTERVAL", AGENT_DEFAULTS.usage),
+    tokens: envInterval("CLAUDE_PULSE_PUSH_TOKENS_INTERVAL", AGENT_DEFAULTS.tokens),
+    gemini: envInterval("CLAUDE_PULSE_PUSH_GEMINI_INTERVAL", AGENT_DEFAULTS.gemini),
+  };
+
+  // Each loop writes locally then pushes; all are independent + fail-soft.
+  const timers = [
+    // context: pollContextOnce() writes local context_sessions + pushes context.
+    startAgentLoop("context", intervals.context, () => pollContextOnce()),
+    // usage 5h/7d snapshots.
+    startAgentLoop("usage", intervals.usage, () => agentPushSnapshots()),
+    // token rollups (last-2-day window): runTokenRollupOnce writes local + pushes.
+    startAgentLoop("tokens", intervals.tokens, () => runTokenRollupOnce(2)),
+    // gemini quota.
+    startAgentLoop("gemini", intervals.gemini, () => agentPushGemini()),
+  ];
+
+  log("Agent daemon running (Ctrl-C to stop)");
+
+  const shutdown = (): void => {
+    log("Agent shutting down...");
+    for (const t of timers) clearInterval(t);
+    void closeDb().finally(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 // --- Main ---
@@ -976,6 +1098,10 @@ async function main(): Promise<void> {
   log("Database initialized with default profiles");
 
   const serverOnly = process.env.CLAUDE_PULSE_SERVER_ONLY === "1";
+  // Receiver-only: the central server is a PURE receiver. It serves the UI/API and
+  // accepts ingest, but runs NO local-file pollers (it has no config-dir access).
+  // Only meaningful alongside server-only.
+  const receiverOnly = serverOnly && process.env.CLAUDE_PULSE_RECEIVER_ONLY === "1";
 
   // Optional full-history backfills (before the normal loops start).
   // Local backfill: write every profile's full history into the local DB.
@@ -1002,18 +1128,25 @@ async function main(): Promise<void> {
     setMcpServer(server);
   }
 
-  // Start background pollers
-  await startAllPollers();
-  startGeminiPoller();
-  startContextPoller();
-  startTokenRollup();
+  // Start background pollers — UNLESS receiver-only (pure central receiver has no
+  // local files to poll; it only serves the UI/API + accepts ingest).
+  if (!receiverOnly) {
+    await startAllPollers();
+    startGeminiPoller();
+    startContextPoller();
+    startTokenRollup();
+  } else {
+    log("Receiver-only mode: skipping all local pollers (pure receiver)");
+  }
 
   // Start HTTP dashboard
   startHttpServer();
 
   if (serverOnly) {
     log(
-      "Server-only mode: HTTP dashboard + pollers running (no MCP stdio transport)"
+      receiverOnly
+        ? "Receiver-only mode: HTTP dashboard + ingest only (no pollers, no MCP stdio transport)"
+        : "Server-only mode: HTTP dashboard + pollers running (no MCP stdio transport)"
     );
   } else {
     // Connect MCP server via stdio
@@ -1043,6 +1176,13 @@ const migrateMode = process.argv.includes("--migrate-sqlite-to-pg");
 const uploadMode =
   process.env.CLAUDE_PULSE_MODE === "upload" || process.argv.includes("--upload-once");
 
+// Continuous local-collector daemon: polls locally + pushes each signal on its
+// own cadence. Gated by CLAUDE_PULSE_AGENT=1 (or CLAUDE_PULSE_MODE=agent).
+const agentMode =
+  process.env.CLAUDE_PULSE_AGENT === "1" ||
+  process.env.CLAUDE_PULSE_MODE === "agent" ||
+  process.argv.includes("--agent");
+
 // A backfill requested via env/flag. In one-shot upload mode this makes the
 // single push a FULL-HISTORY push, then exit.
 const wantBackfill =
@@ -1070,6 +1210,11 @@ if (migrateMode) {
       process.stderr.write(`[claude-pulse] Upload fatal error: ${err}\n`);
       process.exit(1);
     });
+} else if (agentMode) {
+  agentDaemon().catch((err) => {
+    process.stderr.write(`[claude-pulse] Agent fatal error: ${err}\n`);
+    process.exit(1);
+  });
 } else {
   main().catch((err) => {
     process.stderr.write(`[claude-pulse] Fatal error: ${err}\n`);

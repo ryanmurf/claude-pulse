@@ -35,6 +35,9 @@ import {
   contextSessionExists,
   countActiveIngestTokens,
   getAccountById,
+  ingestUsageSnapshot,
+  ensureProfileExists,
+  insertGeminiQuotaSnapshots,
   DEFAULT_ACCOUNT_IDENTITY,
 } from "./store.js";
 import { pollProfile, pollAllProfiles } from "./poller.js";
@@ -459,9 +462,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/gemini-quota
+    // GET /api/gemini-quota — scoped to the requesting account
     if (pathname === "/api/gemini-quota" && method === "GET") {
-      sendJson(res, formatGeminiQuotaSnapshots(await getLatestGeminiQuota()));
+      const account = await accountForRequest(req);
+      sendJson(res, formatGeminiQuotaSnapshots(await getLatestGeminiQuota(account.id)));
       return;
     }
 
@@ -715,7 +719,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const accountExempt = ingestAccount ? isExemptAccount(ingestAccount) : false;
       const rollupCount = Array.isArray(body?.rollups) ? body.rollups.length : 0;
       const contextCount = Array.isArray(body?.context) ? body.context.length : 0;
-      if (!accountExempt && rollupCount + contextCount > maxRowsPerRequest()) {
+      const snapshotCount = Array.isArray(body?.snapshots) ? body.snapshots.length : 0;
+      const geminiCount = Array.isArray(body?.gemini) ? body.gemini.length : 0;
+      if (!accountExempt && rollupCount + contextCount + snapshotCount + geminiCount > maxRowsPerRequest()) {
         sendError(
           res,
           413,
@@ -810,6 +816,61 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       }
 
+      // snapshots — account-level 5h/7d per profile (latest poll wins). machine is
+      // metadata only; we do NOT fan rows out per machine. Ensure the profile row
+      // exists (FK) under this account before inserting.
+      let snapshotsUpserted = 0;
+      if (Array.isArray(body?.snapshots)) {
+        for (const s of body.snapshots) {
+          if (!s || typeof s !== "object") continue;
+          const profile = typeof s.profile === "string" ? s.profile : "";
+          if (!profile) continue;
+          await ensureProfileExists(profile, accountId);
+          await ingestUsageSnapshot({
+            account_id: accountId,
+            profile,
+            five_hour_pct: s.five_hour_pct != null ? toFiniteNum(s.five_hour_pct) : null,
+            five_hour_resets_at: typeof s.five_hour_resets_at === "string" ? s.five_hour_resets_at : null,
+            seven_day_pct: s.seven_day_pct != null ? toFiniteNum(s.seven_day_pct) : null,
+            seven_day_resets_at: typeof s.seven_day_resets_at === "string" ? s.seven_day_resets_at : null,
+            context_tokens: s.context_tokens != null ? toFiniteInt(s.context_tokens) : null,
+            context_pct: s.context_pct != null ? toFiniteNum(s.context_pct) : null,
+            context_session_id: typeof s.context_session_id === "string" ? s.context_session_id : null,
+            context_model: typeof s.context_model === "string" ? s.context_model : null,
+            context_effective_limit: s.context_effective_limit != null ? toFiniteInt(s.context_effective_limit) : null,
+            context_last_reset_at: typeof s.context_last_reset_at === "string" ? s.context_last_reset_at : null,
+            polled_at: typeof s.polled_at === "string" && s.polled_at ? s.polled_at : null,
+          });
+          snapshotsUpserted++;
+        }
+      }
+
+      // gemini — per-account gemini_quota buckets (latest wins via newest id).
+      let geminiUpserted = 0;
+      if (Array.isArray(body?.gemini)) {
+        const validBuckets: {
+          modelId: string;
+          remainingFraction: number;
+          remainingAmount: string | null;
+          resetTime: string | null;
+        }[] = [];
+        for (const g of body.gemini) {
+          if (!g || typeof g !== "object") continue;
+          const modelId = typeof g.model_id === "string" ? g.model_id : "";
+          if (!modelId || !Number.isFinite(g.remaining_fraction)) continue;
+          validBuckets.push({
+            modelId,
+            remainingFraction: toFiniteNum(g.remaining_fraction),
+            remainingAmount: typeof g.remaining_amount === "string" ? g.remaining_amount : null,
+            resetTime: typeof g.reset_time === "string" ? g.reset_time : null,
+          });
+        }
+        if (validBuckets.length > 0) {
+          await insertGeminiQuotaSnapshots(validBuckets, accountId);
+          geminiUpserted = validBuckets.length;
+        }
+      }
+
       // New inserts changed the row counts — drop the cached counts so the next
       // request re-reads an accurate total (cheap; only on accounts near the cap).
       if (!accountExempt && (upserted > 0 || contextUpserted > 0)) {
@@ -837,6 +898,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         ok: true,
         upserted,
         context_upserted: contextUpserted,
+        snapshots_upserted: snapshotsUpserted,
+        gemini_upserted: geminiUpserted,
         ...(rejected > 0
           ? {
               rejected,

@@ -130,6 +130,7 @@ export interface UsageSnapshot {
 
 export interface GeminiQuotaSnapshot {
   id: number;
+  account_id: number | null;
   timestamp: string;
   model_id: string;
   remaining_fraction: number;

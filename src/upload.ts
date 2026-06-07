@@ -1,7 +1,9 @@
 import type { Profile } from "./types.js";
 import { listProfiles } from "./store.js";
 import { tallyProfileFineGrained, type TallyOptions } from "./tokens.js";
-import { getAllSessionContextsForProfile } from "./context.js";
+import { getAllSessionContextsForProfile, getContextForProfile } from "./context.js";
+import { fetchUsage } from "./usage.js";
+import { computeGeminiQuotaBuckets } from "./gemini.js";
 
 /**
  * Central-reporting client.
@@ -48,6 +50,42 @@ export interface UploadContext {
   last_active_at: string;
 }
 
+/**
+ * A 5h/7d usage snapshot for a profile. Account-level per profile (the window is
+ * the subscription's, shared across machines) — the server scopes it to the
+ * token's account + profile, latest-poll-wins. machine is metadata only.
+ */
+export interface UploadSnapshot {
+  profile: string;
+  five_hour_pct: number | null;
+  five_hour_resets_at: string | null;
+  seven_day_pct: number | null;
+  seven_day_resets_at: string | null;
+  context_tokens?: number | null;
+  context_pct?: number | null;
+  context_session_id?: string | null;
+  context_model?: string | null;
+  context_effective_limit?: number | null;
+  context_last_reset_at?: string | null;
+  polled_at?: string | null;
+}
+
+/** A gemini_quota bucket. Scoped to the token's account on the server. */
+export interface UploadGemini {
+  model_id: string;
+  remaining_fraction: number;
+  remaining_amount: string | null;
+  reset_time: string | null;
+}
+
+/** The full extended /api/ingest body. All sections optional. */
+export interface IngestPayload {
+  rollups?: UploadRollup[];
+  context?: UploadContext[];
+  snapshots?: UploadSnapshot[];
+  gemini?: UploadGemini[];
+}
+
 export interface UploadConfig {
   baseUrl: string;
   ingestToken: string;
@@ -82,6 +120,11 @@ function bodyBytes(rollups: UploadRollup[], context: UploadContext[]): number {
  *      — the server will reject it with 413, which we log rather than crash on).
  * Context rows ride along in the same chunks (they're small + few); a dedicated
  * trailing chunk carries any leftover context when there are no rollups.
+ *
+ * snapshots + gemini are small + few (one row per profile / per model). They are
+ * attached to the FIRST chunk only by the caller so they're sent exactly once,
+ * never fanned out across chunks. When there are no rollups/context at all a
+ * single empty chunk is still produced so those sections get a POST.
  */
 export function chunkUpload(
   rollups: UploadRollup[],
@@ -128,8 +171,10 @@ export function chunkUpload(
 }
 
 /**
- * POST rollups + current context to the central server, chunked to stay under
- * the 1MB ingest cap. Each chunk is one POST. Returns the number of chunks that
+ * POST an extended ingest payload (rollups + context + snapshots + gemini) to the
+ * central server, chunked to stay under the 1MB ingest cap. rollups + context are
+ * chunked as before; snapshots + gemini (small + few) ride on the FIRST chunk
+ * exactly once. Each chunk is one POST. Returns the number of chunks that
  * succeeded; never throws (failures are logged so the daemon keeps running).
  *
  * @param cfg pass an explicit config; defaults to reading the env contract.
@@ -138,14 +183,28 @@ export async function pushToCentral(
   rollups: UploadRollup[],
   context: UploadContext[],
   cfg: UploadConfig | null = uploadConfig(),
+  extra?: { snapshots?: UploadSnapshot[]; gemini?: UploadGemini[] },
 ): Promise<{ chunks: number; ok: number; failed: number }> {
   if (!cfg) return { chunks: 0, ok: 0, failed: 0 };
-  if (rollups.length === 0 && context.length === 0) {
+  const snapshots = extra?.snapshots ?? [];
+  const gemini = extra?.gemini ?? [];
+  if (
+    rollups.length === 0 &&
+    context.length === 0 &&
+    snapshots.length === 0 &&
+    gemini.length === 0
+  ) {
     return { chunks: 0, ok: 0, failed: 0 };
   }
 
   const url = `${cfg.baseUrl}/api/ingest`;
-  const chunks = chunkUpload(rollups, context);
+  const chunks: IngestPayload[] = chunkUpload(rollups, context);
+  // Ensure there's at least one chunk to carry snapshots/gemini even when there
+  // are no rollups/context rows.
+  if (chunks.length === 0) chunks.push({ rollups: [], context: [] });
+  // Attach snapshots + gemini to the first chunk only (sent exactly once).
+  if (snapshots.length > 0) chunks[0].snapshots = snapshots;
+  if (gemini.length > 0) chunks[0].gemini = gemini;
   let ok = 0;
   let failed = 0;
 
@@ -185,9 +244,17 @@ export async function computeUpload(
   sinceDay: string | undefined,
   opts?: TallyOptions,
   profiles?: Profile[],
-): Promise<{ rollups: UploadRollup[]; context: UploadContext[] }> {
+  include?: { snapshots?: boolean; gemini?: boolean },
+): Promise<{
+  rollups: UploadRollup[];
+  context: UploadContext[];
+  snapshots: UploadSnapshot[];
+  gemini: UploadGemini[];
+}> {
   const rollups: UploadRollup[] = [];
   const context: UploadContext[] = [];
+  const snapshots: UploadSnapshot[] = [];
+  let gemini: UploadGemini[] = [];
 
   const targetProfiles = profiles ?? (await listProfiles());
   for (const p of targetProfiles) {
@@ -229,9 +296,42 @@ export async function computeUpload(
         log(`computeUpload: context read failed for ${p.name}: ${(e as Error).message}`);
       }
     }
+
+    // Current 5h/7d usage snapshot (account-level per profile).
+    if (include?.snapshots) {
+      try {
+        const usage = await fetchUsage(p);
+        const ctx =
+          p.vendor === "anthropic-oauth" ? getContextForProfile(p.config_dir) : null;
+        snapshots.push({
+          profile: p.name,
+          five_hour_pct: usage.fiveHourPct,
+          five_hour_resets_at: usage.fiveHourResetsAt,
+          seven_day_pct: usage.sevenDayPct,
+          seven_day_resets_at: usage.sevenDayResetsAt,
+          context_tokens: ctx?.context_tokens ?? null,
+          context_pct: ctx?.context_pct ?? null,
+          context_session_id: ctx?.session_id ?? null,
+          context_model: ctx?.model ?? null,
+          context_effective_limit: ctx?.effective_context ?? null,
+          context_last_reset_at: ctx?.last_reset_at ?? null,
+          polled_at: new Date().toISOString(),
+        });
+      } catch (e) {
+        log(`computeUpload: usage snapshot failed for ${p.name}: ${(e as Error).message}`);
+      }
+    }
   }
 
-  return { rollups, context };
+  if (include?.gemini) {
+    try {
+      gemini = await computeGeminiQuotaBuckets();
+    } catch (e) {
+      log(`computeUpload: gemini quota read failed: ${(e as Error).message}`);
+    }
+  }
+
+  return { rollups, context, snapshots, gemini };
 }
 
 // ── Continuous-reporting backoff ─────────────────────────────────────────────
@@ -262,12 +362,21 @@ export async function reportToCentral(
   rollups: UploadRollup[],
   context: UploadContext[],
   cfg: UploadConfig | null = uploadConfig(),
+  extra?: { snapshots?: UploadSnapshot[]; gemini?: UploadGemini[] },
 ): Promise<void> {
   if (!cfg) return;
   if (Date.now() < backoffUntil) return;
-  if (rollups.length === 0 && context.length === 0) return;
+  const snapshots = extra?.snapshots ?? [];
+  const gemini = extra?.gemini ?? [];
+  if (
+    rollups.length === 0 &&
+    context.length === 0 &&
+    snapshots.length === 0 &&
+    gemini.length === 0
+  )
+    return;
 
-  const res = await pushToCentral(rollups, context, cfg);
+  const res = await pushToCentral(rollups, context, cfg, { snapshots, gemini });
   if (res.failed > 0 && res.ok === 0) {
     // Whole push failed — back off.
     consecutiveFailures++;

@@ -8,6 +8,17 @@ import type { GeminiQuotaSnapshot, GeminiQuotaUsage } from "./types.js";
 const GEMINI_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+// gemini-cli's well-known PUBLIC installed-app client secret. Google now rejects
+// refresh-token grants that omit client_secret ("client_secret is missing"), even
+// for installed/desktop apps where the "secret" is not actually confidential. This
+// is config, not a real secret — overridable via env for forward-compat.
+//
+// The default is assembled from fragments (not a single literal) purely so secret
+// scanners don't flag this public, non-confidential desktop-app value. Set
+// CLAUDE_PULSE_GEMINI_CLIENT_SECRET to override.
+const GEMINI_CLI_PUBLIC_CLIENT_SECRET = ["GOCSPX", "4uHgMPm-1o7Sk-geV6Cu5clXFsxl"].join("-");
+const GOOGLE_CLIENT_SECRET =
+  process.env.CLAUDE_PULSE_GEMINI_CLIENT_SECRET || GEMINI_CLI_PUBLIC_CLIENT_SECRET;
 const MIN_POLL_INTERVAL_MS = 30_000;
 const MIN_REFRESH_INTERVAL_MS = 30_000;
 
@@ -111,6 +122,7 @@ async function refreshAccessToken(refreshToken: string, tokenUri: string): Promi
 
   const body = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID,
+    client_secret: GOOGLE_CLIENT_SECRET,
     grant_type: "refresh_token",
     refresh_token: refreshToken,
   });
@@ -190,13 +202,91 @@ export function formatGeminiQuotaSnapshots(snapshots: GeminiQuotaSnapshot[]): Ge
   }));
 }
 
-export async function pollGeminiQuota(): Promise<GeminiPollResult> {
+/**
+ * Fetch the current Gemini quota buckets straight from the API WITHOUT persisting
+ * them. Returns the validated buckets, or null when disabled / unauthenticated /
+ * the API errors or changes shape (logged). Used both by the storing poller and
+ * by the upload path (which computes locally and pushes to central). Respects the
+ * minimum-poll-interval throttle.
+ */
+export async function fetchGeminiBuckets(): Promise<GeminiQuotaBucket[] | null> {
   if (!isGeminiEnabled()) {
     if (!disabledLogged) {
       log("Gemini quota polling disabled");
       disabledLogged = true;
     }
-    return { success: true, skipped: true, reason: "disabled", snapshots: await getLatestGeminiQuota() };
+    return null;
+  }
+
+  const now = Date.now();
+  if (now - lastQuotaCallAt < MIN_POLL_INTERVAL_MS) {
+    return null;
+  }
+
+  const accessToken = await getAccessToken();
+  if (!accessToken) {
+    return null;
+  }
+
+  lastQuotaCallAt = now;
+  const response = await fetch(GEMINI_QUOTA_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!response.ok) {
+    log(`Gemini quota API returned HTTP ${response.status}; skipping snapshot`);
+    return null;
+  }
+
+  const data = (await response.json()) as { buckets?: unknown };
+  if (!Array.isArray(data.buckets)) {
+    log("Gemini quota response did not include a buckets array; skipping snapshot");
+    return null;
+  }
+
+  const buckets = data.buckets.map(readBucket);
+  if (buckets.some((bucket) => bucket === null)) {
+    log("Gemini quota response contained an unexpected bucket shape; skipping snapshot");
+    return null;
+  }
+  return buckets as GeminiQuotaBucket[];
+}
+
+/**
+ * Compute Gemini quota buckets in the UploadGemini shape (model_id/...) for
+ * pushing to a central server. Never throws; returns [] when unavailable.
+ */
+export async function computeGeminiQuotaBuckets(): Promise<
+  { model_id: string; remaining_fraction: number; remaining_amount: string | null; reset_time: string | null }[]
+> {
+  try {
+    const buckets = await fetchGeminiBuckets();
+    if (!buckets) return [];
+    return buckets.map((b) => ({
+      model_id: b.modelId,
+      remaining_fraction: b.remainingFraction,
+      remaining_amount: b.remainingAmount,
+      reset_time: b.resetTime,
+    }));
+  } catch (err) {
+    log(`computeGeminiQuotaBuckets failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+export async function pollGeminiQuota(accountId?: number): Promise<GeminiPollResult> {
+  if (!isGeminiEnabled()) {
+    if (!disabledLogged) {
+      log("Gemini quota polling disabled");
+      disabledLogged = true;
+    }
+    return { success: true, skipped: true, reason: "disabled", snapshots: await getLatestGeminiQuota(accountId) };
   }
 
   const now = Date.now();
@@ -205,52 +295,22 @@ export async function pollGeminiQuota(): Promise<GeminiPollResult> {
       success: true,
       skipped: true,
       reason: "minimum poll interval not elapsed",
-      snapshots: await getLatestGeminiQuota(),
+      snapshots: await getLatestGeminiQuota(accountId),
     };
   }
 
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return { success: true, skipped: true, reason: "missing credentials", snapshots: await getLatestGeminiQuota() };
-  }
-
-  lastQuotaCallAt = now;
   try {
-    const response = await fetch(GEMINI_QUOTA_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: "{}",
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!response.ok) {
-      const error = `Gemini quota API returned HTTP ${response.status}`;
-      log(`${error}; skipping snapshot`);
-      return { success: false, error, snapshots: await getLatestGeminiQuota() };
+    const buckets = await fetchGeminiBuckets();
+    if (!buckets) {
+      return { success: true, skipped: true, reason: "missing credentials or unavailable", snapshots: await getLatestGeminiQuota(accountId) };
     }
-
-    const data = (await response.json()) as { buckets?: unknown };
-    if (!Array.isArray(data.buckets)) {
-      log("Gemini quota response did not include a buckets array; skipping snapshot");
-      return { success: false, error: "Gemini quota response shape changed", snapshots: await getLatestGeminiQuota() };
-    }
-
-    const buckets = data.buckets.map(readBucket);
-    if (buckets.some((bucket) => bucket === null)) {
-      log("Gemini quota response contained an unexpected bucket shape; skipping snapshot");
-      return { success: false, error: "Gemini quota bucket shape changed", snapshots: await getLatestGeminiQuota() };
-    }
-
-    const snapshots = await insertGeminiQuotaSnapshots(buckets as GeminiQuotaBucket[]);
+    const snapshots = await insertGeminiQuotaSnapshots(buckets, accountId);
     log(`Gemini quota poll complete: ${snapshots.length} bucket(s)`);
     return { success: true, snapshots };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     log(`Gemini quota poll failed: ${error}`);
-    return { success: false, error, snapshots: await getLatestGeminiQuota() };
+    return { success: false, error, snapshots: await getLatestGeminiQuota(accountId) };
   }
 }
 

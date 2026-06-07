@@ -120,7 +120,8 @@ export async function initDb(
   } else if (pgConfigFromEnv()) {
     backend = await createPgBackend();
   } else {
-    const resolvedPath = dbPath ?? DEFAULT_DB_PATH;
+    // Precedence: explicit dbPath arg (tests) → CLAUDE_PULSE_DB_PATH env → default.
+    const resolvedPath = dbPath ?? process.env.CLAUDE_PULSE_DB_PATH ?? DEFAULT_DB_PATH;
     const resolvedDir = path.dirname(resolvedPath);
     fs.mkdirSync(resolvedDir, { recursive: true });
     const sqlite = new DatabaseSync(resolvedPath);
@@ -267,9 +268,24 @@ async function createSchema(db: Backend): Promise<void> {
     )
   `);
 
+  // gemini_quota gained account_id in the push/telemetry rework. Per-account
+  // gemini quota; existing rows default to the local/default account below.
+  if (d === "sqlite") {
+    const gqCols = (await db.all<{ name: string }>("PRAGMA table_info(gemini_quota)")).map((c) => c.name);
+    if (!gqCols.includes("account_id")) {
+      await db.exec("ALTER TABLE gemini_quota ADD COLUMN account_id INTEGER");
+    }
+  } else {
+    await db.exec("ALTER TABLE gemini_quota ADD COLUMN IF NOT EXISTS account_id INTEGER");
+  }
+
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_gemini_quota_model_time
       ON gemini_quota(model_id, timestamp)
+  `);
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_gemini_quota_account_model_time
+      ON gemini_quota(account_id, model_id, timestamp)
   `);
 
   await db.exec(`
@@ -501,6 +517,7 @@ async function createSchema(db: Backend): Promise<void> {
   await db.run("UPDATE profiles SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
   await db.run("UPDATE alert_subscriptions SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
   await db.run("UPDATE alert_events SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
+  await db.run("UPDATE gemini_quota SET account_id = ? WHERE account_id IS NULL", [defaultAcct.id]);
 }
 
 /**
@@ -650,6 +667,32 @@ export async function addProfile(
   return (await getProfile(name, acct))!;
 }
 
+/**
+ * Ensure a profile row exists for `name` so FK-constrained inserts (e.g.
+ * usage_snapshots) succeed. profiles.name is globally unique (PK), so this is a
+ * no-op when the name already exists (under ANY account). When it doesn't, a
+ * minimal placeholder row is created tagged with the ingesting account so the
+ * dashboard can list it. Returns true if a new row was inserted.
+ */
+export async function ensureProfileExists(
+  name: string,
+  accountId: number,
+): Promise<boolean> {
+  const d = getDb();
+  const existing = await d.get<{ name: string }>(
+    "SELECT name FROM profiles WHERE name = ?",
+    [name],
+  );
+  if (existing) return false;
+  await d.run(
+    `INSERT INTO profiles (name, config_dir, poll_interval_minutes, vendor, account_id)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(name) DO NOTHING`,
+    [name, "", 5, "anthropic-oauth", accountId],
+  );
+  return true;
+}
+
 export async function updateProfileBudget(
   name: string,
   monthlyBudgetUsd: number | null,
@@ -743,6 +786,63 @@ export async function insertSnapshot(
     ],
   );
 
+  return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [id]))!;
+}
+
+/**
+ * Ingest a 5h/7d usage snapshot pushed from a local agent, scoped to the given
+ * account + profile. usage_snapshots are ACCOUNT-LEVEL per profile (the 5h/7d
+ * window belongs to the subscription, shared across machines), so we just insert
+ * a fresh row with the supplied polled_at — "latest poll wins" falls out of the
+ * existing ORDER BY polled_at DESC reads. machine is metadata only and is NOT
+ * used to fan rows out per machine.
+ *
+ * The profile row must exist for the account (FK on usage_snapshots.profile);
+ * the caller is responsible for ensuring the profile exists.
+ */
+export interface IngestSnapshotInput {
+  account_id: number;
+  profile: string;
+  five_hour_pct: number | null;
+  five_hour_resets_at: string | null;
+  seven_day_pct: number | null;
+  seven_day_resets_at: string | null;
+  context_tokens?: number | null;
+  context_pct?: number | null;
+  context_session_id?: string | null;
+  context_model?: string | null;
+  context_effective_limit?: number | null;
+  context_last_reset_at?: string | null;
+  polled_at?: string | null;
+}
+
+export async function ingestUsageSnapshot(
+  input: IngestSnapshotInput,
+): Promise<UsageSnapshot> {
+  const d = getDb();
+  const polledAt = input.polled_at || new Date().toISOString();
+  const id = await d.insertReturningId(
+    `INSERT INTO usage_snapshots
+       (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
+        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at, polled_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.account_id,
+      input.profile,
+      input.five_hour_pct,
+      input.five_hour_resets_at,
+      input.seven_day_pct,
+      input.seven_day_resets_at,
+      null,
+      input.context_tokens ?? null,
+      input.context_pct ?? null,
+      input.context_session_id ?? null,
+      input.context_model ?? null,
+      input.context_effective_limit ?? null,
+      input.context_last_reset_at ?? null,
+      polledAt,
+    ],
+  );
   return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [id]))!;
 }
 
@@ -862,19 +962,21 @@ export async function insertGeminiQuotaSnapshots(
     remainingAmount: string | null;
     resetTime: string | null;
   }[],
+  accountId?: number,
 ): Promise<GeminiQuotaSnapshot[]> {
   if (buckets.length === 0) return [];
 
   const d = getDb();
+  const acct = accountId ?? (await defaultAccountId());
   const rows: GeminiQuotaSnapshot[] = [];
 
   await d.transaction(async (tx) => {
     for (const bucket of buckets) {
       const id = await tx.insertReturningId(
         `INSERT INTO gemini_quota
-           (model_id, remaining_fraction, remaining_amount, reset_time)
-         VALUES (?, ?, ?, ?)`,
-        [bucket.modelId, bucket.remainingFraction, bucket.remainingAmount, bucket.resetTime],
+           (account_id, model_id, remaining_fraction, remaining_amount, reset_time)
+         VALUES (?, ?, ?, ?, ?)`,
+        [acct, bucket.modelId, bucket.remainingFraction, bucket.remainingAmount, bucket.resetTime],
       );
       rows.push((await tx.get<GeminiQuotaSnapshot>("SELECT * FROM gemini_quota WHERE id = ?", [id]))!);
     }
@@ -883,17 +985,21 @@ export async function insertGeminiQuotaSnapshots(
   return rows;
 }
 
-export async function getLatestGeminiQuota(): Promise<GeminiQuotaSnapshot[]> {
+export async function getLatestGeminiQuota(accountId?: number): Promise<GeminiQuotaSnapshot[]> {
   const d = getDb();
+  const acct = accountId ?? (await defaultAccountId());
   return d.all<GeminiQuotaSnapshot>(
     `SELECT *
      FROM gemini_quota
-     WHERE id IN (
-       SELECT MAX(id)
-       FROM gemini_quota
-       GROUP BY model_id
-     )
+     WHERE account_id = ?
+       AND id IN (
+         SELECT MAX(id)
+         FROM gemini_quota
+         WHERE account_id = ?
+         GROUP BY model_id
+       )
      ORDER BY model_id`,
+    [acct, acct],
   );
 }
 
