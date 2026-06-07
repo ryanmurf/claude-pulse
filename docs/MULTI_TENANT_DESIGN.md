@@ -120,6 +120,61 @@ stream transcripts line-by-line, so memory stays bounded across thousands of fil
 4. (Optional, one-time) seed full history: run once with `CLAUDE_PULSE_UPLOAD_BACKFILL=1` (or
    `--backfill`), or `CLAUDE_PULSE_MODE=upload CLAUDE_PULSE_UPLOAD_BACKFILL=1` for a one-shot.
 
+## Push/telemetry architecture (central = pure receiver, every machine = local agent)
+
+The deployment model is: **central server = pure receiver** (Postgres store + HTTP
+UI + `/api/ingest`, NO local-file pollers, no config-dir access); **every machine
+(incl. tron) = a local agent** that polls locally and PUSHES all signals to the
+central server, attributed to its per-(account,machine) ingest token.
+
+### Extended `/api/ingest` body (all sections optional)
+```jsonc
+{
+  "rollups":   [ /* token_usage grain rows (account+machine from token) */ ],
+  "context":   [ /* context_sessions rows (account+machine from token) */ ],
+  "snapshots": [ /* 5h/7d usage_snapshots — ACCOUNT-LEVEL per profile,
+                    latest-poll-wins; machine is metadata only, NOT fanned out */ ],
+  "gemini":    [ /* gemini_quota buckets — per-ACCOUNT */ ]
+}
+```
+- `rollups` / `context` — unchanged from before.
+- `snapshots[]`: `{profile, five_hour_pct, five_hour_resets_at, seven_day_pct,
+  seven_day_resets_at, context_tokens?, context_pct?, context_session_id?,
+  context_model?, context_effective_limit?, context_last_reset_at?, polled_at?}`.
+  Stored scoped to the **token's account + profile**, latest poll wins (newest
+  `polled_at`). The profile row is auto-created for the account if absent (FK).
+- `gemini[]`: `{model_id, remaining_fraction, remaining_amount, reset_time}`.
+  Stored scoped to the **token's account**; `/api/gemini-quota` reads are
+  account-scoped.
+- Per-account caps + rate-limit on `/api/ingest` are preserved; snapshots+gemini
+  count toward the per-request row cap. Chunking (`pushToCentral`) keeps each POST
+  under the 1MB cap; snapshots+gemini ride on the FIRST chunk exactly once.
+- Response adds `snapshots_upserted` + `gemini_upserted` counts.
+
+### Migration notes (new account_id columns)
+- `usage_snapshots.account_id` already existed (multi-tenant rework). No new
+  migration; ingest just scopes inserts to the token's account.
+- `gemini_quota.account_id` is **new** (migration-safe `ALTER TABLE ... ADD COLUMN
+  IF NOT EXISTS` / SQLite PRAGMA guard). Existing rows are backfilled to the
+  default/local account in `createSchema`. A new
+  `idx_gemini_quota_account_model_time` index supports per-account reads.
+
+### Env-var contract (receiver-only + agent + gemini)
+| Env var | Meaning |
+|---|---|
+| `CLAUDE_PULSE_RECEIVER_ONLY=1` | With `CLAUDE_PULSE_SERVER_ONLY=1`: pure receiver — starts HTTP server + DB only; runs NO `pollAllProfiles`, gemini poller, context poller, or token-rollup loop. |
+| `CLAUDE_PULSE_AGENT=1` (or `CLAUDE_PULSE_MODE=agent` / `--agent`) | Long-lived local collector daemon. Requires `CLAUDE_PULSE_UPLOAD_TO` + `CLAUDE_PULSE_INGEST_TOKEN`. Polls locally + pushes each signal on its own cadence; writes its own local store; fail-soft per signal. |
+| `CLAUDE_PULSE_PUSH_CONTEXT_INTERVAL` | Agent: context push interval (ms, default 30000). |
+| `CLAUDE_PULSE_PUSH_USAGE_INTERVAL` | Agent: 5h/7d snapshot push interval (ms, default 180000). |
+| `CLAUDE_PULSE_PUSH_TOKENS_INTERVAL` | Agent: token-rollup push interval (ms, default 180000; last-2-day window). |
+| `CLAUDE_PULSE_PUSH_GEMINI_INTERVAL` | Agent: gemini-quota push interval (ms, default 300000). |
+| `CLAUDE_PULSE_GEMINI_CLIENT_SECRET` | Override the gemini-cli public installed-app client secret used in the OAuth refresh (`client_secret`). Defaults to the well-known constant. Config, not a real secret. |
+| `CLAUDE_PULSE_DB_PATH` | Override the local SQLite store path (ignored when Postgres env is set). |
+
+The existing one-shot `CLAUDE_PULSE_MODE=upload` + `--backfill` and the continuous
+reporting wired into the long-running daemon loops keep working; both now also
+push `snapshots` + `gemini` so a machine's first sync is complete.
+
 ## Out of scope here / decisions deferred
 - **Who may sign up** (open the herodevs realm vs a dedicated public realm vs an allow-list)
   is a deliberate auth-posture decision — the app is built fully multi-tenant + isolated,
