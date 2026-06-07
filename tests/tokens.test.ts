@@ -136,6 +136,23 @@ describe("tallyProfileTokens — Claude", () => {
     });
     expect(rows).toEqual([]);
   });
+
+  it("sinceDays:null (full history) includes old days a since-day window excludes", async () => {
+    copyFixtureToProjects("claude-usage.jsonl");
+    const profile = { name: "test", config_dir: tmpDir, vendor: "anthropic-oauth" as const };
+
+    // A since-day cutoff AFTER the fixture's oldest day drops the 2026-06-01 rows.
+    const windowed = await tallyProfileTokens(profile, "2026-06-02");
+    expect(windowed.some((r) => r.day === "2026-06-01")).toBe(false);
+
+    // Full-history scan ignores both the mtime gate and the day-floor filter, so
+    // the old 2026-06-01 day comes back even with the same since-day passed in.
+    const full = await tallyProfileTokens(profile, "2026-06-02", { sinceDays: null });
+    expect(full.some((r) => r.day === "2026-06-01")).toBe(true);
+    expect(full.some((r) => r.day === "2026-06-02")).toBe(true);
+    // And it's a SUPERSET of the windowed result (full history >= windowed days).
+    expect(full.length).toBeGreaterThan(windowed.length);
+  });
 });
 
 describe("tallyProfileTokens — codex", () => {
