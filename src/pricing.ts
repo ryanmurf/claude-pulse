@@ -83,7 +83,12 @@ export const DEFAULT_PRICING: PricingRow[] = [
   // OpenAI batch/flex tier — ~50% off (example variant; applies to gpt-5.5)
   { model: "gpt-5.5", settings_match_json: "{\"service_tier\":\"batch\"}", input: 2.5, output: 15, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.25 },
 
-  // DeepSeek v4-flash (deepseek-chat/-reasoner alias here; cache-miss input = input, cache-hit = cache_read)
+  // DeepSeek V4 (official api-docs.deepseek.com/quick_start/pricing, seen 2026-06-07;
+  // cache-miss input = input, cache-hit = cache_read, no cache-write charge).
+  // Longest-prefix match: "deepseek-v4-pro-…" -> pro, "deepseek-v4-flash-…" -> flash,
+  // anything else "deepseek…" -> the generic flash-priced fallback.
+  { model: "deepseek-v4-pro", settings_match_json: "{}", input: 0.435, output: 0.87, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.003625 },
+  { model: "deepseek-v4-flash", settings_match_json: "{}", input: 0.14, output: 0.28, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.0028 },
   { model: "deepseek", settings_match_json: "{}", input: 0.14, output: 0.28, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.0028 },
 
   // Google Gemini (≤200k-token rate; doubles >200k — not modeled. No cache-write charge.)
