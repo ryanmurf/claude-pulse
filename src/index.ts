@@ -135,6 +135,12 @@ server.tool(
       const now = Date.now();
       const resetMs = new Date(resetsAt).getTime();
       const remaining = resetMs - now;
+      // resets_at in the past = the window rolled over since this snapshot was
+      // taken; the pct belongs to a previous window. Extrapolating pace from it
+      // produces nonsense (e.g. "1790% expected") — flag it stale instead.
+      if (remaining <= 0) {
+        return `${label}: ${usedPct.toFixed(0)}% used — stale (window already reset; awaiting fresh poll)`;
+      }
       const elapsed = duration - remaining;
       const elapsedPct = Math.max((elapsed / duration) * 100, 1);
       const ratio = usedPct / elapsedPct;

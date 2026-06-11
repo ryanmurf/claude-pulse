@@ -122,6 +122,68 @@ describe("POST /api/ingest — snapshots", () => {
     expect(localSnap?.five_hour_pct ?? null).toBe(null);
   });
 
+  it("rejects a snapshot whose resets_at regresses (stale reporter can't shadow fresh data)", async () => {
+    const acct = await resolveAccount("stale-guard@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "fresh-machine");
+
+    // Fresh content from an active machine.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "codex",
+            five_hour_pct: 8,
+            five_hour_resets_at: "2026-06-12T01:13:50.000Z",
+            seven_day_pct: 3,
+            seven_day_resets_at: "2026-06-18T03:50:52.000Z",
+            polled_at: "2026-06-11T22:00:00.000Z",
+          },
+        ],
+      },
+    });
+
+    // An idle machine re-publishes a previous window's content with a NEWER
+    // polled_at (the 2026-06-11 tron/codex failure mode) — must not win.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "codex",
+            five_hour_pct: 10,
+            five_hour_resets_at: "2026-06-08T09:44:25.000Z",
+            seven_day_pct: 77,
+            seven_day_resets_at: "2026-06-11T02:13:16.000Z",
+            polled_at: "2026-06-11T22:05:00.000Z",
+          },
+        ],
+      },
+    });
+
+    const latest = await getLatestSnapshot("codex", acct.id);
+    expect(latest?.seven_day_pct).toBe(3);
+    expect(latest?.seven_day_resets_at).toBe("2026-06-18T03:50:52.000Z");
+
+    // Same-window updates (equal resets_at, pct accumulating) still apply.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "codex",
+            five_hour_pct: 9,
+            five_hour_resets_at: "2026-06-12T01:13:50.000Z",
+            seven_day_pct: 4,
+            seven_day_resets_at: "2026-06-18T03:50:52.000Z",
+            polled_at: "2026-06-11T22:10:00.000Z",
+          },
+        ],
+      },
+    });
+    expect((await getLatestSnapshot("codex", acct.id))?.seven_day_pct).toBe(4);
+  });
+
   it("is account-scoped — two accounts don't see each other's snapshots", async () => {
     const a = await resolveAccount("snap-a@example.com");
     const b = await resolveAccount("snap-b@example.com");

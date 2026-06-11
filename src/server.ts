@@ -327,7 +327,8 @@ interface PaceInfo {
   window: string;
   used_pct: number;
   remaining: string;
-  elapsed_pct: number;
+  /** null when the snapshot is stale (window already reset) — no pace estimate. */
+  elapsed_pct: number | null;
   pace: string;
 }
 
@@ -371,6 +372,20 @@ async function computePace(accountId: number, profileFilter?: string): Promise<P
       const now = Date.now();
       const resetMs = new Date(w.resets).getTime();
       const remaining = resetMs - now;
+      // resets_at in the past = the window rolled over since this snapshot was
+      // taken; the pct belongs to a previous window. Don't extrapolate a pace
+      // from it — surface it as stale instead.
+      if (remaining <= 0) {
+        results.push({
+          profile: name,
+          window: w.label,
+          used_pct: w.pct,
+          remaining: "window reset",
+          elapsed_pct: null,
+          pace: "stale",
+        });
+        continue;
+      }
       const elapsed = duration - remaining;
       const elapsedPct = Math.max((elapsed / duration) * 100, 1);
       const ratio = w.pct / elapsedPct;
@@ -1044,6 +1059,7 @@ header h1 span{color:var(--purple)}
 .pace-slightly-fast{background:rgba(245,158,11,.12);color:var(--yellow)}
 .pace-conserve{background:rgba(239,68,68,.12);color:var(--red)}
 .pace-capacity-available{background:rgba(59,130,246,.12);color:var(--blue)}
+.pace-stale{background:rgba(148,163,184,.12);color:var(--muted)}
 
 .tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
