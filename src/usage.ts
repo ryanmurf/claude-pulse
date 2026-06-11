@@ -299,7 +299,7 @@ function resetTime(window: unknown): string | null {
   return epochSecondsToIso(window.resets_at);
 }
 
-export async function fetchCodexRateLimits(configDir: string): Promise<UsageData> {
+export async function fetchCodexRateLimits(configDir: string, now: Date = new Date()): Promise<UsageData> {
   const sessionsDir = path.join(expandHome(configDir), "sessions");
   const rolloutFiles = (await findCodexRolloutFiles(sessionsDir)).slice(0, 3);
 
@@ -307,11 +307,39 @@ export async function fetchCodexRateLimits(configDir: string): Promise<UsageData
     const rateLimits = await readCodexRateLimitsFromFile(file.path);
     if (!rateLimits) continue;
 
+    // Staleness guard: codex rate_limits come from session transcripts, not a
+    // live API. A window whose resets_at is already in the past has rolled over
+    // since the transcript was written — its used_percent describes a PREVIOUS
+    // window. Report that window as no-signal instead of re-publishing days-old
+    // numbers as a fresh poll: an idle machine would otherwise shadow fresh
+    // data pushed by other machines (latest-poll-wins at the central receiver)
+    // and pace math would extrapolate absurd expected percentages.
+    const nowMs = now.getTime();
+    const expired = (iso: string | null): boolean => iso !== null && Date.parse(iso) <= nowMs;
+    let fiveHourPct = usedPercent(rateLimits.primary);
+    let fiveHourResetsAt = resetTime(rateLimits.primary);
+    let sevenDayPct = usedPercent(rateLimits.secondary);
+    let sevenDayResetsAt = resetTime(rateLimits.secondary);
+    if (expired(fiveHourResetsAt)) {
+      fiveHourPct = null;
+      fiveHourResetsAt = null;
+    }
+    if (expired(sevenDayResetsAt)) {
+      sevenDayPct = null;
+      sevenDayResetsAt = null;
+    }
+    // Older rollout files can only be staler — don't bother scanning further.
+    if (fiveHourResetsAt === null && sevenDayResetsAt === null) {
+      throw new Error(
+        `codex rate_limits in ${file.path} are fully expired (codex idle here since they were recorded); no current usage signal`,
+      );
+    }
+
     return {
-      fiveHourPct: usedPercent(rateLimits.primary),
-      fiveHourResetsAt: resetTime(rateLimits.primary),
-      sevenDayPct: usedPercent(rateLimits.secondary),
-      sevenDayResetsAt: resetTime(rateLimits.secondary),
+      fiveHourPct,
+      fiveHourResetsAt,
+      sevenDayPct,
+      sevenDayResetsAt,
       raw: JSON.stringify({
         vendor: "openai-codex",
         source: file.path,

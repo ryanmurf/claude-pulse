@@ -816,11 +816,52 @@ export interface IngestSnapshotInput {
   polled_at?: string | null;
 }
 
+function isoEpochMs(v: string | null | undefined): number | null {
+  if (!v) return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * True when `incoming` carries strictly OLDER rate-limit window content than
+ * `stored` — i.e. its resets_at regresses. The 5h/7d windows belong to the
+ * subscription (shared across machines), so resets_at acts as a content
+ * version: a bigger value = a later window. "Latest poll wins" is only safe
+ * when content moves forward — without this check, a reporter whose local
+ * vendor data is stale (e.g. a machine where codex has been idle for days)
+ * re-publishes old windows with fresh polled_at stamps and permanently
+ * shadows fresher content pushed by other machines.
+ */
+function snapshotContentRegressed(
+  incoming: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
+  stored: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
+): boolean {
+  const in7 = isoEpochMs(incoming.seven_day_resets_at);
+  const st7 = isoEpochMs(stored.seven_day_resets_at);
+  if (in7 !== null && st7 !== null && in7 !== st7) return in7 < st7;
+  const in5 = isoEpochMs(incoming.five_hour_resets_at);
+  const st5 = isoEpochMs(stored.five_hour_resets_at);
+  if (in5 !== null && st5 !== null && in5 !== st5) return in5 < st5;
+  return false;
+}
+
 export async function ingestUsageSnapshot(
   input: IngestSnapshotInput,
 ): Promise<UsageSnapshot> {
   const d = getDb();
   const polledAt = input.polled_at || new Date().toISOString();
+
+  const latest = await d.get<UsageSnapshot>(
+    `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? ORDER BY polled_at DESC LIMIT 1`,
+    [input.profile, input.account_id],
+  );
+  if (latest && snapshotContentRegressed(input, latest)) {
+    process.stderr.write(
+      `[claude-pulse] ${new Date().toISOString()} ingest: skipped stale snapshot for ${input.profile} (resets_at regressed vs stored)\n`,
+    );
+    return latest;
+  }
+
   const id = await d.insertReturningId(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
