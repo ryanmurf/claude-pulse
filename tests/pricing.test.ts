@@ -27,6 +27,24 @@ describe("resolveRate", () => {
     expect(rate.cache_write_1h).toBe(opus.cache_write_1h);
   });
 
+  it("prices Claude Fable 5 (base, [1m], and dated ids) at $10/$50", async () => {
+    for (const id of ["claude-fable-5", "claude-fable-5[1m]", "claude-fable-5-20260609"]) {
+      const { rate, known } = resolveRate(id, {}, DEFAULT_PRICING, []);
+      expect(known).toBe(true);
+      expect(rate.input).toBe(10);
+      expect(rate.output).toBe(50);
+      expect(rate.cache_write_5m).toBe(12.5);
+      expect(rate.cache_write_1h).toBe(20);
+      expect(rate.cache_read).toBe(1);
+    }
+  });
+
+  it("prices Claude Fable 5 batch tier at 50% off", async () => {
+    const { rate } = resolveRate("claude-fable-5", { service_tier: "batch" }, DEFAULT_PRICING, []);
+    expect(rate.input).toBe(5);
+    expect(rate.output).toBe(25);
+  });
+
   it("falls back for an unknown model", async () => {
     const { rate, known } = resolveRate("totally-unknown-9000", {}, DEFAULT_PRICING, []);
     expect(known).toBe(false);

@@ -42,7 +42,7 @@ export interface PricingOverrideRow extends PricingRate {
   settings_match_json: string;
 }
 
-// ── DEFAULT PRICING (researched 2026-06-06) ──────────────────────────────────
+// ── DEFAULT PRICING (researched 2026-06-06; Claude 5 Fable/Mythos added 2026-06-11) ──
 //
 // USD per 1,000,000 tokens. Sources (seen 2026-06-06):
 //   Anthropic  https://platform.claude.com/docs/en/about-claude/pricing
@@ -66,6 +66,15 @@ export interface PricingOverrideRow extends PricingRate {
 //    downstream, so "claude-opus-4-8-20260115" resolves via "claude-opus-4" and
 //    "gpt-5.4-mini-…" resolves via "gpt-5.4-mini" (more specific) over "gpt-5.4".
 export const DEFAULT_PRICING: PricingRow[] = [
+  // Anthropic Claude 5 (Fable/Mythos, released 2026-06-09; seen 2026-06-11 at the
+  // Anthropic pricing URL above) — $10/$50, double Opus 4.8. Same cache multipliers
+  // (5m=1.25x, 1h=2x, read=0.1x of input). Ids like "claude-fable-5[1m]" and dated
+  // ids prefix-match the base key; 1M context is standard pricing (no premium).
+  { model: "claude-fable-5", settings_match_json: "{}", input: 10, output: 50, cache_write_5m: 12.5, cache_write_1h: 20, cache_read: 1 },
+  { model: "claude-mythos-5", settings_match_json: "{}", input: 10, output: 50, cache_write_5m: 12.5, cache_write_1h: 20, cache_read: 1 },
+  // Claude 5 batch tier — 50% off input/output (cache rates scale too)
+  { model: "claude-fable-5", settings_match_json: "{\"service_tier\":\"batch\"}", input: 5, output: 25, cache_write_5m: 6.25, cache_write_1h: 10, cache_read: 0.5 },
+
   // Anthropic Claude 4.x (current Opus 4.5–4.8 = $5/$25; cache write 5m=1.25x, 1h=2x, read=0.1x of input)
   { model: "claude-opus-4", settings_match_json: "{}", input: 5, output: 25, cache_write_5m: 6.25, cache_write_1h: 10, cache_read: 0.5 },
   { model: "claude-sonnet-4", settings_match_json: "{}", input: 3, output: 15, cache_write_5m: 3.75, cache_write_1h: 6, cache_read: 0.3 },

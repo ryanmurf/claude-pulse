@@ -30,6 +30,12 @@ function writeJsonl(file: string, lines: any[]): void {
 }
 
 describe("effectiveContextForModel", () => {
+  it("returns 1M for fable/mythos 5", async () => {
+    expect(effectiveContextForModel("claude-fable-5")).toBe(1_000_000);
+    expect(effectiveContextForModel("claude-fable-5[1m]")).toBe(1_000_000);
+    expect(effectiveContextForModel("claude-fable-5-20260609")).toBe(1_000_000);
+    expect(effectiveContextForModel("claude-mythos-5")).toBe(1_000_000);
+  });
   it("returns 1M for current-gen opus", async () => {
     expect(effectiveContextForModel("claude-opus-4-8")).toBe(1_000_000);
     expect(effectiveContextForModel("claude-opus-4-7")).toBe(1_000_000);
