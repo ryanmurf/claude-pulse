@@ -22,9 +22,13 @@ function log(msg: string): void {
 }
 
 // Model -> effective context window (tokens). Default 200_000.
-// The current generation (Opus 4.6/4.7/4.8, Sonnet 4.6) ship a 1M context
-// window at standard pricing; older 4.x and the Haiku line remain 200K.
+// The current generation (Fable/Mythos 5, Opus 4.6/4.7/4.8, Sonnet 4.6) ship a
+// 1M context window at standard pricing; older 4.x and the Haiku line remain 200K.
 export const MODEL_LIMITS: Record<string, number> = {
+  "claude-fable-5": 1_000_000,
+  "claude-fable-5[1m]": 1_000_000,
+  "claude-fable-5-1m": 1_000_000,
+  "claude-mythos-5": 1_000_000,
   "claude-opus-4-8": 1_000_000,
   "claude-opus-4-8[1m]": 1_000_000,
   "claude-opus-4-8-1m": 1_000_000,
