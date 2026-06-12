@@ -464,6 +464,23 @@ async function fetchAnthropicOAuth(configDir: string): Promise<UsageData> {
     } catch (err) {
       optionAError = err;
       log(`Option A (usage API) failed for ${configDir}: ${err}`);
+
+      // 401 = the access token was REJECTED (expired/revoked even if the file
+      // says otherwise). Force an in-memory refresh and retry once — covers
+      // idle profiles whose credentials file Claude Code isn't refreshing.
+      if (err instanceof Error && /Usage API returned 401\b/.test(err.message) && tokens.refreshToken) {
+        const refreshedTokens = await getOAuthTokens(configDir, { forceRefresh: true });
+        if (refreshedTokens && refreshedTokens.accessToken !== tokens.accessToken) {
+          try {
+            const data = await fetchViaUsageApi(refreshedTokens);
+            log(`Option A (usage API) succeeded for ${configDir} after in-memory token refresh`);
+            return data;
+          } catch (retryErr) {
+            optionAError = retryErr;
+            log(`Option A retry after token refresh failed for ${configDir}: ${retryErr}`);
+          }
+        }
+      }
     }
   } else {
     log(`Skipping Option A for ${configDir}: missing user:profile scope`);
