@@ -151,22 +151,52 @@ describe("pollProfile", () => {
 });
 
 describe("isRateLimitError", () => {
-  it("detects rate limit in error message", async () => {
+  it("detects real rate-limit signals", async () => {
     expect(isRateLimitError(new Error("rate limit exceeded"))).toBe(true);
     expect(isRateLimitError(new Error("Rate Limit reached"))).toBe(true);
     expect(isRateLimitError(new Error("too many requests"))).toBe(true);
-    expect(isRateLimitError(new Error("resource_exhausted"))).toBe(true);
-    expect(isRateLimitError(new Error("overloaded"))).toBe(true);
-    expect(isRateLimitError(new Error("over capacity"))).toBe(true);
     expect(isRateLimitError(new Error("usage limit hit"))).toBe(true);
-    expect(isRateLimitError(new Error("quota exceeded for model"))).toBe(true);
     expect(isRateLimitError(new Error("HTTP 429 Too Many Requests"))).toBe(true);
+    expect(isRateLimitError(new Error("Usage API returned 429: throttled"))).toBe(true);
+    expect(isRateLimitError(new Error('{"type":"error","error":{"type":"rate_limit_error"}}'))).toBe(true);
   });
 
   it("returns false for non-rate-limit errors", async () => {
     expect(isRateLimitError(new Error("No OAuth tokens found"))).toBe(false);
     expect(isRateLimitError(new Error("ENOENT"))).toBe(false);
     expect(isRateLimitError(new Error("authentication failed"))).toBe(false);
+  });
+
+  it("does NOT match the codex staleness error (the idle-machine false positive)", async () => {
+    // The exact production noise source: every poll on an idle-codex machine
+    // threw this, and the old substring match on "rate_limits" mis-classified
+    // it as a rate limit, logging bogus "Rate-limit detected / cannot schedule
+    // resume" lines each cycle.
+    expect(
+      isRateLimitError(
+        new Error(
+          "codex usage windows in /home/u/.codex/sessions/rollout-x.jsonl are fully expired (codex idle here since they were recorded); no current usage signal",
+        ),
+      ),
+    ).toBe(false);
+    // Even the OLD wording must not match — "rate_limits" is not a rate-limit signal.
+    expect(
+      isRateLimitError(
+        new Error(
+          "codex rate_limits in /home/u/.codex/sessions/rollout-x.jsonl are fully expired; no current usage signal",
+        ),
+      ),
+    ).toBe(false);
+    expect(isRateLimitError(new Error("No codex rate_limits found under /home/u/.codex/sessions"))).toBe(false);
+  });
+
+  it("does NOT match arbitrary substrings like 429 inside ids or paths", async () => {
+    expect(isRateLimitError(new Error("failed to read /tmp/session-4429x.jsonl"))).toBe(false);
+    expect(isRateLimitError(new Error("snapshot id 14290 missing"))).toBe(false);
+    expect(isRateLimitError(new Error("resource_exhausted"))).toBe(false);
+    expect(isRateLimitError(new Error("overloaded"))).toBe(false);
+    expect(isRateLimitError(new Error("over capacity"))).toBe(false);
+    expect(isRateLimitError(new Error("quota exceeded for model"))).toBe(false);
   });
 });
 
