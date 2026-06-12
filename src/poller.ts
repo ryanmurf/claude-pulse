@@ -20,11 +20,14 @@ import { checkAlerts } from "./alerts.js";
 import { fetchUsage, vendorPollsRateLimitSnapshot } from "./usage.js";
 import { getAllSessionContextsForProfile, getContextForProfile, type ContextReadResult } from "./context.js";
 import { tallyProfileTokens, tallyProfileFineGrained } from "./tokens.js";
+import { pollGeminiQuota } from "./gemini.js";
 import {
   reportToCentral,
   uploadConfig,
   type UploadRollup,
   type UploadContext,
+  type UploadSnapshot,
+  type UploadGemini,
 } from "./upload.js";
 
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
@@ -635,5 +638,74 @@ export function stopTokenRollup(): void {
     clearInterval(tokenRollupTimer);
     tokenRollupTimer = undefined;
     log("Token rollup loop stopped");
+  }
+}
+
+// ── Agent-daemon push loops (poll locally once, push the same data) ─────────
+
+/**
+ * One agent-daemon usage cycle: poll every profile ONCE (local writes +
+ * alerts), then push those same snapshots to central. Previously this path
+ * re-fetched the usage API a second time via computeUpload — doubling poll
+ * traffic against the endpoint that was already 429-throttling us.
+ *
+ * Failed polls (null/null snapshots) are NOT pushed: a null snapshot carries
+ * no window content, and pushing it would only churn central's latest-wins
+ * reads.
+ */
+export async function agentPushSnapshots(): Promise<void> {
+  const results = await pollAllProfiles();
+  const cfg = uploadConfig();
+  if (!cfg) return;
+
+  const snapshots: UploadSnapshot[] = [];
+  for (const r of results) {
+    const s = r.snapshot;
+    if (!r.success || !s) continue;
+    if (s.five_hour_resets_at === null && s.seven_day_resets_at === null) continue;
+    snapshots.push({
+      profile: s.profile,
+      five_hour_pct: s.five_hour_pct,
+      five_hour_resets_at: s.five_hour_resets_at,
+      seven_day_pct: s.seven_day_pct,
+      seven_day_resets_at: s.seven_day_resets_at,
+      context_tokens: s.context_tokens,
+      context_pct: s.context_pct,
+      context_session_id: s.context_session_id,
+      context_model: s.context_model,
+      context_effective_limit: s.context_effective_limit,
+      context_last_reset_at: s.context_last_reset_at,
+      polled_at: new Date().toISOString(),
+    });
+  }
+  if (snapshots.length > 0) {
+    await reportToCentral([], [], cfg, { snapshots });
+  }
+}
+
+/**
+ * One agent-daemon gemini cycle: poll quota ONCE (local store write), then
+ * push the freshly stored buckets. Previously this called pollGeminiQuota()
+ * and then re-fetched via computeUpload — but fetchGeminiBuckets has a 30s
+ * min-poll throttle, so the second fetch ALWAYS returned null and the daemon
+ * never pushed gemini quota to central at all.
+ */
+export async function agentPushGemini(): Promise<void> {
+  const cfg = uploadConfig();
+  if (!cfg) return;
+
+  const result = await pollGeminiQuota();
+  // Only push data from a FRESH successful poll; a skipped/failed cycle would
+  // just re-push whatever central already has.
+  if (!result.success || result.skipped) return;
+
+  const gemini: UploadGemini[] = (result.snapshots ?? []).map((s) => ({
+    model_id: s.model_id,
+    remaining_fraction: s.remaining_fraction,
+    remaining_amount: s.remaining_amount,
+    reset_time: s.reset_time,
+  }));
+  if (gemini.length > 0) {
+    await reportToCentral([], [], cfg, { gemini });
   }
 }

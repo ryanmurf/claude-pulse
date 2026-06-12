@@ -39,10 +39,12 @@ import {
   pollContextOnce,
   startTokenRollup,
   runTokenRollupOnce,
+  agentPushSnapshots,
+  agentPushGemini,
 } from "./poller.js";
 import os from "node:os";
 import { getContextForProfile } from "./context.js";
-import { computeUpload, pushToCentral, reportToCentral, uploadConfig } from "./upload.js";
+import { computeUpload, pushToCentral, uploadConfig } from "./upload.js";
 import { runLocalBackfill } from "./backfill.js";
 import { acquirePidLock, releasePidLock } from "./pidlock.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
@@ -1002,31 +1004,6 @@ function envInterval(name: string, fallbackMs: number): number {
   if (!raw) return fallbackMs;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : fallbackMs;
-}
-
-/** Compute current 5h/7d snapshots locally, write them locally, and push to central. */
-async function agentPushSnapshots(): Promise<void> {
-  // Local write (per-profile snapshot rows on this machine's local store).
-  await pollAllProfiles();
-  // Compute the upload shape + push (account-level, latest-wins on the server).
-  const cfg = uploadConfig();
-  if (!cfg) return;
-  const { snapshots } = await computeUpload(undefined, undefined, undefined, { snapshots: true });
-  if (snapshots.length > 0) {
-    await reportToCentral([], [], cfg, { snapshots });
-  }
-}
-
-/** Fetch gemini quota once, store locally, and push to central. */
-async function agentPushGemini(): Promise<void> {
-  const cfg = uploadConfig();
-  if (!cfg) return;
-  // Local store write (default/local account) + compute upload buckets.
-  await pollGeminiQuota();
-  const { gemini } = await computeUpload(undefined, undefined, [], { gemini: true });
-  if (gemini.length > 0) {
-    await reportToCentral([], [], cfg, { gemini });
-  }
 }
 
 function startAgentLoop(
