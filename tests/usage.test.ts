@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fetchCodexRateLimits } from "../src/usage.js";
+import { fetchCodexRateLimits, fetchViaUsageApi, truncateIsoToSeconds } from "../src/usage.js";
+import type { OAuthTokens } from "../src/auth.js";
 
 let tmpDir: string;
 
@@ -116,5 +117,124 @@ describe("fetchCodexRateLimits", () => {
     await expect(fetchCodexRateLimits(tmpDir, new Date("2026-06-11T22:00:00Z"))).rejects.toThrow(
       /fully expired/,
     );
+  });
+
+  it("staleness error does not contain rate-limit trigger substrings", async () => {
+    writeRollout();
+    let message = "";
+    try {
+      await fetchCodexRateLimits(tmpDir, new Date("2026-06-11T22:00:00Z"));
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/fully expired/);
+    // Must never re-trip the poller's isRateLimitError matcher.
+    expect(message.toLowerCase()).not.toContain("rate_limit");
+    expect(message).not.toMatch(/\b429\b/);
+  });
+});
+
+// ── fetchViaUsageApi: retry + resets_at normalization (mocked fetch) ─────────
+
+const TOKENS: OAuthTokens = {
+  accessToken: "test-access-token",
+  refreshToken: "test-refresh-token",
+  expiresAt: Date.now() + 3_600_000,
+  scopes: ["user:profile"],
+  subscriptionType: "max",
+  rateLimitTier: "default",
+};
+
+function okUsageResponse(fiveResetsAt: string, sevenResetsAt: string): Response {
+  return new Response(
+    JSON.stringify({
+      five_hour: { utilization: 12.5, resets_at: fiveResetsAt },
+      seven_day: { utilization: 42.0, resets_at: sevenResetsAt },
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+describe("fetchViaUsageApi", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("truncates sub-second resets_at noise to whole seconds", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        okUsageResponse("2026-06-12T04:40:00.714116Z", "2026-06-15T11:00:00.123Z"),
+      ),
+    );
+
+    const usage = await fetchViaUsageApi(TOKENS, { retryDelaysMs: [] });
+    expect(usage.fiveHourResetsAt).toBe("2026-06-12T04:40:00.000Z");
+    expect(usage.sevenDayResetsAt).toBe("2026-06-15T11:00:00.000Z");
+    expect(usage.fiveHourPct).toBe(12.5);
+    expect(usage.sevenDayPct).toBe(42.0);
+  });
+
+  it("retries a 429 then succeeds within the same poll", async () => {
+    const mock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("throttled", { status: 429 }))
+      .mockResolvedValueOnce(
+        okUsageResponse("2026-06-12T04:40:00Z", "2026-06-15T11:00:00Z"),
+      );
+    vi.stubGlobal("fetch", mock);
+
+    const usage = await fetchViaUsageApi(TOKENS, { retryDelaysMs: [1, 1] });
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(usage.fiveHourPct).toBe(12.5);
+  });
+
+  it("retries a 500 then succeeds within the same poll", async () => {
+    const mock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("boom", { status: 500 }))
+      .mockResolvedValueOnce(
+        okUsageResponse("2026-06-12T04:40:00Z", "2026-06-15T11:00:00Z"),
+      );
+    vi.stubGlobal("fetch", mock);
+
+    const usage = await fetchViaUsageApi(TOKENS, { retryDelaysMs: [1, 1] });
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(usage.sevenDayPct).toBe(42.0);
+  });
+
+  it("throws after exhausting retries on persistent 429", async () => {
+    const mock = vi.fn().mockImplementation(
+      async () => new Response("still throttled", { status: 429 }),
+    );
+    vi.stubGlobal("fetch", mock);
+
+    await expect(fetchViaUsageApi(TOKENS, { retryDelaysMs: [1, 1] })).rejects.toThrow(
+      /Usage API returned 429/,
+    );
+    // 1 initial + 2 retries
+    expect(mock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does NOT retry non-retryable statuses (401)", async () => {
+    const mock = vi
+      .fn()
+      .mockResolvedValue(new Response("unauthorized", { status: 401 }));
+    vi.stubGlobal("fetch", mock);
+
+    await expect(fetchViaUsageApi(TOKENS, { retryDelaysMs: [1, 1] })).rejects.toThrow(
+      /Usage API returned 401/,
+    );
+    expect(mock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("truncateIsoToSeconds", () => {
+  it("truncates fractional seconds and normalizes to ISO", () => {
+    expect(truncateIsoToSeconds("2026-06-12T04:40:00.714116Z")).toBe("2026-06-12T04:40:00.000Z");
+    expect(truncateIsoToSeconds("2026-06-12T04:40:00Z")).toBe("2026-06-12T04:40:00.000Z");
+    expect(truncateIsoToSeconds(null)).toBeNull();
+    // Unparseable input passes through untouched rather than becoming Invalid Date.
+    expect(truncateIsoToSeconds("not-a-date")).toBe("not-a-date");
   });
 });

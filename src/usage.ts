@@ -42,15 +42,68 @@ interface UsageApiResponse {
   [key: string]: unknown;
 }
 
-async function fetchViaUsageApi(tokens: OAuthTokens): Promise<UsageData> {
-  const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      "Authorization": `Bearer ${tokens.accessToken}`,
-      "anthropic-beta": "oauth-2025-04-20",
-      "Content-Type": "application/json",
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
+/**
+ * Normalize an ISO timestamp to whole seconds. Anthropic's /api/oauth/usage
+ * returns quantized reset times whose sub-second part is per-request noise
+ * (e.g. 04:40:00.714116Z vs 04:40:00.000Z for the same window) — truncating
+ * at the reader keeps pushed snapshot content stable across polls. The
+ * central ingest regression guard keeps its jitter tolerance as
+ * defense-in-depth for not-yet-upgraded reporters.
+ */
+export function truncateIsoToSeconds(iso: string | null): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  return new Date(Math.floor(ms / 1000) * 1000).toISOString();
+}
+
+/** Transient statuses worth retrying within a single poll: 429 + 5xx. */
+function isRetryableHttpStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/** Backoff schedule for in-poll retries (exponential-ish + jitter added at use). */
+const USAGE_API_RETRY_DELAYS_MS = [2_000, 5_000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Exported for tests (mocked global fetch). `retryDelaysMs` overrides the
+ * backoff schedule so tests don't sleep for real.
+ */
+export async function fetchViaUsageApi(
+  tokens: OAuthTokens,
+  opts?: { retryDelaysMs?: number[] },
+): Promise<UsageData> {
+  const delays = opts?.retryDelaysMs ?? USAGE_API_RETRY_DELAYS_MS;
+
+  let response: Response;
+  for (let attempt = 0; ; attempt++) {
+    response = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        "Authorization": `Bearer ${tokens.accessToken}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    // Retry 429/5xx a couple of times within this poll so a brief throttle
+    // burst doesn't turn the whole cycle into a pushed-nothing failure.
+    // Persistent 429 still falls through to the throw below.
+    if (response.ok || attempt >= delays.length || !isRetryableHttpStatus(response.status)) {
+      break;
+    }
+    const delay = delays[attempt] + Math.floor(Math.random() * 1_000);
+    log(
+      `Usage API returned ${response.status}; retrying in ${delay}ms (attempt ${attempt + 1}/${delays.length})`,
+    );
+    // Drain the body so the failed response doesn't hold its socket open.
+    await response.text().catch(() => undefined);
+    await sleep(delay);
+  }
 
   if (!response.ok) {
     throw new Error(`Usage API returned ${response.status}: ${await response.text()}`);
@@ -61,9 +114,9 @@ async function fetchViaUsageApi(tokens: OAuthTokens): Promise<UsageData> {
 
   return {
     fiveHourPct: data.five_hour?.utilization ?? null,
-    fiveHourResetsAt: data.five_hour?.resets_at ?? null,
+    fiveHourResetsAt: truncateIsoToSeconds(data.five_hour?.resets_at ?? null),
     sevenDayPct: data.seven_day?.utilization ?? null,
-    sevenDayResetsAt: data.seven_day?.resets_at ?? null,
+    sevenDayResetsAt: truncateIsoToSeconds(data.seven_day?.resets_at ?? null),
     raw,
   };
 }
@@ -290,7 +343,8 @@ function epochSecondsToIso(value: unknown): string | null {
     ? Number(value)
     : NaN;
   if (!Number.isFinite(seconds)) return null;
-  const date = new Date(seconds * 1000);
+  // Truncate fractional seconds — keeps serialized resets_at stable poll-to-poll.
+  const date = new Date(Math.floor(seconds) * 1000);
   return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
@@ -329,9 +383,11 @@ export async function fetchCodexRateLimits(configDir: string, now: Date = new Da
       sevenDayResetsAt = null;
     }
     // Older rollout files can only be staler — don't bother scanning further.
+    // NOTE: keep "rate_limit"/"429" OUT of this message — it must not trip
+    // the poller's isRateLimitError detection (it's staleness, not throttling).
     if (fiveHourResetsAt === null && sevenDayResetsAt === null) {
       throw new Error(
-        `codex rate_limits in ${file.path} are fully expired (codex idle here since they were recorded); no current usage signal`,
+        `codex usage windows in ${file.path} are fully expired (codex idle here since they were recorded); no current usage signal`,
       );
     }
 
@@ -348,7 +404,7 @@ export async function fetchCodexRateLimits(configDir: string, now: Date = new Da
     };
   }
 
-  throw new Error(`No codex rate_limits found under ${sessionsDir}`);
+  throw new Error(`No codex usage data found under ${sessionsDir}`);
 }
 
 // ── Public: fetch usage for a profile (vendor-aware) ───────────────────────
@@ -399,12 +455,14 @@ async function fetchAnthropicOAuth(configDir: string): Promise<UsageData> {
   }
 
   // Option A: dedicated usage endpoint (preferred — zero quota cost)
+  let optionAError: unknown;
   if (hasProfileScope(tokens)) {
     try {
       const data = await fetchViaUsageApi(tokens);
       log(`Option A (usage API) succeeded for ${configDir}`);
       return data;
     } catch (err) {
+      optionAError = err;
       log(`Option A (usage API) failed for ${configDir}: ${err}`);
     }
   } else {
@@ -421,6 +479,15 @@ async function fetchAnthropicOAuth(configDir: string): Promise<UsageData> {
       log(`Option B (headers) failed for ${configDir}: ${err}`);
       throw err;
     }
+  }
+
+  // Don't swallow the real failure: when Option A failed (e.g. persistent 429)
+  // and there's no inference scope to fall back on, surface that error — it
+  // carries the status the poller's rate-limit detection needs.
+  if (optionAError !== undefined) {
+    throw optionAError instanceof Error
+      ? optionAError
+      : new Error(String(optionAError));
   }
 
   throw new Error(`OAuth tokens for ${configDir} lack required scopes (have: ${tokens.scopes?.join(", ")})`);

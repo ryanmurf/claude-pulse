@@ -52,20 +52,22 @@ function log(msg: string): void {
 
 /**
  * Check whether an error message indicates rate-limit / usage-window exhaustion.
+ *
+ * Deliberately NARROW: only explicit rate-limit signals match. Loose substring
+ * matching caused false positives — e.g. the codex staleness error used to
+ * contain "rate_limits", and bare `includes("429")` matched ids/paths — which
+ * logged a misleading "Rate-limit detected … cannot schedule resume" pair on
+ * every poll cycle of an idle machine.
  */
 export function isRateLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   const text = msg.toLowerCase();
   return (
-    text.includes("rate limit") ||
-    text.includes("rate_limit") ||
-    text.includes("usage limit") ||
-    text.includes("too many requests") ||
-    text.includes("429") ||
-    text.includes("quota exceeded") ||
-    text.includes("resource_exhausted") ||
-    text.includes("overloaded") ||
-    text.includes("over capacity")
+    /\b429\b/.test(text) || // HTTP 429 status ("Usage API returned 429: …")
+    text.includes("rate_limit_error") || // Anthropic typed API error
+    text.includes("too many requests") || // HTTP 429 status text
+    /\brate limit\b/.test(text) || // "rate limit exceeded" / "rate limit reached"
+    /\busage limit\b/.test(text) // CLI "usage limit reached"
   );
 }
 
