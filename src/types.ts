@@ -126,6 +126,8 @@ export interface UsageSnapshot {
   context_model: string | null;
   context_effective_limit: number | null;
   context_last_reset_at: string | null;
+  /** Code version of the reporter that produced this snapshot (nullable: old reporters omit it). */
+  reporter_version: string | null;
 }
 
 export interface GeminiQuotaSnapshot {

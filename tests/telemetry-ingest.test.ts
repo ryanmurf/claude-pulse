@@ -122,6 +122,92 @@ describe("POST /api/ingest — snapshots", () => {
     expect(localSnap?.five_hour_pct ?? null).toBe(null);
   });
 
+  it("stores reporter_version on ingested snapshots and exposes it in /api/usage", async () => {
+    const acct = await resolveAccount("version-user@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "stamped-machine");
+
+    const r = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        reporter_version: "0.2.0+abc1234",
+        snapshots: [
+          {
+            profile: "claude-max",
+            five_hour_pct: 20,
+            five_hour_resets_at: "2026-06-07T20:00:00.000Z",
+            seven_day_pct: 30,
+            seven_day_resets_at: "2026-06-14T00:00:00.000Z",
+            polled_at: "2026-06-07T10:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(r.status).toBe(200);
+
+    const latest = await getLatestSnapshot("claude-max", acct.id);
+    expect(latest?.reporter_version).toBe("0.2.0+abc1234");
+
+    const usage = await req("GET", "/api/usage", {
+      headers: { "X-Auth-Request-Email": "version-user@example.com" },
+    });
+    expect(usage.status).toBe(200);
+    const row = (usage.json as any[]).find((p) => p.profile === "claude-max");
+    expect(row?.reporter_version).toBe("0.2.0+abc1234");
+  });
+
+  it("accepts pushes from OLD reporters that omit reporter_version (stored as null)", async () => {
+    const acct = await resolveAccount("legacy-user@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "legacy-machine");
+
+    const r = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "claude-hd",
+            five_hour_pct: 5,
+            five_hour_resets_at: "2026-06-07T20:00:00.000Z",
+            seven_day_pct: 9,
+            seven_day_resets_at: "2026-06-14T00:00:00.000Z",
+            polled_at: "2026-06-07T10:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(r.status).toBe(200);
+    expect(r.json.snapshots_upserted).toBe(1);
+
+    const latest = await getLatestSnapshot("claude-hd", acct.id);
+    expect(latest?.five_hour_pct).toBe(5);
+    expect(latest?.reporter_version ?? null).toBeNull();
+  });
+
+  it("length-caps a hostile reporter_version instead of rejecting the push", async () => {
+    const acct = await resolveAccount("hostile-version@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "hostile-machine");
+
+    const r = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        reporter_version: "x".repeat(10_000),
+        snapshots: [
+          {
+            profile: "claude-max",
+            five_hour_pct: 1,
+            five_hour_resets_at: "2026-06-07T20:00:00.000Z",
+            seven_day_pct: 2,
+            seven_day_resets_at: "2026-06-14T00:00:00.000Z",
+            polled_at: "2026-06-07T10:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(r.status).toBe(200);
+
+    const latest = await getLatestSnapshot("claude-max", acct.id);
+    expect(latest?.reporter_version?.length).toBe(64);
+  });
+
   it("rejects a snapshot whose resets_at regresses (stale reporter can't shadow fresh data)", async () => {
     const acct = await resolveAccount("stale-guard@example.com");
     const { plaintext } = await mintIngestToken(acct.id, "fresh-machine");
