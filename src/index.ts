@@ -44,6 +44,7 @@ import os from "node:os";
 import { getContextForProfile } from "./context.js";
 import { computeUpload, pushToCentral, reportToCentral, uploadConfig } from "./upload.js";
 import { runLocalBackfill } from "./backfill.js";
+import { acquirePidLock, releasePidLock } from "./pidlock.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
   formatGeminiQuotaSnapshots,
@@ -1053,6 +1054,21 @@ async function agentDaemon(): Promise<void> {
     return;
   }
 
+  // Singleton guard: stacked daemon starts (nohup restarts on top of a
+  // systemd-managed instance) once left FOUR daemons polling in parallel,
+  // 429-throttling the usage API for every profile. Exactly one agent daemon
+  // per pidfile (per machine by default).
+  const lock = acquirePidLock();
+  if (!lock.acquired) {
+    log(
+      `Another claude-pulse agent daemon is already running (pid ${lock.holderPid}, pidfile ${lock.pidFile}). ` +
+        `Refusing to start a duplicate — parallel daemons multiply poll traffic and rate-limit the usage API. ` +
+        `Stop the existing daemon first (e.g. systemctl --user stop claude-pulse-agent, or kill ${lock.holderPid}).`,
+    );
+    process.exit(1);
+    return;
+  }
+
   log(`Initializing claude-pulse agent (pushing to ${cfg.baseUrl})...`);
   await initDb();
   await ensureDefaultProfiles();
@@ -1090,10 +1106,14 @@ async function agentDaemon(): Promise<void> {
   const shutdown = (): void => {
     log("Agent shutting down...");
     for (const t of timers) clearInterval(t);
+    releasePidLock(lock.pidFile);
     void closeDb().finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // Last-resort cleanup for non-signal exits (sync-only handler). SIGKILL still
+  // leaves the file behind — the stale-pid takeover in acquirePidLock covers it.
+  process.on("exit", () => releasePidLock(lock.pidFile));
 }
 
 // --- Main ---

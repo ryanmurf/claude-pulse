@@ -90,6 +90,9 @@ beforeEach(async () => {
     env: {
       ...process.env,
       CLAUDE_PULSE_DB_PATH: agentDb,
+      // Hermetic singleton lock — never collide with a real daemon on this
+      // machine or with parallel test runs.
+      CLAUDE_PULSE_AGENT_PIDFILE: path.join(tmpDir, "agent.pid"),
       CLAUDE_PULSE_UPLOAD_TO: `http://127.0.0.1:${centralPort}`,
       CLAUDE_PULSE_INGEST_TOKEN: plaintext,
       // First-sync full-history backfill so the (old-dated) fixture token rows
@@ -136,5 +139,31 @@ describe("agent daemon (child process)", () => {
     }, 40000);
     const rows = await getTokenUsage({ accountId: acctId });
     expect(rows.some((r) => r.profile === "fix" && r.source === "ingest")).toBe(true);
+  }, 45000);
+
+  it("refuses to start a duplicate daemon while the first holds the pidfile", async () => {
+    const pidFile = path.join(tmpDir, "agent.pid");
+    // Wait for the (beforeEach-spawned) daemon to take the lock.
+    await waitFor(async () => fs.existsSync(pidFile), 20000);
+
+    const dup = spawn(process.execPath, [ENTRY, "--agent"], {
+      env: {
+        ...process.env,
+        CLAUDE_PULSE_DB_PATH: path.join(tmpDir, "agent.db"),
+        CLAUDE_PULSE_UPLOAD_TO: `http://127.0.0.1:${centralPort}`,
+        CLAUDE_PULSE_INGEST_TOKEN: "irrelevant",
+        CLAUDE_PULSE_AGENT_PIDFILE: pidFile,
+        PULSE_GEMINI_ENABLED: "0",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    dup.stderr?.on("data", (d) => { stderr += String(d); });
+    const code = await new Promise<number | null>((resolve) => dup.on("exit", resolve));
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("already running");
+    // The original daemon's pidfile is untouched.
+    expect(fs.existsSync(pidFile)).toBe(true);
   }, 45000);
 });
