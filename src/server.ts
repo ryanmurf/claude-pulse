@@ -1102,6 +1102,10 @@ tr:last-child td{border-bottom:none}
 .rpt-hosts .rh-row:first-child{border-top:none}
 .rpt-hosts .rh-host{font-family:var(--mono);color:var(--text)}
 .report-total select,#rpt-granularity,#rpt-days{padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);color:var(--text);font-size:.8rem;font-family:var(--font)}
+.settings-section{display:none}
+body.settings-open .section{display:none}
+body.settings-open .settings-section{display:block}
+.btn.btn-on{border-color:var(--purple);color:var(--purple)}
 </style>
 </head>
 <body>
@@ -1112,6 +1116,7 @@ tr:last-child td{border-bottom:none}
       <span class="status" id="status">loading...</span>
       <button class="btn" onclick="refresh()">Refresh</button>
       <button class="btn" onclick="pollAll()">Poll All</button>
+      <button class="btn" id="settings-btn" onclick="toggleSettings()" title="Settings">&#9881; Settings</button>
     </div>
   </header>
 
@@ -1156,7 +1161,7 @@ tr:last-child td{border-bottom:none}
     <div id="context-grid" class="usage-grid"><div class="empty">Loading...</div></div>
   </div>
 
-  <div class="section">
+  <div class="section settings-section">
     <div class="section-hdr">
       <h2>Settings · Machines &amp; Tokens</h2>
       <span id="limits-line" class="status" style="font-size:.72rem"></span>
@@ -1172,7 +1177,7 @@ tr:last-child td{border-bottom:none}
     </div>
   </div>
 
-  <div class="section">
+  <div class="section settings-section">
     <div class="section-hdr"><h2>Settings · Pricing (USD per 1M tokens)</h2></div>
     <div class="tbl-wrap">
       <table><thead><tr><th>Model</th><th>Variant</th><th>Input</th><th>Output</th><th>Cache 5m</th><th>Cache 1h</th><th>Cache read</th><th></th></tr></thead>
@@ -1482,6 +1487,15 @@ async function createSub(){
   $('#sub-threshold').value='';await refresh();
 }
 
+function setSettingsView(open){
+  document.body.classList.toggle('settings-open',open);
+  $('#settings-btn').classList.toggle('btn-on',open);
+  if(open&&location.hash!=='#settings')history.replaceState(null,'','#settings');
+  if(!open&&location.hash==='#settings')history.replaceState(null,'',location.pathname);
+}
+function toggleSettings(){setSettingsView(!document.body.classList.contains('settings-open'))}
+window.addEventListener('hashchange',()=>setSettingsView(location.hash==='#settings'));
+setSettingsView(location.hash==='#settings');
 refresh();setInterval(refresh,30000);
 </script>
 </body>
