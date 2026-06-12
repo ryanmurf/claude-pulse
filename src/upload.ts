@@ -4,6 +4,7 @@ import { tallyProfileFineGrained, type TallyOptions } from "./tokens.js";
 import { getAllSessionContextsForProfile, getContextForProfile } from "./context.js";
 import { fetchUsage, vendorPollsRateLimitSnapshot } from "./usage.js";
 import { computeGeminiQuotaBuckets } from "./gemini.js";
+import { reporterVersion } from "./version.js";
 
 /**
  * Central-reporting client.
@@ -84,6 +85,12 @@ export interface IngestPayload {
   context?: UploadContext[];
   snapshots?: UploadSnapshot[];
   gemini?: UploadGemini[];
+  /**
+   * Reporter code version ("0.1.0+a1b2c3d"). Optional + additive: old
+   * reporters that omit it ingest fine; the server stores it on snapshots so
+   * a stale-code reporter can be identified from the dashboard.
+   */
+  reporter_version?: string;
 }
 
 export interface UploadConfig {
@@ -205,6 +212,9 @@ export async function pushToCentral(
   // Attach snapshots + gemini to the first chunk only (sent exactly once).
   if (snapshots.length > 0) chunks[0].snapshots = snapshots;
   if (gemini.length > 0) chunks[0].gemini = gemini;
+  // Stamp every chunk with this reporter's code version (best-effort metadata).
+  const version = reporterVersion();
+  if (version) for (const chunk of chunks) chunk.reporter_version = version;
   let ok = 0;
   let failed = 0;
 

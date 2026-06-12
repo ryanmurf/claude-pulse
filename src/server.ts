@@ -471,6 +471,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           seven_day_pct: snap?.seven_day_pct ?? null,
           seven_day_resets_at: snap?.seven_day_resets_at ?? null,
           polled_at: snap?.polled_at ?? null,
+          reporter_version: snap?.reporter_version ?? null,
         };
       });
       sendJson(res, result);
@@ -835,6 +836,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       }
 
+      // Optional reporter code-version stamp (additive: old reporters omit it).
+      // Length-capped so a hostile payload can't stuff the column.
+      const reporterVersion =
+        typeof body?.reporter_version === "string" && body.reporter_version.trim()
+          ? body.reporter_version.trim().slice(0, 64)
+          : null;
+
       // snapshots — account-level 5h/7d per profile (latest poll wins). machine is
       // metadata only; we do NOT fan rows out per machine. Ensure the profile row
       // exists (FK) under this account before inserting.
@@ -848,6 +856,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           await ingestUsageSnapshot({
             account_id: accountId,
             profile,
+            reporter_version: reporterVersion,
             five_hour_pct: s.five_hour_pct != null ? toFiniteNum(s.five_hour_pct) : null,
             five_hour_resets_at: typeof s.five_hour_resets_at === "string" ? s.five_hour_resets_at : null,
             seven_day_pct: s.seven_day_pct != null ? toFiniteNum(s.seven_day_pct) : null,

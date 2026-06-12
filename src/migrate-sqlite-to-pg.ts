@@ -87,6 +87,7 @@ const TABLES: TableSpec[] = [
       "context_effective_limit",
       "context_last_reset_at",
       "account_id",
+      "reporter_version",
     ],
     hasIdentityId: true,
   },
@@ -263,8 +264,15 @@ async function copyTable(
   sqlite: Backend,
   pgRaw: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number | null }> },
 ): Promise<number> {
+  // The source SQLite is opened READ-ONLY, so additive columns that initDb
+  // would normally backfill (e.g. reporter_version) may be absent on old DBs.
+  // SELECT only what exists; buildInsert binds the missing ones as NULL.
+  const present = new Set(
+    (await sqlite.all<{ name: string }>(`PRAGMA table_info(${spec.name})`)).map((c) => c.name),
+  );
+  const selectCols = spec.columns.filter((c) => present.has(c));
   const rows = await sqlite.all<Record<string, unknown>>(
-    `SELECT ${spec.columns.join(", ")} FROM ${spec.name}`,
+    `SELECT ${selectCols.join(", ")} FROM ${spec.name}`,
   );
 
   // Truncate (idempotent load). CASCADE handles FK children that get reloaded

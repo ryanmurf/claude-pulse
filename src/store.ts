@@ -47,6 +47,7 @@ import {
   type PricingRow,
   type PricingOverrideRow,
 } from "./pricing.js";
+import { reporterVersion } from "./version.js";
 
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".claude-pulse");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "usage.db");
@@ -240,6 +241,7 @@ async function createSchema(db: Backend): Promise<void> {
       "context_effective_limit INTEGER",
       "context_last_reset_at TEXT",
       "account_id INTEGER",
+      "reporter_version TEXT",
     ]) {
       const colName = c.split(" ")[0];
       if (!snapCols.includes(colName)) {
@@ -250,6 +252,7 @@ async function createSchema(db: Backend): Promise<void> {
     // Postgres fresh schema doesn't carry account_id in the CREATE above (kept
     // identical to SQLite's historical shape); add it explicitly.
     await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS account_id INTEGER");
+    await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS reporter_version TEXT");
   }
 
   await db.exec(`
@@ -767,8 +770,9 @@ export async function insertSnapshot(
   const id = await d.insertReturningId(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
-        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at,
+        reporter_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       acct,
       profile,
@@ -783,6 +787,8 @@ export async function insertSnapshot(
       ctx?.context_model ?? null,
       ctx?.context_effective_limit ?? null,
       ctx?.context_last_reset_at ?? null,
+      // Locally written snapshots are produced by THIS process — stamp it.
+      reporterVersion(),
     ],
   );
 
@@ -814,6 +820,8 @@ export interface IngestSnapshotInput {
   context_effective_limit?: number | null;
   context_last_reset_at?: string | null;
   polled_at?: string | null;
+  /** Reporter code version from the ingest payload (null for old reporters). */
+  reporter_version?: string | null;
 }
 
 function isoEpochMs(v: string | null | undefined): number | null {
@@ -873,8 +881,9 @@ export async function ingestUsageSnapshot(
   const id = await d.insertReturningId(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
-        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at, polled_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at,
+        polled_at, reporter_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.account_id,
       input.profile,
@@ -890,6 +899,7 @@ export async function ingestUsageSnapshot(
       input.context_effective_limit ?? null,
       input.context_last_reset_at ?? null,
       polledAt,
+      input.reporter_version ?? null,
     ],
   );
   return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [id]))!;
