@@ -831,17 +831,25 @@ function isoEpochMs(v: string | null | undefined): number | null {
  * vendor data is stale (e.g. a machine where codex has been idle for days)
  * re-publishes old windows with fresh polled_at stamps and permanently
  * shadows fresher content pushed by other machines.
+ *
+ * Anthropic's /api/oauth/usage returns quantized reset times whose sub-second
+ * part is per-request noise (04:40:00.714116 vs 04:40:00.000) — the same
+ * window can compare a few hundred ms "older" poll-to-poll. Differences
+ * within the tolerance are the same window, not a regression; a genuinely
+ * stale window regresses by hours-to-days.
  */
+const RESET_JITTER_TOLERANCE_MS = 5 * 60_000;
+
 function snapshotContentRegressed(
   incoming: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
   stored: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
 ): boolean {
   const in7 = isoEpochMs(incoming.seven_day_resets_at);
   const st7 = isoEpochMs(stored.seven_day_resets_at);
-  if (in7 !== null && st7 !== null && in7 !== st7) return in7 < st7;
+  if (in7 !== null && st7 !== null && Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) return in7 < st7;
   const in5 = isoEpochMs(incoming.five_hour_resets_at);
   const st5 = isoEpochMs(stored.five_hour_resets_at);
-  if (in5 !== null && st5 !== null && in5 !== st5) return in5 < st5;
+  if (in5 !== null && st5 !== null && Math.abs(in5 - st5) > RESET_JITTER_TOLERANCE_MS) return in5 < st5;
   return false;
 }
 

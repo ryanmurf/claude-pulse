@@ -184,6 +184,68 @@ describe("POST /api/ingest — snapshots", () => {
     expect((await getLatestSnapshot("codex", acct.id))?.seven_day_pct).toBe(4);
   });
 
+  it("tolerates sub-second resets_at jitter from the Anthropic usage API (claude-hd-max 2026-06-12 wedge)", async () => {
+    const acct = await resolveAccount("jitter-guard@example.com");
+    const { plaintext } = await mintIngestToken(acct.id, "tron");
+
+    // A poll that happened to carry Anthropic's raw microsecond noise lands first.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "claude-hd-max",
+            five_hour_pct: 87,
+            five_hour_resets_at: "2026-06-12T00:30:00.867602+00:00",
+            seven_day_pct: 60,
+            seven_day_resets_at: "2026-06-14T11:00:00.867626+00:00",
+            polled_at: "2026-06-12T00:00:01.927Z",
+          },
+        ],
+      },
+    });
+
+    // Later polls report the same windows second-aligned (.000) — a few hundred
+    // ms "older". Must be treated as the same window and accepted, not wedged.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "claude-hd-max",
+            five_hour_pct: 12,
+            five_hour_resets_at: "2026-06-12T05:30:00.000Z",
+            seven_day_pct: 61,
+            seven_day_resets_at: "2026-06-14T11:00:00.000Z",
+            polled_at: "2026-06-12T02:00:04.000Z",
+          },
+        ],
+      },
+    });
+
+    const latest = await getLatestSnapshot("claude-hd-max", acct.id);
+    expect(latest?.five_hour_pct).toBe(12);
+    expect(latest?.seven_day_pct).toBe(61);
+
+    // Beyond the tolerance it is still a regression — days-old content loses.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${plaintext}` },
+      body: {
+        snapshots: [
+          {
+            profile: "claude-hd-max",
+            five_hour_pct: 99,
+            five_hour_resets_at: "2026-06-12T05:30:00.000Z",
+            seven_day_pct: 99,
+            seven_day_resets_at: "2026-06-14T05:00:00.000Z",
+            polled_at: "2026-06-12T02:05:00.000Z",
+          },
+        ],
+      },
+    });
+    expect((await getLatestSnapshot("claude-hd-max", acct.id))?.seven_day_pct).toBe(61);
+  });
+
   it("is account-scoped — two accounts don't see each other's snapshots", async () => {
     const a = await resolveAccount("snap-a@example.com");
     const b = await resolveAccount("snap-b@example.com");
