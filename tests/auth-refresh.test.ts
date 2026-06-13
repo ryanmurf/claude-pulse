@@ -53,10 +53,9 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("getOAuthTokens — in-memory refresh for idle profiles", () => {
-  it("refreshes an expired token via the standard Anthropic OAuth grant, in memory only", async () => {
+describe("getOAuthTokens — auto-refresh + atomic persist for idle profiles", () => {
+  it("refreshes an expired token via the standard Anthropic OAuth grant and persists it", async () => {
     const credsFile = writeCreds({});
-    const before = fs.readFileSync(credsFile, "utf8");
 
     const mock = vi.fn().mockImplementation(async (url: string | URL, init?: RequestInit) => {
       expect(String(url)).toBe(TOKEN_ENDPOINT);
@@ -71,8 +70,86 @@ describe("getOAuthTokens — in-memory refresh for idle profiles", () => {
     const tokens = await getOAuthTokens(tmpDir);
     expect(tokens?.accessToken).toBe("fresh-access-token");
     expect(tokens!.expiresAt).toBeGreaterThan(Date.now());
-    // Claude Code owns the credentials file — it must never be written.
-    expect(fs.readFileSync(credsFile, "utf8")).toBe(before);
+
+    // The refreshed token is persisted back to the credentials file so it
+    // survives process restarts and is shared with live sessions.
+    const persisted = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+    expect(persisted.claudeAiOauth.accessToken).toBe("fresh-access-token");
+    expect(persisted.claudeAiOauth.expiresAt).toBeGreaterThan(Date.now());
+    // Sibling fields are preserved untouched.
+    expect(persisted.claudeAiOauth.scopes).toEqual(["user:profile"]);
+    expect(persisted.claudeAiOauth.subscriptionType).toBe("max");
+    expect(persisted.claudeAiOauth.refreshToken).toBe("the-refresh-token");
+    // No temp/lock files leaked.
+    const leftovers = fs.readdirSync(tmpDir).filter((f) => f.endsWith(".tmp") || f.endsWith(".lock"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("preserves unrelated top-level keys (e.g. mcpOAuth) when persisting", async () => {
+    const credsFile = path.join(tmpDir, ".credentials.json");
+    fs.writeFileSync(
+      credsFile,
+      JSON.stringify({
+        mcpOAuth: { some: "value", nested: { keep: true } },
+        claudeAiOauth: {
+          accessToken: "old-access-token",
+          refreshToken: "the-refresh-token",
+          expiresAt: Date.now() - 60 * 60 * 1000,
+          scopes: ["user:profile"],
+          subscriptionType: "max",
+          rateLimitTier: "default",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(tokenResponse("fresh-access-token")));
+
+    await getOAuthTokens(tmpDir);
+
+    const persisted = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+    expect(persisted.mcpOAuth).toEqual({ some: "value", nested: { keep: true } });
+    expect(persisted.claudeAiOauth.accessToken).toBe("fresh-access-token");
+  });
+
+  it("persists a rotated refresh token so the next process restart can refresh again", async () => {
+    const credsFile = writeCreds({});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(tokenResponse("fresh-access-token", 3600, "rotated-refresh-token")),
+    );
+
+    await getOAuthTokens(tmpDir);
+
+    const persisted = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+    expect(persisted.claudeAiOauth.refreshToken).toBe("rotated-refresh-token");
+    expect(persisted.claudeAiOauth.accessToken).toBe("fresh-access-token");
+  });
+
+  it("does not corrupt the file or crash when a stale lock is present (breaks it)", async () => {
+    const credsFile = writeCreds({});
+    // Simulate a crashed poller's leftover lock with an old mtime.
+    const lockPath = `${credsFile}.lock`;
+    fs.writeFileSync(lockPath, "99999\n");
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(lockPath, old, old);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(tokenResponse("fresh-access-token")));
+
+    const tokens = await getOAuthTokens(tmpDir);
+    expect(tokens?.accessToken).toBe("fresh-access-token");
+    const persisted = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+    expect(persisted.claudeAiOauth.accessToken).toBe("fresh-access-token");
+    // The stale lock was broken and released.
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  it("never leaves the credentials file as invalid JSON (atomic replace)", async () => {
+    const credsFile = writeCreds({});
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(tokenResponse("fresh-access-token")));
+
+    await getOAuthTokens(tmpDir);
+
+    // File is always parseable — the temp-file-then-rename keeps it intact.
+    expect(() => JSON.parse(fs.readFileSync(credsFile, "utf8"))).not.toThrow();
   });
 
   it("caches the refreshed token per profile until its expiry (single refresh call)", async () => {
