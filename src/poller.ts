@@ -34,7 +34,7 @@ const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 const pendingResumes = new Map<string, ReturnType<typeof setTimeout>>();
 let contextTimer: ReturnType<typeof setInterval> | undefined;
 let tokenRollupTimer: ReturnType<typeof setInterval> | undefined;
-const CONTEXT_POLL_INTERVAL_MS = 30_000; // 30s — JSONL-scan is cheap (tail read)
+const CONTEXT_POLL_INTERVAL_MS = 120_000; // 2m — JSONL-scan is cheap (tail read)
 const TOKEN_ROLLUP_INTERVAL_MS = 60 * 60 * 1000; // 1h default
 // How many trailing days to recompute each run — catches late JSONL writes.
 const TOKEN_ROLLUP_LOOKBACK_DAYS = 2;

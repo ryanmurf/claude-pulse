@@ -993,10 +993,10 @@ async function runUploadBackfill(): Promise<void> {
 // signal loop is fail-soft: a failing signal/HTTP error logs + backs off but
 // never kills the daemon or the other loops.
 const AGENT_DEFAULTS = {
-  context: 30_000, // 30s
-  usage: 180_000, // 180s
-  tokens: 180_000, // 180s
-  gemini: 300_000, // 300s
+  context: 300_000, // 5m (local JSONL tail read)
+  usage: 900_000, // 15m (hits the rate-limited Anthropic usage API)
+  tokens: 1_800_000, // 30m (local transcript scan)
+  gemini: 1_800_000, // 30m (hits the Gemini quota API)
 };
 
 function envInterval(name: string, fallbackMs: number): number {
