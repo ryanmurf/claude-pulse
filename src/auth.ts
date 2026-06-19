@@ -93,16 +93,20 @@ async function readFromLinuxCredentialsFile(configDir: string): Promise<OAuthTok
 // idle profile's access token expires and every poll turns into a 401 — which
 // once froze the claude-hd-max gauge for ~9.5h until something re-logged-in.
 //
-// When the stored access token is expired (or the API just rejected it) and a
-// refresh token exists, we run the standard Anthropic OAuth refresh_token grant
-// and PERSIST the new {accessToken, refreshToken (rotated if returned),
-// expiresAt} back to <configDir>/.credentials.json. The write is atomic
-// (temp file in the same dir + rename) and guarded by a per-file lock so two
-// pollers can't clobber the file. Persisting (rather than refreshing only in
-// memory) means the fix survives process restarts — the */30 upload cron spawns
-// a fresh process each run — and a live Claude session reading the same file
-// sees the refreshed token too. We only ever touch the three token fields and
-// preserve every other key (mcpOAuth, scopes, subscriptionType, ...).
+// We refresh THE SAME COOPERATIVE WAY concurrent Claude Code sessions share one
+// profile: take the per-file lock FIRST, re-read the credentials under it, and
+// only run the refresh_token grant if the on-disk access token is STILL expired.
+// If a live session (or a sibling poller) refreshed while we waited for the lock,
+// we ADOPT its token instead of running our own grant — so we never spend a
+// refresh token that another process still holds. Anthropic rotates (single-use)
+// refresh tokens, so an out-of-order grant invalidates the token a sleeping
+// session cached in memory and 401s it into "run /login" on wake. Lock-first +
+// re-read + recheck is exactly what avoids that. The granted token is written
+// back atomically (temp file in the same dir + rename) under the same lock, so
+// the fix survives process restarts (the */30 upload cron spawns a fresh process
+// each run) and a live session reading the file picks up the new token. We only
+// ever touch the three token fields and preserve every other key (mcpOAuth,
+// scopes, subscriptionType, ...).
 //
 // On macOS the credentials live in the Keychain (not a JSON file); there we
 // keep the in-memory-only behavior and never write the Keychain.
@@ -181,54 +185,87 @@ async function acquireCredsLock(credsPath: string): Promise<(() => Promise<void>
 }
 
 /**
- * Persist refreshed tokens back into <configDir>/.credentials.json atomically,
- * preserving every other field. Best-effort: any failure (lock contention,
- * concurrent rewrite, I/O error) is logged and swallowed — the in-memory token
- * still services this poll. Never logs token values. Linux/file-based creds
- * only; on macOS the source is the Keychain and this is a no-op.
+ * Cooperative, lock-first refresh — the same pattern concurrent Claude Code
+ * sessions use to share one profile's credentials.
+ *
+ * Take the creds lock FIRST, then re-read <configDir>/.credentials.json under it.
+ * If the on-disk access token is already current (a live session or sibling
+ * poller refreshed while we waited for the lock), ADOPT it and return without
+ * running a grant — this is the key anti-logout move: we never spend a refresh
+ * token another process may still hold. Only if it's STILL expired do we run the
+ * standard Anthropic refresh_token grant, using the freshest on-disk refresh
+ * token (not a possibly-stale in-memory one), then persist the rotated token
+ * back atomically under the same lock (temp file + rename, 0600), preserving
+ * every other key.
+ *
+ * Returns the tokens to use (freshly granted, or adopted from disk), or null if
+ * we couldn't refresh — no lock (a live session is likely mid-refresh; better to
+ * skip one poll than to race it) or the grant failed. Callers fall back to the
+ * stored token, preserving the old "attempt anyway" behavior. Never logs token
+ * values. On macOS the creds live in the Keychain (no file lock to coordinate
+ * on), so we do the in-memory grant only and never write.
  */
-async function persistRefreshedTokens(
+async function refreshUnderLock(
   configDir: string,
-  refreshed: RefreshedTokens,
-): Promise<void> {
-  if (process.platform === "darwin") return; // Keychain-backed; never written here.
+  fileTokens: OAuthTokens,
+  force: boolean,
+): Promise<RefreshedTokens | null> {
+  // macOS: Keychain-backed, nothing to lock/persist — in-memory grant only.
+  if (process.platform === "darwin") {
+    return refreshAccessToken(configDir, fileTokens.refreshToken);
+  }
 
   const credsPath = credentialsPath(configDir);
   const release = await acquireCredsLock(credsPath);
   if (!release) {
-    log(`OAuth token persist skipped for ${configDir}: could not acquire creds lock`);
-    return;
+    log(`OAuth refresh skipped for ${configDir}: could not acquire creds lock (a live session is likely refreshing)`);
+    return null;
   }
   try {
-    // Re-read under the lock so we merge into the freshest on-disk content
-    // (Claude Code may have rewritten it) and never drop sibling keys.
+    // Re-read under the lock — the on-disk file is the source of truth now.
     let creds: KeychainCredentials;
     try {
       creds = JSON.parse(await readFile(credsPath, "utf-8")) as KeychainCredentials;
     } catch (err) {
-      log(`OAuth token persist skipped for ${configDir}: re-read failed (${(err as Error).message})`);
-      return;
+      log(`OAuth refresh skipped for ${configDir}: re-read failed (${(err as Error).message})`);
+      return null;
     }
-    const existing = creds.claudeAiOauth;
-    if (!existing) {
-      log(`OAuth token persist skipped for ${configDir}: no claudeAiOauth block`);
-      return;
+    const onDisk = creds.claudeAiOauth;
+    if (!onDisk?.refreshToken) {
+      log(`OAuth refresh skipped for ${configDir}: no refresh token on disk`);
+      return null;
     }
-    // If something already wrote a newer (still-valid) access token, leave it.
-    if (!isExpired(existing.expiresAt) && existing.accessToken !== refreshed.accessToken) {
-      return;
+    // Someone refreshed while we waited for the lock — adopt their token and do
+    // NOT burn ours. This is what stops a sleeping session from being logged out.
+    // Under `force` (the API just 401'd this token despite an unexpired expiry —
+    // revocation/skew) we only adopt if the on-disk token is a DIFFERENT one
+    // (i.e. a live session already replaced the bad token); if it's the same
+    // rejected token, we must grant a new one rather than re-serve the dud.
+    const adopt =
+      !isExpired(onDisk.expiresAt) && (!force || onDisk.accessToken !== fileTokens.accessToken);
+    if (adopt) {
+      return {
+        accessToken: onDisk.accessToken,
+        refreshToken: onDisk.refreshToken,
+        expiresAt: onDisk.expiresAt,
+      };
     }
+
+    // Still expired on disk: WE run the single refresh, with the freshest
+    // on-disk refresh token.
+    const refreshed = await refreshAccessToken(configDir, onDisk.refreshToken);
+    if (!refreshed) return null;
+
+    // Persist atomically under the lock we already hold. Atomic replace: write a
+    // uniquely-named temp file in the SAME directory (rename is atomic only
+    // within a filesystem), then rename over the original so a reader sees either
+    // the old or the new file, never a torn write. 0600 keeps it owner-only.
     creds.claudeAiOauth = {
-      ...existing,
+      ...onDisk,
       accessToken: refreshed.accessToken,
       refreshToken: refreshed.refreshToken,
       expiresAt: refreshed.expiresAt,
     };
-
-    // Atomic replace: write a uniquely-named temp file in the SAME directory
-    // (rename is atomic only within a filesystem), then rename over the
-    // original so a reader sees either the old or the new file, never a torn
-    // write. 0600 keeps the secret file owner-only.
     const tmpPath = `${credsPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     try {
       await writeFile(tmpPath, JSON.stringify(creds, null, 2), { mode: 0o600 });
@@ -237,9 +274,12 @@ async function persistRefreshedTokens(
         `OAuth token refreshed + persisted for ${configDir} (expires ${new Date(refreshed.expiresAt).toISOString()})`,
       );
     } catch (err) {
+      // We rotated at Anthropic but couldn't write — return the token anyway so
+      // this poll works; the in-memory cache carries it. Rare I/O error path.
       log(`OAuth token persist failed for ${configDir}: ${(err as Error).message}`);
       await unlink(tmpPath).catch(() => {});
     }
+    return refreshed;
   } finally {
     await release();
   }
@@ -335,16 +375,13 @@ export async function getOAuthTokens(
     return { ...tokens, accessToken: cached.accessToken, expiresAt: cached.expiresAt };
   }
 
-  // Prefer the newest known refresh token (rotation), else the file's.
-  const refreshTokenToUse = cached?.refreshToken || tokens.refreshToken;
-  if (refreshTokenToUse) {
-    const refreshed = await refreshAccessToken(configDir, refreshTokenToUse);
+  // Refresh cooperatively under the creds lock: re-read first and adopt any
+  // token a live session already wrote, so we never rotate one it still holds
+  // in memory. The grant + atomic write-back both happen inside the lock.
+  if (tokens.refreshToken) {
+    const refreshed = await refreshUnderLock(configDir, tokens, force);
     if (refreshed) {
       refreshedTokenCache.set(configDir, refreshed);
-      // Persist atomically so the refresh survives process restarts (the */30
-      // cron is a fresh process each run) and is shared with live sessions.
-      // Best-effort: a persist failure never blocks returning the live token.
-      await persistRefreshedTokens(configDir, refreshed);
       return {
         ...tokens,
         accessToken: refreshed.accessToken,

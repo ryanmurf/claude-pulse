@@ -142,6 +142,49 @@ describe("getOAuthTokens — auto-refresh + atomic persist for idle profiles", (
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
+  it("adopts a token a concurrent session wrote while we waited for the lock — never burns it", async () => {
+    // Anti-logout guarantee: our in-memory token is expired, but by the time we
+    // get the creds lock a live Claude session has refreshed the file. We must
+    // ADOPT that on-disk token and run NO grant of our own — running one would
+    // rotate (single-use) the refresh token the live session still holds and
+    // 401 it into "run /login". Simulate the live session by holding the lock,
+    // then writing a fresh token + releasing it mid-call.
+    const credsFile = writeCreds({ accessToken: "expired-tok", refreshToken: "rt0" }); // expired
+    const lockPath = `${credsFile}.lock`;
+    fs.writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" }); // "live session" holds it
+
+    const fetchMock = vi.fn(); // a token grant here would be the bug
+    vi.stubGlobal("fetch", fetchMock);
+
+    // The "live session" finishes its refresh: writes a current token, releases.
+    setTimeout(() => {
+      fs.writeFileSync(
+        credsFile,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: "cli-fresh",
+            refreshToken: "rt1",
+            expiresAt: Date.now() + 60 * 60 * 1000,
+            scopes: ["user:profile"],
+            subscriptionType: "max",
+            rateLimitTier: "default",
+          },
+        }),
+      );
+      fs.rmSync(lockPath, { force: true });
+    }, 150);
+
+    const tokens = await getOAuthTokens(tmpDir);
+    expect(tokens?.accessToken).toBe("cli-fresh"); // adopted the sibling's token
+    expect(fetchMock).not.toHaveBeenCalled(); // never ran a grant → never burned rt1
+    // The on-disk token (and the sibling's refresh token) is untouched.
+    const after = JSON.parse(fs.readFileSync(credsFile, "utf8"));
+    expect(after.claudeAiOauth.refreshToken).toBe("rt1");
+    // No temp/lock files leaked.
+    const leftovers = fs.readdirSync(tmpDir).filter((f) => f.endsWith(".tmp") || f.endsWith(".lock"));
+    expect(leftovers).toEqual([]);
+  });
+
   it("never leaves the credentials file as invalid JSON (atomic replace)", async () => {
     const credsFile = writeCreds({});
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(tokenResponse("fresh-access-token")));
