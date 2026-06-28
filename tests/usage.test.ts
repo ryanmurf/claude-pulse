@@ -2,7 +2,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fetchCodexRateLimits, fetchViaUsageApi, truncateIsoToSeconds } from "../src/usage.js";
+import {
+  fetchCodexRateLimits,
+  fetchCodexUsageApi,
+  fetchCodexUsage,
+  fetchViaUsageApi,
+  truncateIsoToSeconds,
+} from "../src/usage.js";
 import type { OAuthTokens } from "../src/auth.js";
 
 let tmpDir: string;
@@ -279,5 +285,121 @@ describe("truncateIsoToSeconds", () => {
     expect(truncateIsoToSeconds(null)).toBeNull();
     // Unparseable input passes through untouched rather than becoming Invalid Date.
     expect(truncateIsoToSeconds("not-a-date")).toBe("not-a-date");
+  });
+});
+
+// ── Codex live usage API (/wham/usage) ──────────────────────────────────────
+
+function writeCodexAuth(dir: string, tokens: Record<string, unknown> = {}): void {
+  fs.writeFileSync(
+    path.join(dir, "auth.json"),
+    JSON.stringify({ tokens: { access_token: "at-123", account_id: "acc-456", refresh_token: "rt", ...tokens } }),
+  );
+}
+function whamResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+// 5h reset 1782683430 = 2026-06-28T21:50:30Z ; 7d reset 1783270230 = 2026-07-05T16:50:30Z
+const WHAM_OK = {
+  user_id: "u-1",
+  account_id: "acc-456",
+  email: "secret@example.com",
+  plan_type: "pro",
+  rate_limit: {
+    allowed: true,
+    limit_reached: false,
+    primary_window: { used_percent: 15, limit_window_seconds: 18000, reset_at: 1782683430 },
+    secondary_window: { used_percent: 2, limit_window_seconds: 604800, reset_at: 1783270230 },
+  },
+};
+
+describe("fetchCodexUsageApi", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("maps primary_window→5h and secondary_window→7d from reset_at", async () => {
+    writeCodexAuth(tmpDir);
+    const fetchMock = vi.fn().mockResolvedValue(whamResponse(WHAM_OK));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const u = await fetchCodexUsageApi(tmpDir);
+
+    expect(u.fiveHourPct).toBe(15);
+    expect(u.sevenDayPct).toBe(2);
+    expect(u.fiveHourResetsAt).toBe("2026-06-28T21:50:30.000Z");
+    expect(u.sevenDayResetsAt).toBe("2026-07-05T16:50:30.000Z");
+    // Correct endpoint + auth headers.
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://chatgpt.com/backend-api/wham/usage");
+    expect(init.headers.Authorization).toBe("Bearer at-123");
+    expect(init.headers["ChatGPT-Account-ID"]).toBe("acc-456");
+    // raw must NOT leak identity fields.
+    expect(u.raw).not.toContain("secret@example.com");
+    expect(u.raw).not.toContain("u-1");
+    expect(JSON.parse(u.raw)).toMatchObject({ source: "api:/wham/usage", plan_type: "pro" });
+  });
+
+  it("throws on non-2xx so the caller can fall back", async () => {
+    writeCodexAuth(tmpDir);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(whamResponse("nope", 401)));
+    await expect(fetchCodexUsageApi(tmpDir)).rejects.toThrow(/returned 401/);
+  });
+
+  it("throws (no fetch) when auth.json is missing", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(fetchCodexUsageApi(tmpDir)).rejects.toThrow(/auth\.json/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchCodexUsage (API-first, transcript fallback)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("uses the live API when it succeeds", async () => {
+    writeCodexAuth(tmpDir);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(whamResponse(WHAM_OK)));
+    const u = await fetchCodexUsage(tmpDir);
+    expect(u.sevenDayPct).toBe(2);
+    expect(JSON.parse(u.raw).source).toBe("api:/wham/usage");
+  });
+
+  it("falls back to rollout transcripts when the API fails", async () => {
+    writeCodexAuth(tmpDir);
+    const sessionsDir = path.join(tmpDir, "sessions", "2026", "05", "31");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "rollout-x.jsonl"),
+      JSON.stringify({
+        timestamp: "2026-05-31T12:00:00.000Z",
+        payload: {
+          rate_limits: {
+            primary: { used_percent: 10, window_minutes: 300, resets_at: 1780255919 },
+            secondary: { used_percent: 77, window_minutes: 10080, resets_at: 1780800365 },
+          },
+        },
+      }) + "\n",
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(whamResponse("boom", 500)));
+
+    const u = await fetchCodexUsage(tmpDir, new Date("2026-06-01T08:00:00Z")); // after 5h reset, before 7d
+    expect(u.sevenDayPct).toBe(77); // from the transcript
+    expect(JSON.parse(u.raw).source).toContain("rollout-x.jsonl");
+  });
+
+  it("falls back to transcripts when auth.json is absent", async () => {
+    const sessionsDir = path.join(tmpDir, "sessions", "2026", "05", "31");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "rollout-y.jsonl"),
+      JSON.stringify({
+        msg: { rate_limits: { primary: { used_percent: 5, window_minutes: 300, resets_at: 1780255919 }, secondary: { used_percent: 33, window_minutes: 10080, resets_at: 1780800365 } } },
+      }) + "\n",
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const u = await fetchCodexUsage(tmpDir, new Date("2026-06-01T08:00:00Z"));
+    expect(u.sevenDayPct).toBe(33);
+    expect(fetchMock).not.toHaveBeenCalled(); // missing auth.json short-circuits before any GET
   });
 });

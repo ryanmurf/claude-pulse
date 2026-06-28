@@ -456,6 +456,114 @@ export async function fetchCodexRateLimits(configDir: string, now: Date = new Da
   };
 }
 
+// ── OpenAI Codex live usage API (/wham/usage) ──────────────────────────────
+// Session rate_limits in rollout transcripts only update when THIS machine's
+// codex CLI makes a request, so an idle machine reports stale/expired windows —
+// and on the central dashboard an idle machine's nulls shadow other machines'
+// data (latest-poll-wins). The undocumented /wham/usage backend endpoint returns
+// the same ACCOUNT-WIDE rate-limit windows the Codex app shows, regardless of
+// which machine ran codex, so any host with a valid ~/.codex/auth.json login can
+// report the true current usage. Read-only GET; the token is never logged or
+// stored (the response's identity fields are dropped from `raw`).
+
+const CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
+
+async function readCodexAuth(
+  configDir: string,
+): Promise<{ accessToken: string; accountId: string } | null> {
+  const authPath = path.join(expandHome(configDir), "auth.json");
+  try {
+    const parsed: unknown = JSON.parse(await readFile(authPath, "utf8"));
+    if (!isRecord(parsed) || !isRecord(parsed.tokens)) return null;
+    const t = parsed.tokens;
+    const accessToken = typeof t.access_token === "string" ? t.access_token : "";
+    const accountId = typeof t.account_id === "string" ? t.account_id : "";
+    if (!accessToken || !accountId) return null;
+    return { accessToken, accountId };
+  } catch {
+    return null;
+  }
+}
+
+function codexWindowPct(window: unknown): number | null {
+  if (!isRecord(window)) return null;
+  return typeof window.used_percent === "number" && Number.isFinite(window.used_percent)
+    ? window.used_percent
+    : null;
+}
+
+function codexWindowReset(window: unknown): string | null {
+  return isRecord(window) ? epochSecondsToIso(window.reset_at) : null;
+}
+
+/**
+ * Fetch live, account-wide codex usage from the undocumented /wham/usage backend
+ * endpoint using the existing ~/.codex/auth.json login. Maps
+ * rate_limit.primary_window → 5h and secondary_window → 7d. Throws on missing
+ * auth or any non-2xx so callers can fall back to transcript parsing. The stored
+ * `raw` keeps only the rate-limit windows + plan — NEVER the identity fields
+ * (email/user_id/account_id) the response also carries.
+ */
+export async function fetchCodexUsageApi(configDir: string): Promise<UsageData> {
+  const auth = await readCodexAuth(configDir);
+  if (!auth) {
+    throw new Error(`codex auth.json missing or has no access token under ${configDir}`);
+  }
+  const res = await fetch(CODEX_USAGE_ENDPOINT, {
+    headers: {
+      Authorization: `Bearer ${auth.accessToken}`,
+      "ChatGPT-Account-ID": auth.accountId,
+      originator: "Codex Desktop",
+      "User-Agent": "claude-pulse-codex-usage/1.0",
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`codex usage API returned ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const data: unknown = await res.json();
+  const rl = isRecord(data) && isRecord(data.rate_limit) ? data.rate_limit : null;
+  if (!rl) {
+    throw new Error("codex usage API response had no rate_limit object");
+  }
+  const primary = rl.primary_window;
+  const secondary = rl.secondary_window;
+  return {
+    fiveHourPct: codexWindowPct(primary),
+    fiveHourResetsAt: codexWindowReset(primary),
+    sevenDayPct: codexWindowPct(secondary),
+    sevenDayResetsAt: codexWindowReset(secondary),
+    raw: JSON.stringify({
+      vendor: "openai-codex",
+      source: "api:/wham/usage",
+      plan_type: isRecord(data) && typeof data.plan_type === "string" ? data.plan_type : null,
+      rate_limit: {
+        allowed: rl.allowed ?? null,
+        limit_reached: rl.limit_reached ?? null,
+        primary_window: isRecord(primary) ? primary : null,
+        secondary_window: isRecord(secondary) ? secondary : null,
+      },
+    }),
+  };
+}
+
+/**
+ * Codex usage for a profile: prefer the live, account-wide /wham/usage endpoint
+ * (authoritative regardless of which machine ran codex); fall back to local
+ * rollout-transcript parsing when auth.json is absent or the API call fails
+ * (network/expired token). On double failure the transcript error is surfaced —
+ * it carries the "fully expired" staleness semantics (and deliberately omits
+ * rate-limit trigger substrings) the poller relies on.
+ */
+export async function fetchCodexUsage(configDir: string, now: Date = new Date()): Promise<UsageData> {
+  try {
+    return await fetchCodexUsageApi(configDir);
+  } catch {
+    return await fetchCodexRateLimits(configDir, now);
+  }
+}
+
 // ── Public: fetch usage for a profile (vendor-aware) ───────────────────────
 
 /**
@@ -482,7 +590,7 @@ export async function fetchUsage(configDirOrProfile: string | Profile): Promise<
       return fetchDeepSeekBalance(profile.api_key, profile.monthly_budget_usd);
     }
     case "openai-codex":
-      return fetchCodexRateLimits(profile.config_dir);
+      return fetchCodexUsage(profile.config_dir);
     case "antigravity":
       // Antigravity exposes no 5h/7d rate-limit signal — it's a token-tally-only
       // vendor (usage comes from the conversation .db tally, not a poll). Surface
