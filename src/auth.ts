@@ -31,34 +31,68 @@ function configDirHash(configDir: string): string {
 }
 
 /**
- * Read OAuth credentials from the macOS Keychain.
- * Claude Code stores credentials under service "Claude Code-credentials-{sha256(configDir)[:8]}".
+ * Keychain coordinates for a config dir. Claude Code stores credentials under
+ * service "Claude Code-credentials-{sha256(configDir)[:8]}", account = username.
  */
-async function readFromMacKeychain(configDir: string): Promise<OAuthTokens | null> {
+function macKeychainCoords(configDir: string): { service: string; account: string } {
+  return {
+    service: `Claude Code-credentials-${configDirHash(configDir)}`,
+    account: os.userInfo().username,
+  };
+}
+
+/**
+ * Read the FULL credentials JSON object from the macOS Keychain (every key, not
+ * just claudeAiOauth) so callers can rewrite it preserving siblings like
+ * mcpOAuth. Returns null on any read failure.
+ */
+async function readMacKeychainRaw(configDir: string): Promise<KeychainCredentials | null> {
   if (process.platform !== "darwin") return null;
-
-  const hash = configDirHash(configDir);
-  const service = `Claude Code-credentials-${hash}`;
-  const account = os.userInfo().username;
-
+  const { service, account } = macKeychainCoords(configDir);
   try {
     const { stdout } = await execFileAsync("security", [
-      "find-generic-password",
-      "-s", service,
-      "-a", account,
-      "-w",
+      "find-generic-password", "-s", service, "-a", account, "-w",
     ]);
-
-    const creds: KeychainCredentials = JSON.parse(stdout.trim());
-    if (!creds.claudeAiOauth?.accessToken) {
-      log(`No OAuth tokens in keychain for ${configDir} (service: ${service})`);
-      return null;
-    }
-    return creds.claudeAiOauth;
+    return JSON.parse(stdout.trim()) as KeychainCredentials;
   } catch (err) {
     log(`Failed to read keychain for ${configDir} (service: ${service}): ${err}`);
     return null;
   }
+}
+
+/**
+ * Update the macOS Keychain credentials item IN PLACE via
+ * `security add-generic-password -U`. The item already trusts the `security`
+ * binary (we read it the same way without a prompt), so an in-place update keeps
+ * Claude Code's own reads working. Returns false on failure — callers keep the
+ * in-memory token for this run. Never logs the secret: the execFile error
+ * message echoes the full argv (which includes the password), so we surface only
+ * the exit status.
+ */
+async function writeMacKeychain(configDir: string, creds: KeychainCredentials): Promise<boolean> {
+  const { service, account } = macKeychainCoords(configDir);
+  try {
+    await execFileAsync("security", [
+      "add-generic-password", "-U", "-s", service, "-a", account, "-w", JSON.stringify(creds),
+    ]);
+    return true;
+  } catch (err) {
+    const code = (err as { code?: number | string }).code;
+    log(`Keychain write failed for ${configDir} (security exit ${code ?? "error"})`);
+    return false;
+  }
+}
+
+/**
+ * Read OAuth credentials (claudeAiOauth) from the macOS Keychain.
+ */
+async function readFromMacKeychain(configDir: string): Promise<OAuthTokens | null> {
+  const creds = await readMacKeychainRaw(configDir);
+  if (!creds?.claudeAiOauth?.accessToken) {
+    if (creds) log(`No OAuth tokens in keychain for ${configDir}`);
+    return null;
+  }
+  return creds.claudeAiOauth;
 }
 
 /**
@@ -108,8 +142,11 @@ async function readFromLinuxCredentialsFile(configDir: string): Promise<OAuthTok
 // ever touch the three token fields and preserve every other key (mcpOAuth,
 // scopes, subscriptionType, ...).
 //
-// On macOS the credentials live in the Keychain (not a JSON file); there we
-// keep the in-memory-only behavior and never write the Keychain.
+// On macOS the credentials live in the Keychain (not a JSON file). We apply the
+// SAME cooperative refresh there — lock, re-read, adopt, grant-if-still-expired —
+// and persist the rotated token back to the Keychain in place via
+// `security add-generic-password -U` (the item already trusts the `security`
+// binary, so Claude Code keeps reading it). See refreshUnderLockMac.
 
 export const ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_TOKEN_ENDPOINT = "https://console.anthropic.com/v1/oauth/token";
@@ -185,6 +222,80 @@ async function acquireCredsLock(credsPath: string): Promise<(() => Promise<void>
 }
 
 /**
+ * macOS cooperative refresh — mirrors the Linux file path but with the Keychain
+ * as the credential store.
+ *
+ * Many claude-pulse instances poll the same profiles at once (each Claude Code
+ * session spawns its own MCP server), so an UNCOORDINATED in-memory grant on
+ * macOS had every instance spend the single-use refresh token while none wrote
+ * the rotated token back — orphaning the token Claude Code still held in the
+ * Keychain and 401'ing it into "run /login". We now take a per-config-dir lock,
+ * re-read the Keychain under it, ADOPT a token a sibling/live session already
+ * refreshed (never burning one another process holds), and only run the grant if
+ * the Keychain token is STILL expired. The rotated token is written back to the
+ * Keychain in place, preserving every other key, so Claude Code (which reads the
+ * same item) never sees a spent refresh token.
+ */
+async function refreshUnderLockMac(
+  configDir: string,
+  fileTokens: OAuthTokens,
+  force: boolean,
+): Promise<RefreshedTokens | null> {
+  // The Keychain isn't a lockable path; coordinate sibling pollers on a lock
+  // file in the config dir (there is no .credentials.json on macOS to collide).
+  const release = await acquireCredsLock(credentialsPath(configDir));
+  if (!release) {
+    log(`OAuth refresh skipped for ${configDir}: could not acquire keychain refresh lock (a sibling is refreshing)`);
+    return null;
+  }
+  try {
+    const creds = await readMacKeychainRaw(configDir);
+    const onDisk = creds?.claudeAiOauth;
+    if (!onDisk?.refreshToken) {
+      log(`OAuth refresh skipped for ${configDir}: no refresh token in keychain`);
+      return null;
+    }
+    // Adopt a token someone refreshed while we waited for the lock. Under `force`
+    // (the API just 401'd despite an unexpired expiry) only adopt a DIFFERENT
+    // token (a live session already replaced the bad one); never re-serve the dud.
+    const adopt =
+      !isExpired(onDisk.expiresAt) && (!force || onDisk.accessToken !== fileTokens.accessToken);
+    if (adopt) {
+      return {
+        accessToken: onDisk.accessToken,
+        refreshToken: onDisk.refreshToken,
+        expiresAt: onDisk.expiresAt,
+      };
+    }
+
+    // Still expired on disk: WE run the single refresh with the freshest
+    // Keychain refresh token, then persist the rotated token back in place.
+    const refreshed = await refreshAccessToken(configDir, onDisk.refreshToken);
+    if (!refreshed) return null;
+
+    const updated: KeychainCredentials = {
+      ...creds,
+      claudeAiOauth: {
+        ...onDisk,
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken,
+        expiresAt: refreshed.expiresAt,
+      },
+    };
+    if (await writeMacKeychain(configDir, updated)) {
+      log(
+        `OAuth token refreshed + persisted to keychain for ${configDir} (expires ${new Date(refreshed.expiresAt).toISOString()})`,
+      );
+    } else {
+      log(`OAuth token refreshed for ${configDir} but keychain persist failed; in-memory only this run`);
+    }
+    return refreshed;
+  } finally {
+    await release();
+  }
+}
+
+/**
  * Cooperative, lock-first refresh — the same pattern concurrent Claude Code
  * sessions use to share one profile's credentials.
  *
@@ -210,9 +321,10 @@ async function refreshUnderLock(
   fileTokens: OAuthTokens,
   force: boolean,
 ): Promise<RefreshedTokens | null> {
-  // macOS: Keychain-backed, nothing to lock/persist — in-memory grant only.
+  // macOS: Keychain-backed. Refresh cooperatively (lock + re-read + adopt) and
+  // persist the rotated token back to the Keychain — see refreshUnderLockMac.
   if (process.platform === "darwin") {
-    return refreshAccessToken(configDir, fileTokens.refreshToken);
+    return refreshUnderLockMac(configDir, fileTokens, force);
   }
 
   const credsPath = credentialsPath(configDir);
@@ -344,9 +456,9 @@ async function refreshAccessToken(
  * any in-memory refresh state is dropped (Claude Code refreshed it for us).
  * When it's expired — or `opts.forceRefresh` is set because the API just
  * rejected it — and a refresh token exists, the token is refreshed via the
- * standard Anthropic OAuth grant and (on Linux) PERSISTED back to the
- * credentials file atomically so the fix survives process restarts and is
- * shared with any live Claude session. The refreshed token is also cached in
+ * standard Anthropic OAuth grant and PERSISTED back to the credential store
+ * (the credentials file on Linux, the Keychain on macOS) so the fix survives
+ * process restarts and is shared with any live Claude session. The refreshed token is also cached in
  * memory per profile until ITS expiry. Refresh failure falls back to the
  * stored token, preserving the old "attempt anyway" behavior — the poll loop
  * never crashes and other profiles are unaffected.
