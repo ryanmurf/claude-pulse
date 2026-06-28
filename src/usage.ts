@@ -312,10 +312,39 @@ function findNestedCodexRateLimits(
   return null;
 }
 
-async function readCodexRateLimitsFromFile(jsonlPath: string): Promise<Record<string, unknown> | null> {
-  const raw = await readFile(jsonlPath, "utf8");
-  let latest: Record<string, unknown> | null = null;
+interface CodexSnapshot {
+  rateLimits: Record<string, unknown>;
+  /** Timestamp of the rate_limits ENTRY itself (epoch ms), or null if absent. */
+  tsMs: number | null;
+}
 
+/**
+ * Epoch-ms timestamp of a rollout line, read from the event envelope's
+ * top-level `timestamp` (Codex writes ISO-8601 strings; epoch numbers are
+ * tolerated). Returns null when absent/unparseable so the caller can fall back
+ * to the file mtime.
+ */
+function lineTimestampMs(parsed: unknown): number | null {
+  if (!isRecord(parsed)) return null;
+  const t = parsed.timestamp;
+  if (typeof t === "string") {
+    const ms = Date.parse(t);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof t === "number" && Number.isFinite(t)) {
+    // Values below ~1e12 are epoch seconds; otherwise already milliseconds.
+    return t < 1e12 ? t * 1000 : t;
+  }
+  return null;
+}
+
+async function readCodexRateLimitsFromFile(jsonlPath: string): Promise<CodexSnapshot | null> {
+  const raw = await readFile(jsonlPath, "utf8");
+  let latest: CodexSnapshot | null = null;
+
+  // Keep the LAST rate_limits-bearing line in the file (rollout lines are
+  // appended chronologically) and carry its entry timestamp so the caller can
+  // rank snapshots ACROSS files by when they were actually recorded.
   for (const line of raw.split("\n")) {
     if (!line.trim() || !line.includes("rate_limits")) continue;
     let parsed: unknown;
@@ -325,7 +354,7 @@ async function readCodexRateLimitsFromFile(jsonlPath: string): Promise<Record<st
       continue;
     }
     const found = findNestedCodexRateLimits(parsed);
-    if (found) latest = found;
+    if (found) latest = { rateLimits: found, tsMs: lineTimestampMs(parsed) };
   }
 
   return latest;
@@ -355,56 +384,76 @@ function resetTime(window: unknown): string | null {
 
 export async function fetchCodexRateLimits(configDir: string, now: Date = new Date()): Promise<UsageData> {
   const sessionsDir = path.join(expandHome(configDir), "sessions");
-  const rolloutFiles = (await findCodexRolloutFiles(sessionsDir)).slice(0, 3);
+  const rolloutFiles = await findCodexRolloutFiles(sessionsDir); // newest mtime first
 
+  // Pick the snapshot with the newest rate_limits-ENTRY timestamp across files —
+  // NOT the newest file mtime. A long-lived session's rollout keeps getting
+  // appended (resumes, non-API events) long after its last rate_limits line, so
+  // the newest-mtime file can carry a STALER reading than an older-mtime file
+  // whose last API call was more recent. Ranking by file mtime froze the gauge
+  // on an old % (e.g. 16% used) while a fresher reading (52%) sat in an
+  // older-mtime file. Rank by the entry's own timestamp instead.
+  //
+  // Early-out: a rate_limits entry's timestamp can never exceed its file's
+  // mtime, so once our best entry is at least as new as the next file's mtime,
+  // no remaining (lower-mtime) file can beat it — stop reading. (Falls back to
+  // file mtime for the rare rollout line that carries no timestamp.)
+  let best: { rateLimits: Record<string, unknown>; tsMs: number; path: string } | null = null;
   for (const file of rolloutFiles) {
-    const rateLimits = await readCodexRateLimitsFromFile(file.path);
-    if (!rateLimits) continue;
-
-    // Staleness guard: codex rate_limits come from session transcripts, not a
-    // live API. A window whose resets_at is already in the past has rolled over
-    // since the transcript was written — its used_percent describes a PREVIOUS
-    // window. Report that window as no-signal instead of re-publishing days-old
-    // numbers as a fresh poll: an idle machine would otherwise shadow fresh
-    // data pushed by other machines (latest-poll-wins at the central receiver)
-    // and pace math would extrapolate absurd expected percentages.
-    const nowMs = now.getTime();
-    const expired = (iso: string | null): boolean => iso !== null && Date.parse(iso) <= nowMs;
-    let fiveHourPct = usedPercent(rateLimits.primary);
-    let fiveHourResetsAt = resetTime(rateLimits.primary);
-    let sevenDayPct = usedPercent(rateLimits.secondary);
-    let sevenDayResetsAt = resetTime(rateLimits.secondary);
-    if (expired(fiveHourResetsAt)) {
-      fiveHourPct = null;
-      fiveHourResetsAt = null;
+    if (best && best.tsMs >= file.mtimeMs) break;
+    const snap = await readCodexRateLimitsFromFile(file.path);
+    if (!snap) continue;
+    const tsMs = snap.tsMs ?? file.mtimeMs;
+    if (!best || tsMs > best.tsMs) {
+      best = { rateLimits: snap.rateLimits, tsMs, path: file.path };
     }
-    if (expired(sevenDayResetsAt)) {
-      sevenDayPct = null;
-      sevenDayResetsAt = null;
-    }
-    // Older rollout files can only be staler — don't bother scanning further.
-    // NOTE: keep "rate_limit"/"429" OUT of this message — it must not trip
-    // the poller's isRateLimitError detection (it's staleness, not throttling).
-    if (fiveHourResetsAt === null && sevenDayResetsAt === null) {
-      throw new Error(
-        `codex usage windows in ${file.path} are fully expired (codex idle here since they were recorded); no current usage signal`,
-      );
-    }
-
-    return {
-      fiveHourPct,
-      fiveHourResetsAt,
-      sevenDayPct,
-      sevenDayResetsAt,
-      raw: JSON.stringify({
-        vendor: "openai-codex",
-        source: file.path,
-        rate_limits: rateLimits,
-      }),
-    };
   }
 
-  throw new Error(`No codex usage data found under ${sessionsDir}`);
+  if (!best) {
+    throw new Error(`No codex usage data found under ${sessionsDir}`);
+  }
+  const { rateLimits } = best;
+
+  // Staleness guard: codex rate_limits come from session transcripts, not a
+  // live API. A window whose resets_at is already in the past has rolled over
+  // since the transcript was written — its used_percent describes a PREVIOUS
+  // window. Report that window as no-signal instead of re-publishing days-old
+  // numbers as a fresh poll: an idle machine would otherwise shadow fresh
+  // data pushed by other machines (latest-poll-wins at the central receiver)
+  // and pace math would extrapolate absurd expected percentages.
+  const nowMs = now.getTime();
+  const expired = (iso: string | null): boolean => iso !== null && Date.parse(iso) <= nowMs;
+  let fiveHourPct = usedPercent(rateLimits.primary);
+  let fiveHourResetsAt = resetTime(rateLimits.primary);
+  let sevenDayPct = usedPercent(rateLimits.secondary);
+  let sevenDayResetsAt = resetTime(rateLimits.secondary);
+  if (expired(fiveHourResetsAt)) {
+    fiveHourPct = null;
+    fiveHourResetsAt = null;
+  }
+  if (expired(sevenDayResetsAt)) {
+    sevenDayPct = null;
+    sevenDayResetsAt = null;
+  }
+  // NOTE: keep "rate_limit"/"429" OUT of this message — it must not trip
+  // the poller's isRateLimitError detection (it's staleness, not throttling).
+  if (fiveHourResetsAt === null && sevenDayResetsAt === null) {
+    throw new Error(
+      `codex usage windows in ${best.path} are fully expired (codex idle here since they were recorded); no current usage signal`,
+    );
+  }
+
+  return {
+    fiveHourPct,
+    fiveHourResetsAt,
+    sevenDayPct,
+    sevenDayResetsAt,
+    raw: JSON.stringify({
+      vendor: "openai-codex",
+      source: best.path,
+      rate_limits: rateLimits,
+    }),
+  };
 }
 
 // ── Public: fetch usage for a profile (vendor-aware) ───────────────────────

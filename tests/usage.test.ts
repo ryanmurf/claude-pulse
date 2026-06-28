@@ -82,6 +82,49 @@ describe("fetchCodexRateLimits", () => {
     });
   });
 
+  it("prefers the freshest rate_limits ENTRY even when it lives in an older-mtime file", async () => {
+    // Reproduces the real bug: a long-lived session's rollout file keeps getting
+    // appended (so its mtime is newest) long after its last API call, leaving a
+    // STALE rate_limits reading — while a different file with an OLDER mtime holds
+    // a FRESHER reading from a more recent API call. Ranking by file mtime picks
+    // the stale 16%; ranking by the entry's own timestamp picks the live 52%.
+    const sessionsDir = path.join(tmpDir, "sessions", "2026", "05", "31");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    // resets_at: 5h = 1780255919 (2026-05-31T19:31:59Z), 7d = 1780800365 (2026-06-07T02:46:05Z)
+    const line = (ts: string, fivePct: number, sevenPct: number) =>
+      JSON.stringify({
+        timestamp: ts,
+        type: "event_msg",
+        payload: {
+          rate_limits: {
+            primary: { used_percent: fivePct, window_minutes: 300, resets_at: 1780255919 },
+            secondary: { used_percent: sevenPct, window_minutes: 10080, resets_at: 1780800365 },
+          },
+        },
+      }) + "\n";
+
+    // Touched-late file: last API line is OLD (12:00) but the file kept being
+    // appended, so it has the NEWEST mtime.
+    const stalePath = path.join(sessionsDir, "rollout-touched-late.jsonl");
+    fs.writeFileSync(stalePath, line("2026-05-31T12:00:00.000Z", 10, 16));
+
+    // Fresh file: last API line is RECENT (18:00) but its mtime is older.
+    const freshPath = path.join(sessionsDir, "rollout-fresh.jsonl");
+    fs.writeFileSync(freshPath, line("2026-05-31T18:00:00.000Z", 40, 52));
+
+    const t = (iso: string) => new Date(iso);
+    fs.utimesSync(freshPath, t("2026-05-31T18:05:00Z"), t("2026-05-31T18:05:00Z"));
+    fs.utimesSync(stalePath, t("2026-05-31T20:00:00Z"), t("2026-05-31T20:00:00Z")); // newest mtime
+
+    // Pin "now" so both windows are still live.
+    const usage = await fetchCodexRateLimits(tmpDir, new Date("2026-05-31T19:00:00Z"));
+
+    expect(usage.sevenDayPct).toBe(52); // the fresher entry, NOT the stale 16
+    expect(usage.fiveHourPct).toBe(40);
+    expect(JSON.parse(usage.raw).source).toBe(freshPath);
+  });
+
   // resets_at epochs: 5h = 2026-05-31T19:31:59Z (1780255919), 7d = 2026-06-07T02:46:05Z (1780800365)
   function writeRollout(resets5h = 1780255919, resets7d = 1780800365): string {
     const sessionsDir = path.join(tmpDir, "sessions", "2026", "05", "31");
