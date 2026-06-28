@@ -43,12 +43,20 @@ function tokenResponse(accessToken: string, expiresIn = 3600, refreshToken?: str
   );
 }
 
+let origPlatform: PropertyDescriptor | undefined;
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-pulse-auth-test-"));
+  // These exercise the Linux file-based credentials path; pin the platform so
+  // they're deterministic on macOS too (where the real code reads the Keychain,
+  // covered separately in auth-keychain-mac.test.ts).
+  origPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
   _clearRefreshedTokenCache();
 });
 
 afterEach(() => {
+  if (origPlatform) Object.defineProperty(process, "platform", origPlatform);
   vi.unstubAllGlobals();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
