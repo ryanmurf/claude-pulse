@@ -767,6 +767,32 @@ export async function insertSnapshot(
 ): Promise<UsageSnapshot> {
   const d = getDb();
   const acct = accountId ?? (await defaultAccountId());
+
+  // Same "latest poll wins" guard the push path applies (see ingestUsageSnapshot):
+  // the local poller falls back to transcript parsing when the live vendor API
+  // fails, and a transcript snapshot can carry a stale, lower used_percent for
+  // the current window — which would otherwise clobber a fresher reading via the
+  // ORDER BY polled_at DESC reads. Context-only / error rows (null resets) never
+  // regress, so they still insert.
+  if (fiveHourResetsAt !== null || sevenDayResetsAt !== null) {
+    const latest = await d.get<UsageSnapshot>(
+      `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? ORDER BY polled_at DESC LIMIT 1`,
+      [profile, acct],
+    );
+    const incoming: SnapshotContent = {
+      five_hour_pct: fiveHourPct,
+      five_hour_resets_at: fiveHourResetsAt,
+      seven_day_pct: sevenDayPct,
+      seven_day_resets_at: sevenDayResetsAt,
+    };
+    if (latest && snapshotContentRegressed(incoming, latest)) {
+      process.stderr.write(
+        `[claude-pulse] ${new Date().toISOString()} insertSnapshot: skipped stale snapshot for ${profile} (content regressed vs stored)\n`,
+      );
+      return latest;
+    }
+  }
+
   const id = await d.insertReturningId(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
@@ -831,14 +857,25 @@ function isoEpochMs(v: string | null | undefined): number | null {
 }
 
 /**
- * True when `incoming` carries strictly OLDER rate-limit window content than
- * `stored` — i.e. its resets_at regresses. The 5h/7d windows belong to the
- * subscription (shared across machines), so resets_at acts as a content
- * version: a bigger value = a later window. "Latest poll wins" is only safe
- * when content moves forward — without this check, a reporter whose local
- * vendor data is stale (e.g. a machine where codex has been idle for days)
- * re-publishes old windows with fresh polled_at stamps and permanently
- * shadows fresher content pushed by other machines.
+ * True when `incoming` carries STALER rate-limit content than `stored` and so
+ * must NOT overwrite it under "latest poll wins". Two independent regressions
+ * count, evaluated per window (5h and 7d):
+ *
+ *   1. resets_at regresses — the 5h/7d windows belong to the subscription
+ *      (shared across machines), so resets_at acts as a content version: a
+ *      bigger value = a later window. A reporter whose local vendor data is
+ *      stale (e.g. a machine where codex has been idle for days) otherwise
+ *      re-publishes an OLD window with a fresh polled_at and permanently
+ *      shadows fresher content pushed by other machines.
+ *
+ *   2. used_percent regresses WITHIN THE SAME WINDOW — usage is cumulative, so
+ *      a window's used_percent is monotonic non-decreasing until it resets. A
+ *      poll reporting a LOWER percent for the same window (|Δresets_at| within
+ *      tolerance) is stale — e.g. a transcript-fallback snapshot read earlier
+ *      in the week, or an old reporter with no live-API code — and must not
+ *      clobber the higher value. This is scoped to the SAME window: a genuine
+ *      reset moves resets_at ~days forward (far beyond tolerance), so the
+ *      legitimate drop back to ~0 is still accepted by branch (1).
  *
  * Anthropic's /api/oauth/usage returns quantized reset times whose sub-second
  * part is per-request noise (04:40:00.714116 vs 04:40:00.000) — the same
@@ -848,16 +885,31 @@ function isoEpochMs(v: string | null | undefined): number | null {
  */
 const RESET_JITTER_TOLERANCE_MS = 5 * 60_000;
 
-function snapshotContentRegressed(
-  incoming: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
-  stored: { five_hour_resets_at: string | null; seven_day_resets_at: string | null },
-): boolean {
+interface SnapshotContent {
+  five_hour_pct: number | null;
+  five_hour_resets_at: string | null;
+  seven_day_pct: number | null;
+  seven_day_resets_at: string | null;
+}
+
+/** A non-null used_percent that fell below the stored value (stale reading). */
+function pctRegressed(incoming: number | null, stored: number | null): boolean {
+  return incoming !== null && stored !== null && incoming < stored;
+}
+
+function snapshotContentRegressed(incoming: SnapshotContent, stored: SnapshotContent): boolean {
   const in7 = isoEpochMs(incoming.seven_day_resets_at);
   const st7 = isoEpochMs(stored.seven_day_resets_at);
-  if (in7 !== null && st7 !== null && Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) return in7 < st7;
+  if (in7 !== null && st7 !== null) {
+    if (Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) return in7 < st7;
+    if (pctRegressed(incoming.seven_day_pct, stored.seven_day_pct)) return true;
+  }
   const in5 = isoEpochMs(incoming.five_hour_resets_at);
   const st5 = isoEpochMs(stored.five_hour_resets_at);
-  if (in5 !== null && st5 !== null && Math.abs(in5 - st5) > RESET_JITTER_TOLERANCE_MS) return in5 < st5;
+  if (in5 !== null && st5 !== null) {
+    if (Math.abs(in5 - st5) > RESET_JITTER_TOLERANCE_MS) return in5 < st5;
+    if (pctRegressed(incoming.five_hour_pct, stored.five_hour_pct)) return true;
+  }
   return false;
 }
 

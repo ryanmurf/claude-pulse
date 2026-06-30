@@ -12,6 +12,7 @@ import {
   removeProfile,
   updatePollInterval,
   insertSnapshot,
+  ingestUsageSnapshot,
   getLatestSnapshot,
   getLatestSnapshots,
   getLastSuccessfulSnapshot,
@@ -199,6 +200,87 @@ describe("insertSnapshot / getLatestSnapshot / getHistory", () => {
 
     const history = await getHistory("lim-test", 24, 3);
     expect(history).toHaveLength(3);
+  });
+});
+
+describe("snapshot staleness guard (latest-poll-wins regression)", () => {
+  // A weekly window's reset_at. The same string = the same window (Δ ≤ jitter
+  // tolerance); +7d = a genuine reset to a fresh window.
+  const R7 = "2026-07-06T03:04:59Z";
+  const R7_NEXT = "2026-07-13T03:04:59Z";
+  const R5 = "2026-06-30T05:00:00Z";
+  const R5_NEXT = "2026-06-30T10:00:00Z"; // +5h, a new 5h window
+
+  it("insertSnapshot rejects a lower used_percent for the same 7d window (52→16 must not overwrite)", async () => {
+    await addProfile("regress-7d", "/tmp/r7", 5);
+    await insertSnapshot("regress-7d", null, null, 52.0, R7, null);
+    // Stale poll (e.g. transcript fallback) re-reports the same window at 16%.
+    await insertSnapshot("regress-7d", null, null, 16.0, R7, null);
+
+    const latest = await getLatestSnapshot("regress-7d");
+    expect(latest!.seven_day_pct).toBeCloseTo(52.0);
+  });
+
+  it("insertSnapshot accepts a rising used_percent within the same window", async () => {
+    await addProfile("rise-7d", "/tmp/rise", 5);
+    await insertSnapshot("rise-7d", null, null, 52.0, R7, null);
+    await insertSnapshot("rise-7d", null, null, 55.0, R7, null);
+
+    const latest = await getLatestSnapshot("rise-7d");
+    expect(latest!.seven_day_pct).toBeCloseTo(55.0);
+  });
+
+  it("insertSnapshot accepts a drop to 0 on a genuine weekly reset (reset_at jumps +7d)", async () => {
+    await addProfile("reset-7d", "/tmp/reset", 5);
+    await insertSnapshot("reset-7d", null, null, 52.0, R7, null);
+    await insertSnapshot("reset-7d", null, null, 0.0, R7_NEXT, null);
+
+    const latest = await getLatestSnapshot("reset-7d");
+    expect(latest!.seven_day_pct).toBeCloseTo(0.0);
+    expect(latest!.seven_day_resets_at).toBe(R7_NEXT);
+  });
+
+  it("insertSnapshot accepts a 5h reset to 0 while the 7d window holds steady", async () => {
+    await addProfile("cycle-5h", "/tmp/c5", 5);
+    await insertSnapshot("cycle-5h", 80.0, R5, 52.0, R7, null);
+    await insertSnapshot("cycle-5h", 0.0, R5_NEXT, 52.0, R7, null);
+
+    const latest = await getLatestSnapshot("cycle-5h");
+    expect(latest!.five_hour_pct).toBeCloseTo(0.0);
+    expect(latest!.seven_day_pct).toBeCloseTo(52.0);
+  });
+
+  it("insertSnapshot still inserts null-usage (error/context) rows — they never regress", async () => {
+    await addProfile("null-ok", "/tmp/null", 5);
+    await insertSnapshot("null-ok", null, null, 52.0, R7, null);
+    await insertSnapshot("null-ok", null, null, null, null, '{"error":"rate limit"}');
+
+    const history = await getHistory("null-ok", 24, 100);
+    expect(history).toHaveLength(2);
+  });
+
+  it("ingestUsageSnapshot (push path) also rejects a same-window used_percent regression", async () => {
+    await addProfile("regress-ingest", "/tmp/ri", 5);
+    await ingestUsageSnapshot({
+      account_id: LA,
+      profile: "regress-ingest",
+      five_hour_pct: 0,
+      five_hour_resets_at: R5,
+      seven_day_pct: 52,
+      seven_day_resets_at: R7,
+    });
+    // An old / transcript-only reporter re-pushes the same window at 16%.
+    await ingestUsageSnapshot({
+      account_id: LA,
+      profile: "regress-ingest",
+      five_hour_pct: 0,
+      five_hour_resets_at: R5,
+      seven_day_pct: 16,
+      seven_day_resets_at: R7,
+    });
+
+    const latest = await getLatestSnapshot("regress-ingest", LA);
+    expect(latest!.seven_day_pct).toBeCloseTo(52);
   });
 });
 
