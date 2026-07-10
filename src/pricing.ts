@@ -42,11 +42,14 @@ export interface PricingOverrideRow extends PricingRate {
   settings_match_json: string;
 }
 
-// ── DEFAULT PRICING (researched 2026-06-06; Claude 5 Fable/Mythos added 2026-06-11) ──
+// ── DEFAULT PRICING (researched 2026-06-06; Claude 5 Fable/Mythos added
+// 2026-06-11; gpt-5.3-codex-spark added 2026-07-10) ──
 //
-// USD per 1,000,000 tokens. Sources (seen 2026-06-06):
+// USD per 1,000,000 tokens. Sources (seen 2026-06-06, codex-spark row seen
+// 2026-07-10):
 //   Anthropic  https://platform.claude.com/docs/en/about-claude/pricing
 //   OpenAI     https://developers.openai.com/api/docs/pricing
+//   OpenAI     https://learn.chatgpt.com/docs/pricing (Codex CLI billing + spark research-preview note)
 //   DeepSeek   https://api-docs.deepseek.com/quick_start/pricing
 //   Google     https://ai.google.dev/gemini-api/docs/pricing
 //
@@ -62,6 +65,17 @@ export interface PricingOverrideRow extends PricingRate {
 //    effort just emits more output tokens, which we already meter. The only true
 //    rate variants are service tiers (batch/flex/priority), Anthropic Fast Mode,
 //    and data residency — model those as settings_match variants below.
+//  - OpenAI's codex models DO have a documented "priority" tier at 2x the
+//    standard input/output/cached-input rate (confirmed 2026-07-10 for
+//    gpt-5.3-codex: $3.50/$28/$0.35 vs $1.75/$14/$0.175 standard). NOT modeled
+//    here as a settings_match variant: the codex ingestion path
+//    (tallyCodexFine in tokens.ts) only reads `effort` out of turn_context —
+//    it does not read/emit a service_tier-like key for codex, and no local
+//    codex session transcript has ever contained one (config.toml's
+//    `service_tier = "default"` is a CLI-level default that isn't propagated
+//    into the turn_context JSON we ingest). Until that field is captured
+//    upstream, every codex event effectively prices at standard tier — adding
+//    a priority row here would be dead code with no way to select it.
 //  - Keyed by a normalised (lowercased) model id, LONGEST-prefix-matched
 //    downstream, so "claude-opus-4-8-20260115" resolves via "claude-opus-4" and
 //    "gpt-5.4-mini-…" resolves via "gpt-5.4-mini" (more specific) over "gpt-5.4".
@@ -89,6 +103,13 @@ export const DEFAULT_PRICING: PricingRow[] = [
   { model: "gpt-5.4-mini", settings_match_json: "{}", input: 0.75, output: 4.5, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.075 },
   { model: "gpt-5.4", settings_match_json: "{}", input: 2.5, output: 15, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.25 },
   { model: "gpt-5.3-codex", settings_match_json: "{}", input: 1.75, output: 14, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.175 },
+  // gpt-5.3-codex-spark (Codex CLI research preview, ChatGPT Pro only, seen
+  // 2026-07-09 in local codex session transcripts as turn_context.model). Same
+  // published rate as gpt-5.3-codex ($1.75/$14) — no distinct SKU pricing yet.
+  // Explicit row (rather than relying on the "gpt-5.3-codex" prefix match) so
+  // it shows up in the Pricing settings UI and can be overridden independently
+  // if OpenAI splits its pricing later.
+  { model: "gpt-5.3-codex-spark", settings_match_json: "{}", input: 1.75, output: 14, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.175 },
   // OpenAI batch/flex tier — ~50% off (example variant; applies to gpt-5.5)
   { model: "gpt-5.5", settings_match_json: "{\"service_tier\":\"batch\"}", input: 2.5, output: 15, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0.25 },
 
