@@ -45,6 +45,17 @@ describe("resolveRate", () => {
     expect(rate.output).toBe(25);
   });
 
+  it("prices gpt-5.3-codex-spark at the same standard rate as gpt-5.3-codex", async () => {
+    const { rate, known } = resolveRate("gpt-5.3-codex-spark", {}, DEFAULT_PRICING, []);
+    expect(known).toBe(true);
+    const codex = DEFAULT_PRICING.find((r) => r.model === "gpt-5.3-codex")!;
+    expect(rate.input).toBe(codex.input);
+    expect(rate.output).toBe(codex.output);
+    expect(rate.cache_read).toBe(codex.cache_read);
+    // has its own explicit row (not just riding the "gpt-5.3-codex" prefix match)
+    expect(DEFAULT_PRICING.some((r) => r.model === "gpt-5.3-codex-spark")).toBe(true);
+  });
+
   it("falls back for an unknown model", async () => {
     const { rate, known } = resolveRate("totally-unknown-9000", {}, DEFAULT_PRICING, []);
     expect(known).toBe(false);
