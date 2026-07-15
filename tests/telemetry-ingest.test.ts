@@ -10,7 +10,11 @@ import {
   resolveAccount,
   mintIngestToken,
   getLatestSnapshots,
+  getLatestSnapshotsByMachine,
+  getLatestUsageRows,
   getLatestSnapshot,
+  insertSnapshot,
+  addProfile,
   getLatestGeminiQuota,
 } from "../src/store.js";
 import { startHttpServer, stopHttpServer } from "../src/server.js";
@@ -120,6 +124,89 @@ describe("POST /api/ingest — snapshots", () => {
     const local = await resolveAccount("local");
     const localSnap = await getLatestSnapshot("claude-max", local.id);
     expect(localSnap?.five_hour_pct ?? null).toBe(null);
+  });
+
+  it("keeps a per-computer 5h/7d reading for a profile shared across machines (no host collision)", async () => {
+    const acct = await resolveAccount("codex-user@example.com");
+    const tron = await mintIngestToken(acct.id, "tron");
+    const midnight = await mintIngestToken(acct.id, "midnight");
+
+    // tron reports codex.
+    const rt = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${tron.plaintext}` },
+      body: {
+        snapshots: [{
+          profile: "codex", five_hour_pct: 20, five_hour_resets_at: "2026-07-15T20:00:00.000Z",
+          seven_day_pct: 15, seven_day_resets_at: "2026-07-20T00:00:00.000Z", polled_at: "2026-07-15T10:00:00.000Z",
+        }],
+      },
+    });
+    expect(rt.status).toBe(200);
+
+    // midnight reports codex with DIFFERENT values, polled LATER — under the old
+    // (account, profile) keying this clobbered tron. It must not now.
+    const rm = await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${midnight.plaintext}` },
+      body: {
+        snapshots: [{
+          profile: "codex", five_hour_pct: 80, five_hour_resets_at: "2026-07-15T20:00:00.000Z",
+          seven_day_pct: 60, seven_day_resets_at: "2026-07-20T00:00:00.000Z", polled_at: "2026-07-15T10:05:00.000Z",
+        }],
+      },
+    });
+    expect(rm.status).toBe(200);
+
+    // Both computers' readings coexist under ONE profile.
+    const codexRows = (await getLatestSnapshotsByMachine(acct.id)).filter((s) => s.profile === "codex");
+    expect(codexRows.length).toBe(2);
+    const byMachine = Object.fromEntries(codexRows.map((s) => [s.machine, s.five_hour_pct]));
+    expect(byMachine.tron).toBe(20);
+    expect(byMachine.midnight).toBe(80);
+
+    // /api/usage surfaces one row per (profile, computer).
+    const usage = await req("GET", "/api/usage", { headers: { "X-Auth-Request-Email": "codex-user@example.com" } });
+    const usageCodex = (usage.json as any[]).filter((p) => p.profile === "codex");
+    expect(usageCodex.length).toBe(2);
+    expect(usageCodex.map((r) => r.machine).sort()).toEqual(["midnight", "tron"]);
+
+    // The regression guard is per-machine: tron re-publishing a STALE lower pct
+    // for the same window is rejected for tron and never touches midnight.
+    await req("POST", "/api/ingest", {
+      headers: { Authorization: `Bearer ${tron.plaintext}` },
+      body: {
+        snapshots: [{
+          profile: "codex", five_hour_pct: 5, five_hour_resets_at: "2026-07-15T20:00:00.000Z",
+          seven_day_pct: 15, seven_day_resets_at: "2026-07-20T00:00:00.000Z", polled_at: "2026-07-15T10:10:00.000Z",
+        }],
+      },
+    });
+    const after = Object.fromEntries(
+      (await getLatestSnapshotsByMachine(acct.id))
+        .filter((s) => s.profile === "codex")
+        .map((s) => [s.machine, s.five_hour_pct]),
+    );
+    expect(after.tron).toBe(20);
+    expect(after.midnight).toBe(80);
+  });
+
+  it("falls back to the latest machine-agnostic snapshot for a profile not yet reporting per-machine", async () => {
+    const acct = await resolveAccount("fallback-user@example.com");
+    await addProfile("claude-legacy", "/tmp/x", 5, "anthropic-oauth", null, null, acct.id);
+    // A legacy snapshot with NO machine (local single-host poller path).
+    await insertSnapshot(
+      "claude-legacy", 42, "2026-07-15T20:00:00.000Z", 20, "2026-07-20T00:00:00.000Z", null, null, acct.id,
+    );
+
+    // getLatestUsageRows surfaces it (machine null) even with no per-machine row.
+    const rows = await getLatestUsageRows(acct.id);
+    const r = rows.find((s) => s.profile === "claude-legacy");
+    expect(r?.five_hour_pct).toBe(42);
+    expect(r?.machine ?? null).toBeNull();
+
+    // And it renders on /api/usage rather than blanking out.
+    const usage = await req("GET", "/api/usage", { headers: { "X-Auth-Request-Email": "fallback-user@example.com" } });
+    const row = (usage.json as any[]).find((p) => p.profile === "claude-legacy");
+    expect(row?.five_hour_pct).toBe(42);
   });
 
   it("stores reporter_version on ingested snapshots and exposes it in /api/usage", async () => {
