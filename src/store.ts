@@ -116,9 +116,11 @@ export async function initDb(
 ): Promise<void> {
   if (backend) return;
 
+  let isPg = false;
   if (opts?.backend) {
     backend = opts.backend;
   } else if (pgConfigFromEnv()) {
+    isPg = true;
     backend = await createPgBackend();
   } else {
     // Precedence: explicit dbPath arg (tests) → CLAUDE_PULSE_DB_PATH env → default.
@@ -131,7 +133,51 @@ export async function initDb(
     backend = createSqliteBackend(sqlite);
   }
 
-  await createSchema(backend);
+  // Postgres connects LAZILY — the first query (createSchema) is what actually
+  // resolves DNS + opens the socket. A transient blip there (getaddrinfo
+  // EAI_AGAIN, ECONNREFUSED, ...) would otherwise throw to the top-level fatal
+  // handler and exit(1) the whole process, so a DNS hiccup becomes a crash loop
+  // (observed: 71 restarts against an intermittently-resolving `postgres`).
+  // Retry the first-connect on transient network errors so a blip self-heals.
+  if (isPg) {
+    await withPgConnectRetry(() => createSchema(backend!));
+  } else {
+    await createSchema(backend);
+  }
+}
+
+/** pg/libc error codes that are transient network/DNS failures — worth retrying. */
+const TRANSIENT_DB_CODES = new Set([
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNRESET",
+]);
+
+/**
+ * Run a DB-connecting operation, retrying transient network/DNS failures with
+ * linear backoff instead of letting a cold-start blip kill the process. The pg
+ * Pool re-resolves DNS on each new connection attempt, so retrying the operation
+ * is sufficient — no pool reset needed.
+ */
+async function withPgConnectRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = Number(process.env.CLAUDE_PULSE_DB_CONNECT_RETRIES ?? 20);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const code = (e as { code?: string })?.code ?? "";
+      if (!TRANSIENT_DB_CODES.has(code) || attempt >= maxAttempts) throw e;
+      const delayMs = Math.min(1000 * attempt, 5000);
+      process.stderr.write(
+        `[claude-pulse] DB connect transient error ${code}; retry ${attempt}/${maxAttempts} in ${delayMs}ms\n`,
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 }
 
 function getDb(): Backend {
