@@ -1170,16 +1170,15 @@ export async function getLatestSnapshotsByMachine(accountId?: number): Promise<U
  */
 export async function getLatestUsageRows(accountId?: number): Promise<UsageSnapshot[]> {
   const acct = accountId ?? (await defaultAccountId());
-  const perMachine = await getLatestSnapshotsByMachine(acct);
-  const covered = new Set(perMachine.map((s) => s.profile));
-  const rows = [...perMachine];
-  const profiles = await listProfiles(acct);
-  for (const p of profiles) {
-    if (covered.has(p.name)) continue;
-    const snap = await getLatestSnapshot(p.name, acct);
-    if (snap) rows.push(snap);
-  }
-  return rows;
+  // The 5h/7d usage limit is ACCOUNT-GLOBAL — identical no matter which machine
+  // polls it — so collapse each profile to a SINGLE gauge: its freshest snapshot
+  // across all machines. Splitting per (profile, machine) rendered the same
+  // account's usage N times (e.g. codex polled from tron/midnight/blackbird is
+  // ONE subscription shown thrice, all sharing the same reset window). The
+  // machine dimension still persists in usage_snapshots so per-host polls don't
+  // overwrite each other and token rollups can attribute spend per box; it just
+  // no longer fans the live gauge out into duplicate cards.
+  return getLatestSnapshots(acct);
 }
 
 export async function getHistory(
