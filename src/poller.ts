@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PollResult, Profile, AlertEvent } from "./types.js";
 import {
   insertSnapshot,
+  getLatestSnapshots,
   listProfiles,
   getProfile,
   getLastSuccessfulSnapshot,
@@ -654,19 +655,21 @@ export function stopTokenRollup(): void {
  * reads.
  */
 export async function agentPushSnapshots(): Promise<void> {
-  const results = await pollAllProfiles();
+  // Refresh the local store (poll every profile), THEN push the freshest STORED
+  // snapshot per profile — not this cycle's live re-poll result. A rate-limited
+  // profile (this coordinator's own claude-hd-max) frequently 429s; its live
+  // re-poll PollResult.snapshot then comes back unusable and it was silently
+  // dropped from the dashboard for days, even though the 5-min poll timer had
+  // already stored a good reading. Reading from the store decouples delivery
+  // from a flaky re-poll and pushes whatever was last successfully polled.
+  await pollAllProfiles();
   const cfg = uploadConfig();
   if (!cfg) return;
 
+  const stored = await getLatestSnapshots();
   const snapshots: UploadSnapshot[] = [];
-  for (const r of results) {
-    const s = r.snapshot;
-    if (!r.success || !s) continue;
-    // Skip only genuinely-empty snapshots. A rate-limited profile (e.g. this
-    // coordinator's own claude-hd-max) frequently 429s and falls back to the
-    // headers path, which yields usage pcts but no reset timestamps. Those must
-    // still be pushed — dropping them here silently starved hd-max from the
-    // dashboard for hours even though its poll succeeded.
+  for (const s of stored) {
+    // Skip only genuinely-empty snapshots (no pcts AND no resets).
     if (
       s.five_hour_pct === null &&
       s.seven_day_pct === null &&
@@ -686,7 +689,7 @@ export async function agentPushSnapshots(): Promise<void> {
       context_model: s.context_model,
       context_effective_limit: s.context_effective_limit,
       context_last_reset_at: s.context_last_reset_at,
-      polled_at: new Date().toISOString(),
+      polled_at: s.polled_at ?? new Date().toISOString(),
     });
   }
   if (snapshots.length > 0) {
