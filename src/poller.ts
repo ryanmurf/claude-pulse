@@ -662,7 +662,18 @@ export async function agentPushSnapshots(): Promise<void> {
   for (const r of results) {
     const s = r.snapshot;
     if (!r.success || !s) continue;
-    if (s.five_hour_resets_at === null && s.seven_day_resets_at === null) continue;
+    // Skip only genuinely-empty snapshots. A rate-limited profile (e.g. this
+    // coordinator's own claude-hd-max) frequently 429s and falls back to the
+    // headers path, which yields usage pcts but no reset timestamps. Those must
+    // still be pushed — dropping them here silently starved hd-max from the
+    // dashboard for hours even though its poll succeeded.
+    if (
+      s.five_hour_pct === null &&
+      s.seven_day_pct === null &&
+      s.five_hour_resets_at === null &&
+      s.seven_day_resets_at === null
+    )
+      continue;
     snapshots.push({
       profile: s.profile,
       five_hour_pct: s.five_hour_pct,
