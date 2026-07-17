@@ -128,6 +128,8 @@ export interface UsageSnapshot {
   context_last_reset_at: string | null;
   /** Code version of the reporter that produced this snapshot (nullable: old reporters omit it). */
   reporter_version: string | null;
+  /** Originating computer/host (nullable: legacy rows + the local single-host poller). */
+  machine: string | null;
 }
 
 export interface GeminiQuotaSnapshot {

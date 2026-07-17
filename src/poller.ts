@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PollResult, Profile, AlertEvent } from "./types.js";
 import {
   insertSnapshot,
+  getLatestSnapshots,
   listProfiles,
   getProfile,
   getLastSuccessfulSnapshot,
@@ -654,15 +655,28 @@ export function stopTokenRollup(): void {
  * reads.
  */
 export async function agentPushSnapshots(): Promise<void> {
-  const results = await pollAllProfiles();
+  // Refresh the local store (poll every profile), THEN push the freshest STORED
+  // snapshot per profile — not this cycle's live re-poll result. A rate-limited
+  // profile (this coordinator's own claude-hd-max) frequently 429s; its live
+  // re-poll PollResult.snapshot then comes back unusable and it was silently
+  // dropped from the dashboard for days, even though the 5-min poll timer had
+  // already stored a good reading. Reading from the store decouples delivery
+  // from a flaky re-poll and pushes whatever was last successfully polled.
+  await pollAllProfiles();
   const cfg = uploadConfig();
   if (!cfg) return;
 
+  const stored = await getLatestSnapshots();
   const snapshots: UploadSnapshot[] = [];
-  for (const r of results) {
-    const s = r.snapshot;
-    if (!r.success || !s) continue;
-    if (s.five_hour_resets_at === null && s.seven_day_resets_at === null) continue;
+  for (const s of stored) {
+    // Skip only genuinely-empty snapshots (no pcts AND no resets).
+    if (
+      s.five_hour_pct === null &&
+      s.seven_day_pct === null &&
+      s.five_hour_resets_at === null &&
+      s.seven_day_resets_at === null
+    )
+      continue;
     snapshots.push({
       profile: s.profile,
       five_hour_pct: s.five_hour_pct,
@@ -675,7 +689,16 @@ export async function agentPushSnapshots(): Promise<void> {
       context_model: s.context_model,
       context_effective_limit: s.context_effective_limit,
       context_last_reset_at: s.context_last_reset_at,
-      polled_at: new Date().toISOString(),
+      // Normalize to ISO-8601. The local SQLite store keeps polled_at as a
+      // space-separated UTC string ("YYYY-MM-DD HH:MM:SS"); pushing that verbatim
+      // mixed formats in the central text column, and `ORDER BY polled_at DESC`
+      // (a string sort) then ranks a same-day ISO row ABOVE a newer space row
+      // ('T' > ' '), so the dashboard silently showed a stale reading. Always ISO.
+      polled_at: s.polled_at
+        ? (String(s.polled_at).includes("T")
+            ? String(s.polled_at)
+            : String(s.polled_at).replace(" ", "T") + "Z")
+        : new Date().toISOString(),
     });
   }
   if (snapshots.length > 0) {

@@ -3,8 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   listProfiles,
   redactProfile,
-  getLatestSnapshot,
-  getLatestSnapshots,
+  getLatestUsageRows,
   getHistory,
   getTriggeredAlerts,
   acknowledgeAlert,
@@ -324,6 +323,8 @@ async function accountForRequest(req: IncomingMessage): Promise<Account> {
 
 interface PaceInfo {
   profile: string;
+  /** Computer this pace belongs to (null: aggregate/placeholder). */
+  machine: string | null;
   window: string;
   used_pct: number;
   remaining: string;
@@ -351,14 +352,15 @@ function formatRemaining(ms: number): string {
 
 async function computePace(accountId: number, profileFilter?: string): Promise<PaceInfo[]> {
   const results: PaceInfo[] = [];
-  const names = profileFilter
-    ? [profileFilter]
-    : (await listProfiles(accountId)).map((p) => p.name);
+  // Pace is computed per (profile, computer) so a profile shared across machines
+  // (e.g. `codex`) yields a pace badge per computer — matching the per-computer
+  // usage cards. getLatestUsageRows returns the latest snapshot for each
+  // (profile, machine), plus a fallback row for profiles not yet reporting
+  // per-machine, so pace stays aligned with the usage cards.
+  const snaps = (await getLatestUsageRows(accountId))
+    .filter((s) => !profileFilter || s.profile === profileFilter);
 
-  for (const name of names) {
-    const snap = await getLatestSnapshot(name, accountId);
-    if (!snap) continue;
-
+  for (const snap of snaps) {
     const windows = [
       { key: "five_hour", label: "5h", pct: snap.five_hour_pct, resets: snap.five_hour_resets_at },
       { key: "seven_day", label: "7d", pct: snap.seven_day_pct, resets: snap.seven_day_resets_at },
@@ -377,7 +379,8 @@ async function computePace(accountId: number, profileFilter?: string): Promise<P
       // from it — surface it as stale instead.
       if (remaining <= 0) {
         results.push({
-          profile: name,
+          profile: snap.profile,
+          machine: snap.machine ?? null,
           window: w.label,
           used_pct: w.pct,
           remaining: "window reset",
@@ -397,7 +400,8 @@ async function computePace(accountId: number, profileFilter?: string): Promise<P
       else pace = "on track";
 
       results.push({
-        profile: name,
+        profile: snap.profile,
+        machine: snap.machine ?? null,
         window: w.label,
         used_pct: w.pct,
         remaining: formatRemaining(remaining),
@@ -457,23 +461,64 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // GET /api/usage — account-scoped 5h/7d per profile
+    // GET /api/usage — account-scoped 5h/7d per (profile, machine/computer).
+    // One row per computer that has reported a profile, so a profile shared
+    // across machines (e.g. `codex`) expands to a card-per-computer on the
+    // dashboard instead of hosts overwriting each other. Profiles that have a
+    // config row but no per-machine snapshot yet still get a placeholder row so
+    // they render (machine: null).
     if (pathname === "/api/usage" && method === "GET") {
       const account = await accountForRequest(req);
-      const snapshots = await getLatestSnapshots(account.id);
+      const snapshots = await getLatestUsageRows(account.id);
       const profiles = await listProfiles(account.id);
-      const result = profiles.map((p) => {
-        const snap = snapshots.find((s) => s.profile === p.name);
-        return {
+      // vendor drives dashboard rendering (e.g. codex has no 5h window — see
+      // renderWin/renderUsage in DASHBOARD_HTML), so thread it onto every row.
+      const vendorByProfile = new Map(profiles.map((p) => [p.name, p.vendor]));
+      const result: Array<Record<string, unknown>> = [];
+      const seen = new Set<string>();
+      for (const snap of snapshots) {
+        seen.add(snap.profile);
+        // Codex has no 5h window (OpenAI removed it 2026-07). Fixed reporters put
+        // the account's weekly % in seven_day; OLD reporters (still deployed on some
+        // hosts) put it in the five_hour slot with seven_day null. Normalize both to
+        // seven_day for codex so the 7d bar is correct no matter which reporter/host
+        // is freshest, and null the (hidden) 5h slot. Non-codex rows are unchanged.
+        const isCodex = (vendorByProfile.get(snap.profile) ?? null) === "openai-codex";
+        result.push({
+          profile: snap.profile,
+          vendor: vendorByProfile.get(snap.profile) ?? null,
+          machine: snap.machine ?? null,
+          five_hour_pct: isCodex ? null : (snap.five_hour_pct ?? null),
+          five_hour_resets_at: isCodex ? null : (snap.five_hour_resets_at ?? null),
+          seven_day_pct: isCodex
+            ? (snap.seven_day_pct ?? snap.five_hour_pct ?? null)
+            : (snap.seven_day_pct ?? null),
+          seven_day_resets_at: isCodex
+            ? (snap.seven_day_resets_at ?? snap.five_hour_resets_at ?? null)
+            : (snap.seven_day_resets_at ?? null),
+          polled_at: snap.polled_at ?? null,
+          reporter_version: snap.reporter_version ?? null,
+        });
+      }
+      // Configured profiles that have never reported a per-machine snapshot: emit
+      // a single placeholder so the dashboard still lists them.
+      for (const p of profiles) {
+        if (seen.has(p.name)) continue;
+        result.push({
           profile: p.name,
-          five_hour_pct: snap?.five_hour_pct ?? null,
-          five_hour_resets_at: snap?.five_hour_resets_at ?? null,
-          seven_day_pct: snap?.seven_day_pct ?? null,
-          seven_day_resets_at: snap?.seven_day_resets_at ?? null,
-          polled_at: snap?.polled_at ?? null,
-          reporter_version: snap?.reporter_version ?? null,
-        };
-      });
+          vendor: p.vendor,
+          machine: null,
+          five_hour_pct: null,
+          five_hour_resets_at: null,
+          seven_day_pct: null,
+          seven_day_resets_at: null,
+          polled_at: null,
+          reporter_version: null,
+        });
+      }
+      result.sort((a, b) =>
+        String(a.profile).localeCompare(String(b.profile)) ||
+        String(a.machine ?? "").localeCompare(String(b.machine ?? "")));
       sendJson(res, result);
       return;
     }
@@ -843,9 +888,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           ? body.reporter_version.trim().slice(0, 64)
           : null;
 
-      // snapshots — account-level 5h/7d per profile (latest poll wins). machine is
-      // metadata only; we do NOT fan rows out per machine. Ensure the profile row
-      // exists (FK) under this account before inserting.
+      // snapshots — 5h/7d per (profile, machine). The 5h/7d window belongs to the
+      // account/subscription, but each computer keeps its OWN current reading so a
+      // profile shared across machines (e.g. `codex` on tron/midnight/blackbird)
+      // doesn't have hosts clobber each other under one account+profile row. The
+      // machine is the token's machine (authoritative — never body-supplied).
+      // Ensure the profile row exists (FK) under this account before inserting.
       let snapshotsUpserted = 0;
       if (Array.isArray(body?.snapshots)) {
         for (const s of body.snapshots) {
@@ -856,6 +904,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           await ingestUsageSnapshot({
             account_id: accountId,
             profile,
+            machine,
             reporter_version: reporterVersion,
             five_hour_pct: s.five_hour_pct != null ? toFiniteNum(s.five_hour_pct) : null,
             five_hour_resets_at: typeof s.five_hour_resets_at === "string" ? s.five_hour_resets_at : null,
@@ -1257,15 +1306,34 @@ function countdown(iso){
 function renderUsage(usage,pace){
   const g=$('#usage-grid');
   if(!usage.length){g.innerHTML='<div class="empty">No profiles configured</div>';return}
-  g.innerHTML=usage.map(u=>{
-    const fh=pace.find(p=>p.profile===u.profile&&p.window==='5h');
-    const sd=pace.find(p=>p.profile===u.profile&&p.window==='7d');
-    return\`<div class="card">
-      <div class="card-title">\${esc(u.profile)}<span class="meta">\${u.polled_at?timeAgo(u.polled_at):'never polled'}
-        <button class="btn btn-sm" onclick="pollOne('\${esc(u.profile)}')">Poll</button></span></div>
-      \${renderWin('5-hour',u.five_hour_pct,fh)}
-      \${renderWin('7-day',u.seven_day_pct,sd)}
-    </div>\`}).join('');
+  // Each /api/usage row is one (profile, computer). Group into a card per
+  // profile; a profile reported from several computers (e.g. codex on
+  // tron/midnight/blackbird) expands to a section per computer, each with its
+  // own 5h/7d — so hosts no longer overwrite one another.
+  const byProfile=new Map();
+  usage.forEach(u=>{if(!byProfile.has(u.profile))byProfile.set(u.profile,[]);byProfile.get(u.profile).push(u)});
+  g.innerHTML=[...byProfile.entries()].map(([profile,rows])=>{
+    rows.sort((a,b)=>(b.polled_at?Date.parse(b.polled_at):0)-(a.polled_at?Date.parse(a.polled_at):0));
+    const machineRows=rows.filter(r=>r.machine);
+    const multi=machineRows.length>1;
+    const latest=rows[0]&&rows[0].polled_at?rows[0].polled_at:null;
+    const meta=multi?machineRows.length+' computers':(latest?timeAgo(latest):'never polled');
+    const sections=rows.map(u=>{
+      const fh=pace.find(p=>p.profile===u.profile&&p.machine===u.machine&&p.window==='5h');
+      const sd=pace.find(p=>p.profile===u.profile&&p.machine===u.machine&&p.window==='7d');
+      const lbl=(multi&&u.machine)?'<div class="rt-lbl" style="font-size:.66rem;margin:10px 0 4px">'+esc(u.machine)+(u.polled_at?' · '+timeAgo(u.polled_at):'')+'</div>':'';
+      // codex has no 5-hour window (OpenAI removed it 2026-07, weekly-only now) —
+      // omit the bar entirely rather than show a permanently-empty/0% gauge.
+      // Other vendors (anthropic-oauth, etc.) keep both bars unchanged.
+      const fiveHourBar=u.vendor==='openai-codex'?'':renderWin('5-hour',u.five_hour_pct,fh);
+      return lbl+fiveHourBar+renderWin('7-day',u.seven_day_pct,sd);
+    }).join('');
+    return \`<div class="card">
+      <div class="card-title">\${esc(profile)}<span class="meta">\${meta}
+        <button class="btn btn-sm" onclick="pollOne('\${esc(profile)}')">Poll</button></span></div>
+      \${sections}
+    </div>\`;
+  }).join('');
 }
 function renderWin(label,pct,pi){
   const v=pct!==null?pct:0,c=barColor(pct);

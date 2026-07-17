@@ -52,9 +52,12 @@ export interface UploadContext {
 }
 
 /**
- * A 5h/7d usage snapshot for a profile. Account-level per profile (the window is
- * the subscription's, shared across machines) — the server scopes it to the
- * token's account + profile, latest-poll-wins. machine is metadata only.
+ * A 5h/7d usage snapshot for a profile. The 5h/7d window belongs to the
+ * account/subscription, but the server stores the reading per (account, profile,
+ * machine) — keyed on the INGEST TOKEN's machine (authoritative, never sent in
+ * this body) — so a profile shared across computers (e.g. `codex` on
+ * tron/midnight/blackbird) keeps a distinct current gauge per computer instead
+ * of hosts overwriting each other. Latest-poll-wins is scoped per machine.
  */
 export interface UploadSnapshot {
   profile: string;

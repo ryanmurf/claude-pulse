@@ -116,9 +116,11 @@ export async function initDb(
 ): Promise<void> {
   if (backend) return;
 
+  let isPg = false;
   if (opts?.backend) {
     backend = opts.backend;
   } else if (pgConfigFromEnv()) {
+    isPg = true;
     backend = await createPgBackend();
   } else {
     // Precedence: explicit dbPath arg (tests) → CLAUDE_PULSE_DB_PATH env → default.
@@ -131,7 +133,51 @@ export async function initDb(
     backend = createSqliteBackend(sqlite);
   }
 
-  await createSchema(backend);
+  // Postgres connects LAZILY — the first query (createSchema) is what actually
+  // resolves DNS + opens the socket. A transient blip there (getaddrinfo
+  // EAI_AGAIN, ECONNREFUSED, ...) would otherwise throw to the top-level fatal
+  // handler and exit(1) the whole process, so a DNS hiccup becomes a crash loop
+  // (observed: 71 restarts against an intermittently-resolving `postgres`).
+  // Retry the first-connect on transient network errors so a blip self-heals.
+  if (isPg) {
+    await withPgConnectRetry(() => createSchema(backend!));
+  } else {
+    await createSchema(backend);
+  }
+}
+
+/** pg/libc error codes that are transient network/DNS failures — worth retrying. */
+const TRANSIENT_DB_CODES = new Set([
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNRESET",
+]);
+
+/**
+ * Run a DB-connecting operation, retrying transient network/DNS failures with
+ * linear backoff instead of letting a cold-start blip kill the process. The pg
+ * Pool re-resolves DNS on each new connection attempt, so retrying the operation
+ * is sufficient — no pool reset needed.
+ */
+async function withPgConnectRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = Number(process.env.CLAUDE_PULSE_DB_CONNECT_RETRIES ?? 20);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const code = (e as { code?: string })?.code ?? "";
+      if (!TRANSIENT_DB_CODES.has(code) || attempt >= maxAttempts) throw e;
+      const delayMs = Math.min(1000 * attempt, 5000);
+      process.stderr.write(
+        `[claude-pulse] DB connect transient error ${code}; retry ${attempt}/${maxAttempts} in ${delayMs}ms\n`,
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
 }
 
 function getDb(): Backend {
@@ -227,7 +273,8 @@ async function createSchema(db: Backend): Promise<void> {
       context_session_id TEXT,
       context_model TEXT,
       context_effective_limit INTEGER,
-      context_last_reset_at TEXT
+      context_last_reset_at TEXT,
+      machine TEXT
     )
   `);
 
@@ -242,6 +289,12 @@ async function createSchema(db: Backend): Promise<void> {
       "context_last_reset_at TEXT",
       "account_id INTEGER",
       "reporter_version TEXT",
+      // The originating computer/host of the snapshot. The live 5h/7d gauge is
+      // keyed (account, profile, machine) so one profile (e.g. `codex`) can hold
+      // a distinct current reading per computer instead of hosts overwriting each
+      // other under a single account+profile row. Nullable: legacy rows + the
+      // local single-host poller leave it NULL.
+      "machine TEXT",
     ]) {
       const colName = c.split(" ")[0];
       if (!snapCols.includes(colName)) {
@@ -253,11 +306,19 @@ async function createSchema(db: Backend): Promise<void> {
     // identical to SQLite's historical shape); add it explicitly.
     await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS account_id INTEGER");
     await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS reporter_version TEXT");
+    // Per-computer dimension for the live gauge (see the machine note above).
+    await db.exec("ALTER TABLE usage_snapshots ADD COLUMN IF NOT EXISTS machine TEXT");
   }
 
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_snapshots_profile_time
       ON usage_snapshots(profile, polled_at)
+  `);
+  // Supports the per-(profile, machine) "latest snapshot per computer" read that
+  // drives the dashboard usage cards.
+  await db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_snapshots_profile_machine_time
+      ON usage_snapshots(profile, machine, polled_at)
   `);
 
   await db.exec(`
@@ -823,11 +884,14 @@ export async function insertSnapshot(
 
 /**
  * Ingest a 5h/7d usage snapshot pushed from a local agent, scoped to the given
- * account + profile. usage_snapshots are ACCOUNT-LEVEL per profile (the 5h/7d
- * window belongs to the subscription, shared across machines), so we just insert
- * a fresh row with the supplied polled_at — "latest poll wins" falls out of the
- * existing ORDER BY polled_at DESC reads. machine is metadata only and is NOT
- * used to fan rows out per machine.
+ * account + profile + machine. Each (account, profile, machine) tuple keeps its
+ * OWN current reading: the 5h/7d window belongs to the subscription/account, but
+ * a subscription used from several computers (e.g. a shared `codex` account on
+ * tron, midnight and blackbird) needs each computer's live gauge to coexist
+ * rather than the last poller to clobber the rest. We insert a fresh row with
+ * the supplied polled_at — "latest poll wins" falls out of the existing ORDER BY
+ * polled_at DESC reads, now scoped per machine — and the dashboard groups a
+ * profile's machines back together for display.
  *
  * The profile row must exist for the account (FK on usage_snapshots.profile);
  * the caller is responsible for ensuring the profile exists.
@@ -835,6 +899,13 @@ export async function insertSnapshot(
 export interface IngestSnapshotInput {
   account_id: number;
   profile: string;
+  /**
+   * Originating computer/host, authoritatively the ingest token's machine (never
+   * client-body supplied). The live 5h/7d gauge is keyed (account, profile,
+   * machine) so per-computer readings for a shared profile (e.g. `codex` on
+   * tron / midnight / blackbird) coexist instead of overwriting one another.
+   */
+  machine?: string | null;
   five_hour_pct: number | null;
   five_hour_resets_at: string | null;
   seven_day_pct: number | null;
@@ -900,14 +971,20 @@ function pctRegressed(incoming: number | null, stored: number | null): boolean {
 function snapshotContentRegressed(incoming: SnapshotContent, stored: SnapshotContent): boolean {
   const in7 = isoEpochMs(incoming.seven_day_resets_at);
   const st7 = isoEpochMs(stored.seven_day_resets_at);
-  if (in7 !== null && st7 !== null) {
-    if (Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) return in7 < st7;
-    if (pctRegressed(incoming.seven_day_pct, stored.seven_day_pct)) return true;
+  if (in7 !== null && st7 !== null && Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) {
+    return in7 < st7;
   }
+  // NO seven-day pct-regression check: the Anthropic 7-day window ROLLS, so its
+  // percentage legitimately DECREASES as old usage ages out of the window.
+  // Treating that as a regression permanently froze a profile once a stale-high
+  // reading was stored — claude-hd-max sat at 47% for days, rejecting every fresh
+  // (lower) reading. Only a genuinely earlier 7d reset (handled above) is stale.
   const in5 = isoEpochMs(incoming.five_hour_resets_at);
   const st5 = isoEpochMs(stored.five_hour_resets_at);
   if (in5 !== null && st5 !== null) {
     if (Math.abs(in5 - st5) > RESET_JITTER_TOLERANCE_MS) return in5 < st5;
+    // The 5h window is fixed/cumulative, so a lower 5h % within the SAME window is
+    // a stale (e.g. transcript-fallback) reading — keep rejecting that.
     if (pctRegressed(incoming.five_hour_pct, stored.five_hour_pct)) return true;
   }
   return false;
@@ -918,14 +995,25 @@ export async function ingestUsageSnapshot(
 ): Promise<UsageSnapshot> {
   const d = getDb();
   const polledAt = input.polled_at || new Date().toISOString();
+  const machine = input.machine ?? null;
 
-  const latest = await d.get<UsageSnapshot>(
-    `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? ORDER BY polled_at DESC LIMIT 1`,
-    [input.profile, input.account_id],
-  );
+  // Regression guard is scoped per (profile, account, machine): a stale reading
+  // from THIS computer must not clobber this computer's fresher value, but it
+  // must NOT be compared against OTHER computers' readings (their windows /
+  // percents differ). A NULL machine (local single-host path) compares against
+  // the NULL-machine lineage only.
+  const latest = machine === null
+    ? await d.get<UsageSnapshot>(
+        `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? AND machine IS NULL ORDER BY polled_at DESC LIMIT 1`,
+        [input.profile, input.account_id],
+      )
+    : await d.get<UsageSnapshot>(
+        `SELECT * FROM usage_snapshots WHERE profile = ? AND account_id = ? AND machine = ? ORDER BY polled_at DESC LIMIT 1`,
+        [input.profile, input.account_id, machine],
+      );
   if (latest && snapshotContentRegressed(input, latest)) {
     process.stderr.write(
-      `[claude-pulse] ${new Date().toISOString()} ingest: skipped stale snapshot for ${input.profile} (resets_at regressed vs stored)\n`,
+      `[claude-pulse] ${new Date().toISOString()} ingest: skipped stale snapshot for ${input.profile}@${machine ?? "-"} (resets_at regressed vs stored)\n`,
     );
     return latest;
   }
@@ -934,8 +1022,8 @@ export async function ingestUsageSnapshot(
     `INSERT INTO usage_snapshots
        (account_id, profile, five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, raw_response,
         context_tokens, context_pct, context_session_id, context_model, context_effective_limit, context_last_reset_at,
-        polled_at, reporter_version)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        polled_at, reporter_version, machine)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.account_id,
       input.profile,
@@ -952,6 +1040,7 @@ export async function ingestUsageSnapshot(
       input.context_last_reset_at ?? null,
       polledAt,
       input.reporter_version ?? null,
+      machine,
     ],
   );
   return (await d.get<UsageSnapshot>("SELECT * FROM usage_snapshots WHERE id = ?", [id]))!;
@@ -1044,6 +1133,58 @@ export async function getLatestSnapshots(accountId?: number): Promise<UsageSnaps
      ORDER BY s.profile`,
     [acct, acct],
   );
+}
+
+/**
+ * Latest snapshot per (profile, machine) for an account — the read that drives
+ * the dashboard's per-computer usage cards. Rows with a NULL machine (legacy
+ * pre-machine history + the local single-host poller) are excluded so a profile
+ * that now reports per-computer doesn't also surface a stale, unattributable
+ * "no computer" gauge. Every server-side snapshot arrives via /api/ingest, which
+ * stamps the token's machine, so live data always carries one.
+ */
+export async function getLatestSnapshotsByMachine(accountId?: number): Promise<UsageSnapshot[]> {
+  const d = getDb();
+  const acct = accountId ?? (await defaultAccountId());
+  return d.all<UsageSnapshot>(
+    `SELECT s.*
+     FROM usage_snapshots s
+     INNER JOIN (
+       SELECT profile, machine, MAX(polled_at) as max_polled
+       FROM usage_snapshots
+       WHERE account_id = ? AND machine IS NOT NULL
+       GROUP BY profile, machine
+     ) latest
+       ON s.profile = latest.profile
+      AND s.machine = latest.machine
+      AND s.polled_at = latest.max_polled
+     WHERE s.account_id = ? AND s.machine IS NOT NULL
+     ORDER BY s.profile, s.machine`,
+    [acct, acct],
+  );
+}
+
+/**
+ * Rows that drive the dashboard's usage cards + pace: the latest snapshot per
+ * (profile, machine) for every profile that reports per-computer, PLUS a single
+ * fallback row (latest snapshot regardless of machine) for any profile that has
+ * NO per-machine snapshot yet. The fallback keeps the dashboard non-regressive:
+ * a legacy single-host profile whose reporter only pushes machine-tagged
+ * snapshots on a slow cadence (or hasn't since the machine column was added)
+ * still shows its last-known reading instead of blanking out. Profiles with no
+ * snapshot at all are omitted (the caller supplies a placeholder).
+ */
+export async function getLatestUsageRows(accountId?: number): Promise<UsageSnapshot[]> {
+  const acct = accountId ?? (await defaultAccountId());
+  // The 5h/7d usage limit is ACCOUNT-GLOBAL — identical no matter which machine
+  // polls it — so collapse each profile to a SINGLE gauge: its freshest snapshot
+  // across all machines. Splitting per (profile, machine) rendered the same
+  // account's usage N times (e.g. codex polled from tron/midnight/blackbird is
+  // ONE subscription shown thrice, all sharing the same reset window). The
+  // machine dimension still persists in usage_snapshots so per-host polls don't
+  // overwrite each other and token rollups can attribute spend per box; it just
+  // no longer fans the live gauge out into duplicate cards.
+  return getLatestSnapshots(acct);
 }
 
 export async function getHistory(

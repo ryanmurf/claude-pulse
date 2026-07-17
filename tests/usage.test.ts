@@ -181,6 +181,34 @@ describe("fetchCodexRateLimits", () => {
     expect(message.toLowerCase()).not.toContain("rate_limit");
     expect(message).not.toMatch(/\b429\b/);
   });
+
+  // OpenAI removed the 5h codex window (2026-07): session transcripts now
+  // record a SOLE "primary" rate-limit entry whose window_minutes is 10080
+  // (7 days), with "secondary": null. Classification must key off the
+  // window's own duration, not its position, or the weekly percentage would
+  // get mislabeled as the 5h gauge.
+  it("classifies a sole 10080-minute primary window as 7d, not 5h, when secondary is null", async () => {
+    const sessionsDir = path.join(tmpDir, "sessions", "2026", "07", "16");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, "rollout-weekly-only.jsonl"),
+      JSON.stringify({
+        msg: {
+          rate_limits: {
+            primary: { used_percent: 16, window_minutes: 10080, resets_at: 1784781838 },
+            secondary: null,
+          },
+        },
+      }) + "\n",
+    );
+
+    const usage = await fetchCodexRateLimits(tmpDir, new Date("2026-07-16T12:00:00Z"));
+
+    expect(usage.fiveHourPct).toBeNull();
+    expect(usage.fiveHourResetsAt).toBeNull();
+    expect(usage.sevenDayPct).toBe(16);
+    expect(usage.sevenDayResetsAt).toBe("2026-07-23T04:43:58.000Z");
+  });
 });
 
 // ── fetchViaUsageApi: retry + resets_at normalization (mocked fetch) ─────────
@@ -349,6 +377,51 @@ describe("fetchCodexUsageApi", () => {
     vi.stubGlobal("fetch", fetchMock);
     await expect(fetchCodexUsageApi(tmpDir)).rejects.toThrow(/auth\.json/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // OpenAI removed the 5h codex window (2026-07): the live API now returns a
+  // SOLE "primary_window" whose limit_window_seconds is 604800 (7 days), with
+  // secondary_window: null. Positionally mapping primary→5h would silently
+  // mislabel the weekly percentage as the 5h gauge — classification must key
+  // off the window's own duration, not its position.
+  it("classifies a sole 7-day-duration primary_window as 7d, not 5h, when secondary_window is null", async () => {
+    writeCodexAuth(tmpDir);
+    const weeklyOnly = {
+      plan_type: "pro",
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 16, limit_window_seconds: 604800, reset_at: 1784781838 },
+        secondary_window: null,
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(whamResponse(weeklyOnly)));
+
+    const u = await fetchCodexUsageApi(tmpDir);
+
+    expect(u.fiveHourPct).toBeNull();
+    expect(u.fiveHourResetsAt).toBeNull();
+    expect(u.sevenDayPct).toBe(16);
+    expect(u.sevenDayResetsAt).toBe("2026-07-23T04:43:58.000Z");
+  });
+
+  it("falls back to the legacy positional mapping when neither window carries a duration", async () => {
+    writeCodexAuth(tmpDir);
+    const noDuration = {
+      plan_type: "pro",
+      rate_limit: {
+        allowed: true,
+        limit_reached: false,
+        primary_window: { used_percent: 15, reset_at: 1782683430 },
+        secondary_window: { used_percent: 2, reset_at: 1783270230 },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(whamResponse(noDuration)));
+
+    const u = await fetchCodexUsageApi(tmpDir);
+
+    expect(u.fiveHourPct).toBe(15);
+    expect(u.sevenDayPct).toBe(2);
   });
 });
 
