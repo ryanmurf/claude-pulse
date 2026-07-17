@@ -971,14 +971,20 @@ function pctRegressed(incoming: number | null, stored: number | null): boolean {
 function snapshotContentRegressed(incoming: SnapshotContent, stored: SnapshotContent): boolean {
   const in7 = isoEpochMs(incoming.seven_day_resets_at);
   const st7 = isoEpochMs(stored.seven_day_resets_at);
-  if (in7 !== null && st7 !== null) {
-    if (Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) return in7 < st7;
-    if (pctRegressed(incoming.seven_day_pct, stored.seven_day_pct)) return true;
+  if (in7 !== null && st7 !== null && Math.abs(in7 - st7) > RESET_JITTER_TOLERANCE_MS) {
+    return in7 < st7;
   }
+  // NO seven-day pct-regression check: the Anthropic 7-day window ROLLS, so its
+  // percentage legitimately DECREASES as old usage ages out of the window.
+  // Treating that as a regression permanently froze a profile once a stale-high
+  // reading was stored — claude-hd-max sat at 47% for days, rejecting every fresh
+  // (lower) reading. Only a genuinely earlier 7d reset (handled above) is stale.
   const in5 = isoEpochMs(incoming.five_hour_resets_at);
   const st5 = isoEpochMs(stored.five_hour_resets_at);
   if (in5 !== null && st5 !== null) {
     if (Math.abs(in5 - st5) > RESET_JITTER_TOLERANCE_MS) return in5 < st5;
+    // The 5h window is fixed/cumulative, so a lower 5h % within the SAME window is
+    // a stale (e.g. transcript-fallback) reading — keep rejecting that.
     if (pctRegressed(incoming.five_hour_pct, stored.five_hour_pct)) return true;
   }
   return false;
