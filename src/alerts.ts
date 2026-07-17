@@ -34,6 +34,11 @@ export async function checkAlerts(
 
     switch (sub.alert_type) {
       case "five_hour_threshold": {
+        // The five_hour_pct !== null guard also covers codex profiles: OpenAI
+        // removed the 5h window (2026-07), so the poller now stores NULL for
+        // codex's five_hour_pct/resets_at (see classifyCodexWindows in
+        // usage.ts) — this naturally skips 5h evaluation instead of firing a
+        // bogus alert off a stale/zeroed value.
         if (
           snapshot.five_hour_pct !== null &&
           sub.threshold !== null &&

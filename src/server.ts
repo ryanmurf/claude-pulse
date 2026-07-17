@@ -471,12 +471,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const account = await accountForRequest(req);
       const snapshots = await getLatestUsageRows(account.id);
       const profiles = await listProfiles(account.id);
+      // vendor drives dashboard rendering (e.g. codex has no 5h window — see
+      // renderWin/renderUsage in DASHBOARD_HTML), so thread it onto every row.
+      const vendorByProfile = new Map(profiles.map((p) => [p.name, p.vendor]));
       const result: Array<Record<string, unknown>> = [];
       const seen = new Set<string>();
       for (const snap of snapshots) {
         seen.add(snap.profile);
         result.push({
           profile: snap.profile,
+          vendor: vendorByProfile.get(snap.profile) ?? null,
           machine: snap.machine ?? null,
           five_hour_pct: snap.five_hour_pct ?? null,
           five_hour_resets_at: snap.five_hour_resets_at ?? null,
@@ -492,6 +496,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         if (seen.has(p.name)) continue;
         result.push({
           profile: p.name,
+          vendor: p.vendor,
           machine: null,
           five_hour_pct: null,
           five_hour_resets_at: null,
@@ -1307,7 +1312,11 @@ function renderUsage(usage,pace){
       const fh=pace.find(p=>p.profile===u.profile&&p.machine===u.machine&&p.window==='5h');
       const sd=pace.find(p=>p.profile===u.profile&&p.machine===u.machine&&p.window==='7d');
       const lbl=(multi&&u.machine)?'<div class="rt-lbl" style="font-size:.66rem;margin:10px 0 4px">'+esc(u.machine)+(u.polled_at?' · '+timeAgo(u.polled_at):'')+'</div>':'';
-      return lbl+renderWin('5-hour',u.five_hour_pct,fh)+renderWin('7-day',u.seven_day_pct,sd);
+      // codex has no 5-hour window (OpenAI removed it 2026-07, weekly-only now) —
+      // omit the bar entirely rather than show a permanently-empty/0% gauge.
+      // Other vendors (anthropic-oauth, etc.) keep both bars unchanged.
+      const fiveHourBar=u.vendor==='openai-codex'?'':renderWin('5-hour',u.five_hour_pct,fh);
+      return lbl+fiveHourBar+renderWin('7-day',u.seven_day_pct,sd);
     }).join('');
     return \`<div class="card">
       <div class="card-title">\${esc(profile)}<span class="meta">\${meta}

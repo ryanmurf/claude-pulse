@@ -382,6 +382,70 @@ function resetTime(window: unknown): string | null {
   return epochSecondsToIso(window.resets_at);
 }
 
+// ── Codex window classification (5h vs 7d, by duration — not position) ─────
+// OpenAI removed the 5-hour codex window (2026-07): both local session
+// transcripts and the live /wham/usage API now return only ONE rate-limit
+// window — still labeled "primary"/"primary_window" — whose OWN duration is
+// actually 7 days (window_minutes:10080 / limit_window_seconds:604800), not
+// 5 hours. Trusting position (primary→5h, secondary→7d) would silently
+// mislabel the weekly percentage as the 5h gauge. Classify each window by its
+// own duration instead. Falls back to the legacy positional assumption only
+// when duration is unavailable on BOTH windows (an older/unknown response
+// shape), so a genuinely-live 5h window never regresses to null.
+const CODEX_FIVE_HOUR_MAX_MINUTES = 12 * 60; // 12h: well above 5h, well below the 10080min weekly window
+
+type CodexWindowKind = "five_hour" | "seven_day";
+
+function classifyCodexWindowByMinutes(minutes: number | null): CodexWindowKind | null {
+  if (minutes === null || !Number.isFinite(minutes)) return null;
+  return minutes <= CODEX_FIVE_HOUR_MAX_MINUTES ? "five_hour" : "seven_day";
+}
+
+/**
+ * Map a codex response's primary/secondary windows to {fiveHour, sevenDay} by
+ * each window's own duration. When the endpoint only returns one window (the
+ * current state), the other comes back null — never a stale/positional guess.
+ */
+function classifyCodexWindows(
+  primary: unknown,
+  secondary: unknown,
+  primaryMinutes: number | null,
+  secondaryMinutes: number | null,
+): { fiveHour: unknown | null; sevenDay: unknown | null } {
+  const primaryKind = classifyCodexWindowByMinutes(primaryMinutes);
+  const secondaryKind = classifyCodexWindowByMinutes(secondaryMinutes);
+
+  if (primaryKind === null && secondaryKind === null) {
+    // No duration signal on either window — keep the legacy positional
+    // assumption (primary=5h, secondary=7d) rather than dropping data.
+    return { fiveHour: primary, sevenDay: secondary };
+  }
+
+  let fiveHour: unknown | null = null;
+  let sevenDay: unknown | null = null;
+  if (primaryKind === "five_hour") fiveHour = primary;
+  else if (primaryKind === "seven_day") sevenDay = primary;
+  if (secondaryKind === "five_hour") fiveHour = secondary;
+  else if (secondaryKind === "seven_day") sevenDay = secondary;
+  return { fiveHour, sevenDay };
+}
+
+/** window_minutes on a codex session-transcript rate_limit window (5h≈300, 7d=10080). */
+function codexTranscriptWindowMinutes(window: unknown): number | null {
+  if (!isRecord(window)) return null;
+  return typeof window.window_minutes === "number" && Number.isFinite(window.window_minutes)
+    ? window.window_minutes
+    : null;
+}
+
+/** limit_window_seconds on a /wham/usage window, converted to minutes (5h=18000s, 7d=604800s). */
+function codexApiWindowMinutes(window: unknown): number | null {
+  if (!isRecord(window)) return null;
+  return typeof window.limit_window_seconds === "number" && Number.isFinite(window.limit_window_seconds)
+    ? window.limit_window_seconds / 60
+    : null;
+}
+
 export async function fetchCodexRateLimits(configDir: string, now: Date = new Date()): Promise<UsageData> {
   const sessionsDir = path.join(expandHome(configDir), "sessions");
   const rolloutFiles = await findCodexRolloutFiles(sessionsDir); // newest mtime first
@@ -423,10 +487,16 @@ export async function fetchCodexRateLimits(configDir: string, now: Date = new Da
   // and pace math would extrapolate absurd expected percentages.
   const nowMs = now.getTime();
   const expired = (iso: string | null): boolean => iso !== null && Date.parse(iso) <= nowMs;
-  let fiveHourPct = usedPercent(rateLimits.primary);
-  let fiveHourResetsAt = resetTime(rateLimits.primary);
-  let sevenDayPct = usedPercent(rateLimits.secondary);
-  let sevenDayResetsAt = resetTime(rateLimits.secondary);
+  const { fiveHour, sevenDay } = classifyCodexWindows(
+    rateLimits.primary,
+    rateLimits.secondary,
+    codexTranscriptWindowMinutes(rateLimits.primary),
+    codexTranscriptWindowMinutes(rateLimits.secondary),
+  );
+  let fiveHourPct = usedPercent(fiveHour);
+  let fiveHourResetsAt = resetTime(fiveHour);
+  let sevenDayPct = usedPercent(sevenDay);
+  let sevenDayResetsAt = resetTime(sevenDay);
   if (expired(fiveHourResetsAt)) {
     fiveHourPct = null;
     fiveHourResetsAt = null;
@@ -498,11 +568,15 @@ function codexWindowReset(window: unknown): string | null {
 
 /**
  * Fetch live, account-wide codex usage from the undocumented /wham/usage backend
- * endpoint using the existing ~/.codex/auth.json login. Maps
- * rate_limit.primary_window → 5h and secondary_window → 7d. Throws on missing
- * auth or any non-2xx so callers can fall back to transcript parsing. The stored
- * `raw` keeps only the rate-limit windows + plan — NEVER the identity fields
- * (email/user_id/account_id) the response also carries.
+ * endpoint using the existing ~/.codex/auth.json login. Classifies
+ * rate_limit.primary_window / secondary_window into five-hour/seven-day by
+ * each window's own limit_window_seconds (see classifyCodexWindows) — NOT by
+ * position, since OpenAI removed the 5h window (2026-07) and the endpoint now
+ * returns only a single, 7-day-duration "primary_window" with
+ * secondary_window: null. Throws on missing auth or any non-2xx so callers
+ * can fall back to transcript parsing. The stored `raw` keeps only the
+ * rate-limit windows + plan — NEVER the identity fields (email/user_id/
+ * account_id) the response also carries.
  */
 export async function fetchCodexUsageApi(configDir: string): Promise<UsageData> {
   const auth = await readCodexAuth(configDir);
@@ -529,11 +603,17 @@ export async function fetchCodexUsageApi(configDir: string): Promise<UsageData> 
   }
   const primary = rl.primary_window;
   const secondary = rl.secondary_window;
+  const { fiveHour, sevenDay } = classifyCodexWindows(
+    primary,
+    secondary,
+    codexApiWindowMinutes(primary),
+    codexApiWindowMinutes(secondary),
+  );
   return {
-    fiveHourPct: codexWindowPct(primary),
-    fiveHourResetsAt: codexWindowReset(primary),
-    sevenDayPct: codexWindowPct(secondary),
-    sevenDayResetsAt: codexWindowReset(secondary),
+    fiveHourPct: codexWindowPct(fiveHour),
+    fiveHourResetsAt: codexWindowReset(fiveHour),
+    sevenDayPct: codexWindowPct(sevenDay),
+    sevenDayResetsAt: codexWindowReset(sevenDay),
     raw: JSON.stringify({
       vendor: "openai-codex",
       source: "api:/wham/usage",
