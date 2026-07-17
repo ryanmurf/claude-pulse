@@ -478,14 +478,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const seen = new Set<string>();
       for (const snap of snapshots) {
         seen.add(snap.profile);
+        // Codex has no 5h window (OpenAI removed it 2026-07). Fixed reporters put
+        // the account's weekly % in seven_day; OLD reporters (still deployed on some
+        // hosts) put it in the five_hour slot with seven_day null. Normalize both to
+        // seven_day for codex so the 7d bar is correct no matter which reporter/host
+        // is freshest, and null the (hidden) 5h slot. Non-codex rows are unchanged.
+        const isCodex = (vendorByProfile.get(snap.profile) ?? null) === "openai-codex";
         result.push({
           profile: snap.profile,
           vendor: vendorByProfile.get(snap.profile) ?? null,
           machine: snap.machine ?? null,
-          five_hour_pct: snap.five_hour_pct ?? null,
-          five_hour_resets_at: snap.five_hour_resets_at ?? null,
-          seven_day_pct: snap.seven_day_pct ?? null,
-          seven_day_resets_at: snap.seven_day_resets_at ?? null,
+          five_hour_pct: isCodex ? null : (snap.five_hour_pct ?? null),
+          five_hour_resets_at: isCodex ? null : (snap.five_hour_resets_at ?? null),
+          seven_day_pct: isCodex
+            ? (snap.seven_day_pct ?? snap.five_hour_pct ?? null)
+            : (snap.seven_day_pct ?? null),
+          seven_day_resets_at: isCodex
+            ? (snap.seven_day_resets_at ?? snap.five_hour_resets_at ?? null)
+            : (snap.seven_day_resets_at ?? null),
           polled_at: snap.polled_at ?? null,
           reporter_version: snap.reporter_version ?? null,
         });
