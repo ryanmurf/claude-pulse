@@ -689,7 +689,16 @@ export async function agentPushSnapshots(): Promise<void> {
       context_model: s.context_model,
       context_effective_limit: s.context_effective_limit,
       context_last_reset_at: s.context_last_reset_at,
-      polled_at: s.polled_at ?? new Date().toISOString(),
+      // Normalize to ISO-8601. The local SQLite store keeps polled_at as a
+      // space-separated UTC string ("YYYY-MM-DD HH:MM:SS"); pushing that verbatim
+      // mixed formats in the central text column, and `ORDER BY polled_at DESC`
+      // (a string sort) then ranks a same-day ISO row ABOVE a newer space row
+      // ('T' > ' '), so the dashboard silently showed a stale reading. Always ISO.
+      polled_at: s.polled_at
+        ? (String(s.polled_at).includes("T")
+            ? String(s.polled_at)
+            : String(s.polled_at).replace(" ", "T") + "Z")
+        : new Date().toISOString(),
     });
   }
   if (snapshots.length > 0) {
