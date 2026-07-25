@@ -17,6 +17,7 @@ import {
   type ContextSnapshotFields,
 } from "./store.js";
 import { checkAlerts } from "./alerts.js";
+import { inspectCredentialState } from "./auth.js";
 import { fetchUsage, vendorPollsRateLimitSnapshot } from "./usage.js";
 import { getAllSessionContextsForProfile, getContextForProfile, type ContextReadResult } from "./context.js";
 import { tallyProfileTokens, tallyProfileFineGrained } from "./tokens.js";
@@ -281,6 +282,28 @@ export async function pollProfile(profileName: string): Promise<PollResult> {
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     log(`Poll failed for ${profile.name}: ${errorMsg}`);
+
+    // A failed poll writes a NULL gauge (below), which is indistinguishable in
+    // the DB from "this vendor has no 5h window". Make the LOG unambiguous:
+    // name the profile, the dir it actually tried, and whether that dir holds
+    // usable credentials at all. `claude-max` reported NULL for nine days and
+    // the only clue was a bare "No OAuth tokens found for /home/ryan/.claude" —
+    // which never named the profile, so nobody connected it to the dead gauge.
+    if (profile.vendor === "anthropic-oauth") {
+      try {
+        const creds = await inspectCredentialState(profile.config_dir);
+        if (!creds.usable) {
+          log(
+            `WARNING: profile "${profile.name}" cannot authenticate — config_dir=${profile.config_dir} ` +
+              `credentials=${creds.state} (${creds.detail}). Recording a NULL gauge. ` +
+              `If that config_dir looks wrong, it is: compare it against the CLAUDE_CONFIG_DIR ` +
+              `exported by the "${profile.name}" launcher wrapper.`,
+          );
+        }
+      } catch {
+        /* diagnostics only — never let the probe mask the original failure */
+      }
+    }
 
     // If rate-limited, schedule a resume notification for when the window resets
     if (isRateLimitError(err)) {

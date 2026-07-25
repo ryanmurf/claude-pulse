@@ -710,6 +710,30 @@ export async function updateProfileBudget(
   return result.changes > 0;
 }
 
+/**
+ * Repoint a profile at a different config dir.
+ *
+ * `ensureDefaultProfiles` is `ON CONFLICT DO NOTHING`, so a row whose
+ * `config_dir` has drifted away from the code-level default is NEVER repaired
+ * by changing that default — the insert simply no-ops. Correcting drift needs
+ * an explicit UPDATE, which is what this is for (see preflight.ts for the
+ * narrow conditions under which it is called automatically).
+ *
+ * Deliberately touches ONLY `config_dir`: `poll_interval_minutes` is an
+ * operator-tuned value (the anthropic-oauth profiles run at 30m specifically to
+ * avoid 429s) and must never be reset as a side effect.
+ */
+export async function updateProfileConfigDir(name: string, configDir: string): Promise<boolean> {
+  const d = getDb();
+  const result = await d.run(
+    `UPDATE profiles
+     SET config_dir = ?, updated_at = datetime('now')
+     WHERE name = ?`,
+    [configDir, name],
+  );
+  return result.changes > 0;
+}
+
 export async function updateProfileApiKey(
   name: string,
   apiKey: string | null,
