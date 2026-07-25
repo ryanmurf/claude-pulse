@@ -52,6 +52,32 @@ import { reporterVersion } from "./version.js";
 const DEFAULT_DB_DIR = path.join(os.homedir(), ".claude-pulse");
 const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "usage.db");
 
+/**
+ * How long a writer waits for a contended write lock before giving up.
+ * Generous on purpose: every writer here is a short single-statement upsert, so
+ * waiting is always cheaper than failing an entire poll or upload run.
+ */
+export const SQLITE_BUSY_TIMEOUT_MS = 15_000;
+
+/**
+ * Connection pragmas for the local SQLite store.
+ *
+ * `busy_timeout` is the load-bearing one. SQLite defaults it to 0 — a writer
+ * that finds the write lock held throws SQLITE_BUSY *immediately* rather than
+ * waiting. This store has at least two concurrent writers on a normal host (the
+ * agent daemon's poll loops and the every-30-minutes upload cron), so that
+ * default turned routine sub-second overlap into hard `database is locked`
+ * failures that aborted entire upload runs — silently starving the central
+ * dashboard of exactly the data this store exists to deliver. WAL already lets
+ * readers proceed during a write; this makes writers queue briefly instead of
+ * giving up.
+ */
+export function applySqlitePragmas(sqlite: DatabaseSync): void {
+  sqlite.exec("PRAGMA journal_mode = WAL");
+  sqlite.exec("PRAGMA foreign_keys = ON");
+  sqlite.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+}
+
 /** Fallback account identity when no X-Auth-Request-Email header is present. */
 export const DEFAULT_ACCOUNT_IDENTITY =
   process.env.CLAUDE_PULSE_DEFAULT_ACCOUNT || "local";
@@ -126,8 +152,7 @@ export async function initDb(
     const resolvedDir = path.dirname(resolvedPath);
     fs.mkdirSync(resolvedDir, { recursive: true });
     const sqlite = new DatabaseSync(resolvedPath);
-    sqlite.exec("PRAGMA journal_mode = WAL");
-    sqlite.exec("PRAGMA foreign_keys = ON");
+    applySqlitePragmas(sqlite);
     backend = createSqliteBackend(sqlite);
   }
 

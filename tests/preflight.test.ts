@@ -10,6 +10,8 @@ import {
   addProfile,
   getProfile,
   updatePollInterval,
+  applySqlitePragmas,
+  SQLITE_BUSY_TIMEOUT_MS,
 } from "../src/store.js";
 
 let tmpDir: string;
@@ -238,5 +240,20 @@ describe("runProfilePreflight", () => {
     expect(entry?.healthy).toBe(true);
     expect(entry?.credentials).toBeNull();
     expect((await getProfile("codex"))?.config_dir).toBe(path.join(tmpDir, ".codex"));
+  });
+});
+
+describe("sqlite concurrency", () => {
+  it("sets a non-zero busy_timeout so concurrent writers queue instead of failing", async () => {
+    // The SQLite default (0) turns routine overlap between the agent daemon's
+    // poll loops and the every-30-minutes upload cron into hard
+    // `database is locked` aborts of the whole run.
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(path.join(tmpDir, "pragma.db"));
+    applySqlitePragmas(db);
+    const row = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+    expect(row.timeout).toBe(SQLITE_BUSY_TIMEOUT_MS);
+    expect(SQLITE_BUSY_TIMEOUT_MS).toBeGreaterThan(0);
+    db.close();
   });
 });
