@@ -517,3 +517,127 @@ export function hasProfileScope(tokens: OAuthTokens): boolean {
 export function hasInferenceScope(tokens: OAuthTokens): boolean {
   return tokens.scopes?.includes("user:inference") ?? false;
 }
+
+// ── Credential-state inspection (diagnostics only, never returns secrets) ────
+//
+// WHY THIS EXISTS. A profile whose config_dir points at a directory with no
+// usable credentials polls forever and stores a NULL gauge on every cycle. That
+// is indistinguishable, at the DB level, from "the vendor has no 5h window" —
+// so it hid for NINE DAYS on the claude-max profile: its `profiles.config_dir`
+// said `~/.claude` while the `claude-max` wrapper exports
+// `CLAUDE_CONFIG_DIR=~/.claude-max`, and `~/.claude/.credentials.json` had no
+// usable access token. The only trace was one unread log line per poll.
+//
+// `inspectCredentialState` gives callers a cheap, structured, SECRET-FREE
+// answer to "can this config dir actually authenticate?" so startup preflight
+// can say so loudly and the drift can be auto-corrected. It deliberately does
+// NOT reuse getOAuthTokens: that path collapses every distinct failure
+// (missing dir, missing file, torn JSON, blank token, absent expiry) into a
+// single `null`, which is exactly the ambiguity that hid this bug.
+
+export type CredentialState =
+  /** A usable, unexpired access token is present. */
+  | "ok"
+  /** Access token present but already past `expiresAt` — refreshable, not broken. */
+  | "expired"
+  /** `config_dir` itself does not exist (almost always a wrong/renamed path). */
+  | "missing-dir"
+  /** Dir exists, but there is no credential store for it. */
+  | "missing-file"
+  /** Credential store exists but could not be read (perms, I/O). */
+  | "unreadable"
+  /** Credential store exists but is not valid JSON (torn/partial write). */
+  | "unparseable"
+  /** Parsed fine, but `claudeAiOauth.accessToken` is absent/blank. */
+  | "no-access-token"
+  /** Access token present but `expiresAt` is null/absent/non-numeric. */
+  | "no-expiry";
+
+export interface CredentialInspection {
+  state: CredentialState;
+  /** True when a poll against this dir can plausibly succeed. */
+  usable: boolean;
+  /** Human-readable, SECRET-FREE explanation for logs/alerts. */
+  detail: string;
+  /** Where the credentials were looked for (path on Linux, keychain service on macOS). */
+  source: string;
+}
+
+const USABLE_STATES: ReadonlySet<CredentialState> = new Set<CredentialState>(["ok", "expired"]);
+
+function inspection(
+  state: CredentialState,
+  detail: string,
+  source: string,
+): CredentialInspection {
+  return { state, usable: USABLE_STATES.has(state), detail, source };
+}
+
+/**
+ * Inspect the credential store behind `configDir` WITHOUT ever surfacing token
+ * material. Safe to log, safe to put in an alert body.
+ *
+ * On macOS the credentials live in the Keychain, so `missing-dir` is not a
+ * meaningful signal there and is not reported.
+ */
+export async function inspectCredentialState(configDir: string): Promise<CredentialInspection> {
+  if (process.platform === "darwin") {
+    const { service } = macKeychainCoords(configDir);
+    const raw = await readMacKeychainRaw(configDir);
+    if (!raw) {
+      return inspection("missing-file", `no keychain item for ${configDir}`, service);
+    }
+    return classifyOauthBlob(raw.claudeAiOauth, service);
+  }
+
+  const credsPath = credentialsPath(configDir);
+  try {
+    await stat(configDir);
+  } catch {
+    return inspection("missing-dir", `config_dir does not exist: ${configDir}`, credsPath);
+  }
+
+  let raw: string;
+  try {
+    raw = await readFile(credsPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return inspection("missing-file", `no credentials file at ${credsPath}`, credsPath);
+    }
+    return inspection("unreadable", `cannot read ${credsPath} (${code ?? "unknown error"})`, credsPath);
+  }
+
+  let parsed: KeychainCredentials;
+  try {
+    parsed = JSON.parse(raw) as KeychainCredentials;
+  } catch {
+    return inspection("unparseable", `${credsPath} is not valid JSON`, credsPath);
+  }
+  return classifyOauthBlob(parsed.claudeAiOauth, credsPath);
+}
+
+function classifyOauthBlob(
+  oauth: OAuthTokens | undefined,
+  source: string,
+): CredentialInspection {
+  if (!oauth || typeof oauth.accessToken !== "string" || oauth.accessToken.length === 0) {
+    return inspection("no-access-token", `claudeAiOauth.accessToken is absent or blank`, source);
+  }
+  if (typeof oauth.expiresAt !== "number" || !Number.isFinite(oauth.expiresAt)) {
+    return inspection(
+      "no-expiry",
+      `claudeAiOauth.expiresAt is null/absent — the token can be neither trusted nor refreshed`,
+      source,
+    );
+  }
+  if (oauth.expiresAt < Date.now()) {
+    return inspection(
+      "expired",
+      `access token expired at ${new Date(oauth.expiresAt).toISOString()}` +
+        (oauth.refreshToken ? " (refresh token present)" : " (NO refresh token)"),
+      source,
+    );
+  }
+  return inspection("ok", `valid until ${new Date(oauth.expiresAt).toISOString()}`, source);
+}

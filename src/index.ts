@@ -47,6 +47,7 @@ import { getContextForProfile } from "./context.js";
 import { computeUpload, pushToCentral, uploadConfig } from "./upload.js";
 import { runLocalBackfill } from "./backfill.js";
 import { acquirePidLock, releasePidLock } from "./pidlock.js";
+import { runProfilePreflight } from "./preflight.js";
 import { startHttpServer, stopHttpServer } from "./server.js";
 import {
   formatGeminiQuotaSnapshots,
@@ -930,6 +931,10 @@ async function uploadOnce(opts?: { backfill?: boolean }): Promise<number> {
 
   await initDb();
   await ensureDefaultProfiles();
+  // Validate (and, where unambiguous, repair) every profile's config_dir before
+  // uploading. The upload cron runs far more often than the daemon restarts, so
+  // this is the fastest path back to a working gauge after config_dir drift.
+  await runProfilePreflight();
 
   const host = os.hostname();
   const backfill = opts?.backfill === true;
@@ -1049,6 +1054,10 @@ async function agentDaemon(): Promise<void> {
   log(`Initializing claude-pulse agent (pushing to ${cfg.baseUrl})...`);
   await initDb();
   await ensureDefaultProfiles();
+  // Prove each profile can actually authenticate BEFORE the poll loops start,
+  // and say so loudly if one can't — a profile pointed at the wrong config_dir
+  // otherwise just writes a NULL gauge forever with no visible failure.
+  await runProfilePreflight();
 
   // Optional one-time full-history backfill before the incremental loops start.
   if (process.env.CLAUDE_PULSE_UPLOAD_BACKFILL === "1" || process.argv.includes("--backfill")) {
@@ -1101,6 +1110,7 @@ async function main(): Promise<void> {
   await initDb();
   await ensureDefaultProfiles();
   log("Database initialized with default profiles");
+  await runProfilePreflight();
 
   const serverOnly = process.env.CLAUDE_PULSE_SERVER_ONLY === "1";
   // Receiver-only: the central server is a PURE receiver. It serves the UI/API and
